@@ -10,6 +10,15 @@ SCI is used in [babashka](https://github.com/babashka/babashka),
 [joyride](https://github.com/BetterThanTomorrow/joyride/) and many
 [other](https://github.com/babashka/sci#projects-using-sci) projects.
 
+## Unreleased
+
+- Add forkable interpreter worlds for Vars, namespaces, dynamic bindings, SCI
+  mutable values, and application-defined host resources.
+- Add explicit continuation-context capture and retargeting so an embedding can
+  resume a suspended computation independently in related forked worlds.
+- Add `with-detached-context` for recursively constructing an independent SCI
+  interpreter without inheriting the caller's execution-local world.
+
 ## 0.15.39
 
 - Fix [babashka#1874](https://github.com/babashka/babashka/issues/1874): `defmethod`, `prefer-method`, `remove-method` and `get-method` with a sci interface such as `clojure.lang.IDeref` dispatch on the class
