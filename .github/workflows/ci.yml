@@ -1,8 +1,9 @@
 name: CI
 
 on:
-  - push
-  - pull_request
+  push:
+  pull_request:
+  workflow_dispatch:
 
 # TODO: Add the deploy if needed
 jobs:
@@ -195,4 +196,3 @@ jobs:
       - name: Test libsci example programs
         run: |
           bb libsci:test
-
