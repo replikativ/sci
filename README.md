@@ -1,11 +1,18 @@
 <img src="logo/logo-300dpi.png" width="100px">
 
-[![CircleCI](https://circleci.com/gh/babashka/sci/tree/master.svg?style=shield)](https://circleci.com/gh/babashka/sci/tree/master)
-[![Clojars Project](https://img.shields.io/clojars/v/org.babashka/sci.svg)](https://clojars.org/org.babashka/sci)
+[![CircleCI](https://circleci.com/gh/replikativ/sci/tree/master.svg?style=shield)](https://circleci.com/gh/replikativ/sci/tree/master)
+[![Clojars Project](https://img.shields.io/clojars/v/org.replikativ/sci.svg)](https://clojars.org/org.replikativ/sci)
 [![Financial Contributors on Open Collective](https://opencollective.com/babashka/all/badge.svg?label=financial+contributors)](https://opencollective.com/babashka)
 [![project chat](https://img.shields.io/badge/slack-join_chat-brightgreen.svg)](https://app.slack.com/client/T03RZGPFR/C015LCR9MHD)
 
 **Small Clojure Interpreter**
+
+> This is the replikativ compatibility distribution of SCI. It preserves the
+> `sci.*` namespaces and upstream API while adding forkable interpreter worlds,
+> explicit host-resource fork policies, and continuation-context retargeting.
+> The changes remain proposed upstream; this coordinate gives downstream
+> replikativ libraries a stable Maven dependency in the meantime. Do not put
+> `org.replikativ/sci` and `org.babashka/sci` on the same classpath.
 
 <blockquote class="twitter-tweet" data-lang="en">
     <p lang="en" dir="ltr">I want a limited dialect of Clojure for a single-purpose, scripted application. SCI will fit nicely.</p>
@@ -94,7 +101,11 @@ Are you using SCI in your company or projects? Let us know [here](https://github
 
 Use as a dependency:
 
-[![Clojars Project](https://img.shields.io/clojars/v/org.babashka/sci.svg)](https://clojars.org/org.babashka/sci)
+[![Clojars Project](https://img.shields.io/clojars/v/org.replikativ/sci.svg)](https://clojars.org/org.replikativ/sci)
+
+```clojure
+org.replikativ/sci {:mvn/version "0.15.59-replikativ.1"}
+```
 
 ## Usage
 
@@ -583,6 +594,67 @@ aren't visible to other users:
 (sci/eval-string* forked "forked") ;;=> 1
 (sci/eval-string* sci-ctx "forked") ;;=> Unable to resolve symbol: forked
 ```
+
+Full runtime forking is opt-in. Initialize the shared context with
+`:runtime-mode :forkable`; the default `:standard` mode retains SCI's original
+direct hot paths and `sci/fork` only copies the namespace environment.
+
+Values returned across the host boundary retain their world semantics:
+interpreted functions returned by the public evaluation APIs execute in the
+context that returned them, including higher-order results and functions nested
+in finite persistent containers. Stable SCI Vars use their creation world when
+called directly by the host. Use `sci/call-with-context` to select a descendant
+explicitly, and use `sci/alter-var-meta!` / `sci/reset-var-meta!` for portable
+fork-aware Var metadata mutation.
+
+Forkable mode snapshots the roots and metadata of existing SCI vars and the
+values of atoms and volatiles created inside SCI. The handles keep their
+identity, so aliases and functions defined before the fork resolve against the
+world in which they are invoked:
+
+``` clojure
+(def sci-ctx (sci/init {:runtime-mode :forkable}))
+
+(sci/eval-string* sci-ctx
+  "(def counter (atom 0))
+   (defn bump! [] (swap! counter inc))")
+
+(def forked (sci/fork sci-ctx))
+(sci/eval-string* forked "(bump!)")       ;;=> 1
+(sci/eval-string* sci-ctx "@counter")     ;;=> 0
+```
+
+Values supplied by the host remain the host application's responsibility. An
+application-owned type can implement `sci.fork/Forkable`; SCI invokes its
+`fork-value` method once per identical value in each fork and preserves aliases
+to the resulting copy. Returning the object itself explicitly shares it, while
+throwing rejects the fork. For unclassified values, the optional `:fork-fn`
+remains a general fallback. It should return immutable values unchanged and
+preserve any aliasing that matters to the application:
+
+``` clojure
+(def sci-ctx
+  (sci/init {:runtime-mode :forkable
+             :fork-fn #(if (instance? clojure.lang.Atom %)
+                         (atom @%)
+                         %)}))
+```
+
+Dynamic binding frames remain scoped to their thread and evaluation, matching
+the Clojure REPL model; a fork snapshots root bindings, not a running control
+continuation. Stateful host objects not handled by `:fork-fn`, and mutable
+facilities not owned by SCI such as Java objects, remain shared.
+
+Runtime state is stored in dense lineage-local slots. A fork copies those
+slots, favoring the expected case where ordinary reads and writes are much
+more frequent than forks. On the JVM a fork waits for active forms in its
+source world, so the copied state is a quiescent snapshot.
+
+See [Forkable SCI worlds](doc/forking.md) for the lifecycle, semantic boundary,
+and current limitations of this experimental model.
+
+A small interactive tree of forked REPL worlds can be run with
+`clojure -M:examples -m sci.examples.forked-repl`.
 
 ### Implementing require and load-file
 
