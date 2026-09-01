@@ -213,15 +213,28 @@ workflows:
   version: 2
   ci:
     jobs:
-      - jvm
-      - node
+      - jvm:
+          filters:
+            tags:
+              only: /.*/
+      - node:
+          filters:
+            tags:
+              only: /.*/
 #      - planck
-      - linux
+      - linux:
+          filters:
+            tags:
+              only: /.*/
 #      - mac
       - deploy:
+          context:
+            - clojars-deploy
           filters:
             branches:
-              only: master
+              ignore: /.*/
+            tags:
+              only: /^replikativ-v0\.15\.59\.1$/
           requires:
             - jvm
             - node

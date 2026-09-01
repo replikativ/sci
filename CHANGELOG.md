@@ -12,6 +12,13 @@ SCI is used in [babashka](https://github.com/babashka/babashka),
 
 ## Unreleased
 
+## 0.15.59-replikativ.1
+
+- Adds forkable interpreter worlds with explicit host-resource fork policies
+- Adds continuation-context retargeting for forked execution
+- Compatibility distribution of upstream SCI 0.15.59; published under
+  `org.replikativ/sci` while the changes are proposed upstream
+
 ## 0.15.59
 
 - Caches resolved JVM instance methods per call site for performance

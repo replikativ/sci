@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 
-if [ -z "$CIRCLE_PULL_REQUEST" ] && [ "$CIRCLE_BRANCH" = "master" ]
-then
-    lein with-profiles +compile-java do clean, deploy clojars
-fi
+set -euo pipefail
 
-exit 0;
+test "${CIRCLE_TAG:-}" = "replikativ-v0.15.59.1"
+lein with-profiles +compile-java do clean, deploy clojars
