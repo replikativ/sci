@@ -12,6 +12,8 @@ SCI is used in [babashka](https://github.com/babashka/babashka),
 
 ## Unreleased
 
+- A static method used as a value obeys `:static-methods` config like a
+  direct call: unlisted methods on closed classes are denied.
 - Speed up `try` with `finally` if `:interrupt-fn` is set (about 15% in a native image)
 - Copy `:added` and `:deprecated` into the metadata of built-in vars
 - `clojure.repl/print-doc` is a private var, so `ns-interns` of `clojure.repl` returns only vars
