@@ -104,7 +104,7 @@ Use as a dependency:
 [![Clojars Project](https://img.shields.io/clojars/v/org.replikativ/sci.svg)](https://clojars.org/org.replikativ/sci)
 
 ```clojure
-org.replikativ/sci {:mvn/version "0.15.59-replikativ.1"}
+org.replikativ/sci {:mvn/version "0.15.59-replikativ.2"}
 ```
 
 ## Usage

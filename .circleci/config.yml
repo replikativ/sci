@@ -236,7 +236,7 @@ workflows:
             branches:
               ignore: /.*/
             tags:
-              only: /^replikativ-v0\.15\.59\.1$/
+              only: /^replikativ-v.*/
           requires:
             - jvm
             - node

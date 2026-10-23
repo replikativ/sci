@@ -2,5 +2,14 @@
 
 set -euo pipefail
 
-test "${CIRCLE_TAG:-}" = "replikativ-v0.15.59.1"
+# The release tag is derived from resources/SCI_VERSION:
+# 0.15.59-replikativ.2 -> replikativ-v0.15.59.2
+version="$(tr -d '[:space:]' < resources/SCI_VERSION)"
+expected_tag="replikativ-v${version/-replikativ./.}"
+
+if [ "${CIRCLE_TAG:-}" != "$expected_tag" ]; then
+    echo "Refusing to deploy: CIRCLE_TAG='${CIRCLE_TAG:-}' does not match '$expected_tag' (from SCI_VERSION $version)" >&2
+    exit 1
+fi
+
 lein with-profiles +compile-java do clean, deploy clojars

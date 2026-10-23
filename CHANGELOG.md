@@ -12,7 +12,13 @@ SCI is used in [babashka](https://github.com/babashka/babashka),
 
 ## Unreleased
 
-- A static method used as a value (`(let [f Integer/toHexString] ...)`) obeys `:static-methods` config, like a direct call: denied when unlisted on a closed class, overridden when an override is configured
+## 0.15.59-replikativ.2
+
+- The forkable-worlds distribution rebased onto upstream SCI 0.15.59
+- A static method used as a value (`(let [f Integer/toHexString] ...)`) obeys
+  `:static-methods` config, like a direct call: denied when unlisted on a
+  closed class, overridden when an override is configured
+  ([babashka/sci#1118](https://github.com/babashka/sci/pull/1118))
 
 ## 0.15.59-replikativ.1
 
@@ -27,7 +33,7 @@ SCI is used in [babashka](https://github.com/babashka/babashka),
 - Add `with-detached-context` for recursively constructing an independent SCI
   interpreter without inheriting the caller's execution-local world.
 
-## 0.15.39
+## 0.15.59
 
 - Fix [babashka#1874](https://github.com/babashka/babashka/issues/1874): `defmethod`, `prefer-method`, `remove-method` and `get-method` with a sci interface such as `clojure.lang.IDeref` dispatch on the class
 - Fix interop with a `false` argument: `(Boolean. false)` picked the `String` overload
