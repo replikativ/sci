@@ -118,6 +118,13 @@ jobs:
               curl -O -sL https://github.com/graalvm/graalvm-ce-builds/releases/download/vm-22.3.0/graalvm-ce-java11-linux-amd64-22.3.0.tar.gz
               tar xzf graalvm-ce-java11-linux-amd64-22.3.0.tar.gz
             fi
+            # GraalVM CE 22.3 ships without native-image; a cache restored
+            # from an older key may not have it either
+            if ! [ -x graalvm-ce-java11-22.3.0/bin/native-image ]; then
+              curl -fsSL --retry 5 --retry-all-errors --connect-timeout 30 -o native-image.jar \
+                https://github.com/graalvm/graalvm-ce-builds/releases/download/vm-22.3.0/native-image-installable-svm-java11-linux-amd64-22.3.0.jar
+              graalvm-ce-java11-22.3.0/bin/gu install -L native-image.jar
+            fi
       - run:
           name: Build binary
           command: |
