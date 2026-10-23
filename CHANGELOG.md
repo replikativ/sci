@@ -12,6 +12,8 @@ SCI is used in [babashka](https://github.com/babashka/babashka),
 
 ## Unreleased
 
+- A static method used as a value (`(let [f Integer/toHexString] ...)`) obeys `:static-methods` config, like a direct call: denied when unlisted on a closed class, overridden when an override is configured
+
 ## 0.15.59-replikativ.1
 
 - Adds forkable interpreter worlds with explicit host-resource fork policies
