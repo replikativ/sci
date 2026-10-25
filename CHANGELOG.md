@@ -12,7 +12,11 @@ SCI is used in [babashka](https://github.com/babashka/babashka),
 
 ## Unreleased
 
-## 0.15.59-replikativ.3
+## 0.15.59-replikativ.4
+
+The `.3` tag passed its test jobs but did not publish to Clojars because its
+deployment metadata named the wrong credential variables.  This release
+corrects that metadata and contains the same interpreter changes.
 
 - Preserve `:allow` and `:deny` when `merge-opts` receives no replacement
   permission lists ([babashka/sci#1119](https://github.com/babashka/sci/pull/1119)).

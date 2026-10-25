@@ -10,4 +10,4 @@ if [ "${CIRCLE_TAG:-}" != "$expected_tag" ]; then
     exit 1
 fi
 
-lein with-profiles +compile-java do clean, deploy clojars
+lein do clean, deploy clojars
