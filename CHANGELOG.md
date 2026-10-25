@@ -12,8 +12,11 @@ SCI is used in [babashka](https://github.com/babashka/babashka),
 
 ## Unreleased
 
+## 0.15.59-replikativ.5
+
 - A static method used as a value obeys `:static-methods` config like a
-  direct call: unlisted methods on closed classes are denied.
+  direct call: unlisted methods on closed classes are denied
+  ([babashka/sci#1118](https://github.com/babashka/sci/pull/1118)).
 
 ## 0.15.59-replikativ.4
 
