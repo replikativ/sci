@@ -94,7 +94,11 @@ Are you using SCI in your company or projects? Let us know [here](https://github
 
 Use as a dependency:
 
-[![Clojars Project](https://img.shields.io/clojars/v/org.babashka/sci.svg)](https://clojars.org/org.babashka/sci)
+[![Clojars Project](https://img.shields.io/clojars/v/org.replikativ/sci.svg)](https://clojars.org/org.replikativ/sci)
+
+```clojure
+org.replikativ/sci {:mvn/version "0.15.59-replikativ.3"}
+```
 
 ## Usage
 

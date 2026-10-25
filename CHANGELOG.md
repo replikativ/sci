@@ -12,6 +12,15 @@ SCI is used in [babashka](https://github.com/babashka/babashka),
 
 ## Unreleased
 
+## 0.15.59-replikativ.3
+
+- Preserve `:allow` and `:deny` when `merge-opts` receives no replacement
+  permission lists ([babashka/sci#1119](https://github.com/babashka/sci/pull/1119)).
+- Keep closure creation and `binding-conveyor-fn` on direct paths in the
+  default `:standard` runtime.  Forkable mode retains function provenance for
+  host callbacks, with fewer duplicate registrations on the JVM.
+- Incorporate upstream SCI changes through `bdc4203c` after 0.15.59.
+
 - Speed up `try` with `finally` if `:interrupt-fn` is set (about 15% in a native image)
 - Copy `:added` and `:deprecated` into the metadata of built-in vars
 - `clojure.repl/print-doc` is a private var, so `ns-interns` of `clojure.repl` returns only vars
@@ -38,6 +47,17 @@ SCI is used in [babashka](https://github.com/babashka/babashka),
   resume a suspended computation independently in related forked worlds.
 - Add `with-detached-context` for recursively constructing an independent SCI
   interpreter without inheriting the caller's execution-local world.
+
+## 0.15.59-replikativ.2
+
+- Rebase the forkable-worlds distribution onto upstream SCI 0.15.59.
+- Honour `:static-methods` config for static methods used as values
+  ([babashka/sci#1118](https://github.com/babashka/sci/pull/1118)).
+
+## 0.15.59-replikativ.1
+
+- Introduce forkable interpreter worlds and continuation-context retargeting
+  under `org.replikativ/sci`.
 
 ## 0.15.59
 

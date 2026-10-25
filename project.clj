@@ -1,11 +1,14 @@
-(defproject org.babashka/sci
+(defproject org.replikativ/sci
   #=(clojure.string/trim
      #=(slurp "resources/SCI_VERSION"))
   ;; :jvm-opts ["-Dclojure.compiler.direct-linking=true"]
-  :description "Small Clojure Interpreter"
-  :url "https://github.com/babashka/SCI"
+  :description "Replikativ compatibility distribution of SCI with forkable interpreter worlds"
+  :url "https://github.com/replikativ/sci"
   :scm {:name "git"
-        :url "https://github.com/babashka/SCI"}
+        :url "https://github.com/replikativ/sci"
+        :connection "scm:git:https://github.com/replikativ/sci.git"
+        :developerConnection "scm:git:ssh://git@github.com/replikativ/sci.git"
+        :tag "replikativ-v0.15.59.3"}
   :license {:name "Eclipse Public License 1.0"
             :url "http://opensource.org/licenses/eclipse-1.0.php"}
   :source-paths ["src"]
