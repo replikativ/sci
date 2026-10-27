@@ -445,6 +445,24 @@
      ;; contexts. Full live-state isolation is opt-in via :runtime-mode.
      (update ctx :env (fn [env] (atom @env))))))
 
+(defn retire!
+  "Retire a quiescent forkable context and release its managed realization
+   caches. Future evaluation or forking through this context is refused;
+   related worlds remain usable. This does not close arbitrary host resources.
+   Standard contexts have no managed world and are unaffected."
+  [ctx]
+  (when-let [runtime-world (:sci.impl/world ctx)]
+    (world/retire-world! runtime-world))
+  nil)
+
+(defn recover-fork!
+  "Retry cleanup when `fork` failed and also reported a cleanup failure.
+   The exception retains its unpublished target; this operation only retires
+   that target, never repeats the fork or changes the source context. If retry
+   fails, retain the thrown failure and call this function again later."
+  [error]
+  (world/recover-failed-fork! error))
+
 (defn eval-string*
   "Evaluates string `s` in the context of `ctx` (as produced with
   `init`)."

@@ -22,9 +22,9 @@
       :cljs [cljs.reader :as edn])
    #?@(:cljd [] :clj [[clojure.java.io :as jio]])
    #?@(:cljd [] :clj [[sci.impl.proxy :as proxy]])
-   #?(:cljd [sci.impl.copy-vars :refer [copy-core-var copy-var macrofy new-var avoid-method-too-large]]
-      :clj [sci.impl.copy-vars :refer [copy-core-var copy-var macrofy new-var avoid-method-too-large]]
-      :cljs [sci.impl.copy-vars :refer [new-var]])
+   #?(:cljd [sci.impl.copy-vars :refer [copy-core-var copy-var macrofy new-var avoid-method-too-large forkable-macro-var]]
+      :clj [sci.impl.copy-vars :refer [copy-core-var copy-var macrofy new-var avoid-method-too-large forkable-macro-var]]
+      :cljs [sci.impl.copy-vars :refer [new-var forkable-macro-var]])
    #?(:cljs [sci.impl.resolve])
    [clojure.set :as set]
    [clojure.string :as str]
@@ -41,6 +41,8 @@
    ;; no hierarchies on cljd, like the host
    #?@(:cljd [] :default [[sci.impl.hierarchies :as hierarchies]])
    [sci.impl.io :as io]
+   [sci.impl.lazy-seq :as lazyseq]
+   [sci.impl.lazy-producers :as lazy-producers]
    [sci.impl.load :as load :refer [load-string load-reader]]
    [sci.impl.macroexpand :as mexpand]
    [sci.impl.macros :as macros]
@@ -647,6 +649,16 @@
     (swap! env update :namespaces dissoc sym)
     nil))
 
+(defn- register-interned-var! [ctx v]
+  ;; Interning through either the SCI or host API must install the same
+  ;; fork-local root descriptor as an analyzed def. In particular, a freshly
+  ;; interned host value must not bypass the fork policy by living only in env.
+  (when (and (:sci.impl/world ctx)
+             (not (world/registered? (:sci.impl/world ctx) v)))
+    (world/register-var! v (sci.impl.vars/getRawRoot v) (meta v)
+                         (sci.impl.vars/getRawWatches v)))
+  v)
+
 (defn sci-intern
   ;; in this case the var will become unbound
   ([ns var-sym]
@@ -654,22 +666,26 @@
          ns (sci-the-ns* ctx ns)
          ns-name (types/getName ns)
          env (:env ctx)]
-     (or (get-in @env [:namespaces ns-name var-sym])
-         (let [new-var (sci.impl.utils/new-var var-sym nil (assoc (meta var-sym) :ns ns))]
-           (sci.impl.vars/unbind new-var)
-           (swap! env assoc-in [:namespaces ns-name var-sym] new-var)
-           new-var))))
+     (register-interned-var!
+      ctx
+      (or (get-in @env [:namespaces ns-name var-sym])
+          (let [new-var (sci.impl.utils/new-var var-sym nil (assoc (meta var-sym) :ns ns))]
+            (sci.impl.vars/unbind new-var)
+            (swap! env assoc-in [:namespaces ns-name var-sym] new-var)
+            new-var)))))
   ([ns var-sym val]
    (let [ctx (store/get-ctx)
          ns (sci-the-ns* ctx ns)
          ns-name (types/getName ns)
          env (:env ctx)]
-     (or (when-let [v (get-in @env [:namespaces ns-name var-sym])]
-           (sci.impl.vars/bindRoot v val)
-           v)
-         (let [new-var (sci.impl.utils/new-var var-sym val (assoc (meta var-sym) :ns ns))]
-           (swap! env assoc-in [:namespaces ns-name var-sym] new-var)
-           new-var)))))
+     (register-interned-var!
+      ctx
+      (or (when-let [v (get-in @env [:namespaces ns-name var-sym])]
+            (sci.impl.vars/bindRoot v val)
+            v)
+          (let [new-var (sci.impl.utils/new-var var-sym val (assoc (meta var-sym) :ns ns))]
+            (swap! env assoc-in [:namespaces ns-name var-sym] new-var)
+            new-var))))))
 
 (defn sci-bound?
   [sci-var]
@@ -1345,6 +1361,9 @@
                  (do (clojure.core/-add-loaded-lib '~name) nil)))]
     ;;(println exp)
     exp))
+
+(defn forkable-lazy-seq* [_ _ & body]
+  (list 'clojure.core/-lazy-seq* (list* 'fn* [] body)))
 
 (defn lazy-seq*
   [_ _ & body]
@@ -2199,7 +2218,16 @@
 
  (def forkable-core-overrides
    (merge
-    {'deref (copy-var core-protocols/forkable-deref* clojure-core-ns
+    (into {} (keep (fn [[sym v]]
+                     (when (and (utils/var? v) (:macro (meta v)))
+                       [sym (forkable-macro-var sym v)])))
+          clojure-core)
+    (into {} (map (fn [[sym f]] [sym (copy-var f clojure-core-ns
+                                              {:name sym :copy-meta-from (symbol "clojure.core" (str sym))})]))
+          lazy-producers/producer-functions)
+    {'lazy-seq (macrofy 'lazy-seq forkable-lazy-seq*)
+     '-lazy-seq* (new-var '-lazy-seq* lazyseq/lazy-seq* clojure-core-ns)
+     'deref (copy-var core-protocols/forkable-deref* clojure-core-ns
                       {:name 'deref})
      'apply (copy-var core-protocols/forkable-apply clojure-core-ns
                       {:name 'apply})

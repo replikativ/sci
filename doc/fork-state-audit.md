@@ -136,7 +136,7 @@ child-only dynamic metadata cannot affect a nested parent evaluation.
 | SCI mutable deftype fields | Stable instance handle with one managed persistent field-map slot | Implemented across closures/containers; CLJS direct roots may also be copied onto the child native-protocol prototype |
 | `*loaded-libs*` | Built-in Var root has a per-cell copier for its host Ref/atom | Implemented; keeps the host representation while loaded sets diverge |
 | Delay | Stable SCI handle with world-local pending/realized state | Implemented; pending realizations split, while cached outcomes are inherited according to host delay semantics |
-| Lazy sequence realization | One host lazy cell/cache | Direct world-cell values are rejected as affine; managed lazy continuations remain future work |
+| Lazy sequence realization | Logical owner with independent per-world caches on JVM/JS | SCI lazy bodies and supported core producers are managed; foreign native lazy values remain affine. Retire discarded worlds with `sci/retire!`. See [managed laziness](managed-laziness.md). |
 | SCI `memoize` cache | Closure owns a fork-local `SciAtom` cache | Implemented; inherited entries are shared as immutable values and later cache fills diverge |
 | JVM Promise | Stable SCI handle with world-local pending/delivered state | Implemented; a pending child has no inherited waiters and delivery is branch-local |
 | CLJS Promise | Native asynchronous host value | Direct world-cell values are rejected as external; `:fork-fn` must choose deliberate sharing or application virtualization |
@@ -342,10 +342,13 @@ current environment, so that port still needs verification on a Dart host.
 
 SCI's `memoize` now closes over a `SciAtom`, so it inherits the parent's cache
 at fork and subsequent fills remain world-local. Cached result values retain
-their ordinary sharing or explicit `Forkable` policy. Lazy sequences are
-harder: their realization cache is a small continuation, and arbitrary lazy
-bodies may perform effects. They belong with the future execution/fiber model
-rather than a generic object copier.
+their ordinary sharing or explicit `Forkable` policy. JVM/JavaScript SCI lazy
+sequences now use logical owners with per-world realization boxes. Forking
+copies pending or completed state without running lazy bodies; weak owner
+indexing avoids a permanent dense slot per element, and explicit retirement
+releases world-dependent cache cycles. This snapshots computation at a
+quiescent boundary, not midway through an executing body. Foreign lazy values
+still require an explicit policy. See [managed laziness](managed-laziness.md).
 
 ### Transients and mutable aggregates
 

@@ -12,6 +12,16 @@ SCI is used in [babashka](https://github.com/babashka/babashka),
 
 ## Unreleased
 
+## 0.15.59-replikativ.6
+
+- Make lazy sequence realization and core lazy producers fork-local without
+  forcing pending values during forks.
+- Add explicit interpreter-world retirement (`sci.core/retire!`) and failed-fork
+  cleanup recovery (`sci.core/recover-fork!`). Embedders must retire owned
+  interpreters after their actual work has finished; see `doc/managed-laziness.md`.
+- Preserve native lazy failure behavior across Clojure versions and adapt trusted
+  native macro syntax for forkable interpreters.
+
 ## 0.15.59-replikativ.5
 
 - A static method used as a value obeys `:static-methods` config like a

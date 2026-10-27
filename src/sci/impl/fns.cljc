@@ -2,13 +2,15 @@
   {:no-doc true}
   (:require
    [sci.impl.macros :as macros]
+   [sci.impl.lazy-seq :as lazyseq]
    [sci.impl.types :as types]
    [sci.impl.utils :as utils :refer [recur]]
    [sci.impl.world :as world])
   #?(:cljs (:require-macros [sci.impl.fns :refer [context-wrapper
                                                   gen-fn wrap-this-as]]))
   #?@(:cljd []
-      :clj [(:import [java.util Collections Map WeakHashMap])]))
+      :clj [(:import [java.util Collections Map WeakHashMap]
+                      [java.lang.ref WeakReference])]))
 
 #?(:cljd nil :clj (set! *warn-on-reflection* true))
 
@@ -30,6 +32,21 @@
      :cljs (.set interpreted-functions f info))
   f)
 
+(defn- metadata-reference [value]
+  ;; JVM WeakHashMap can retain a stale entry's value until its next access,
+  ;; so metadata must not strongly retain an original closure or its world.
+  ;; JS WeakMap and Dart Expando use ephemeron associations instead: these
+  ;; metadata thunks are retained only while their function key remains live.
+  #?(:cljd (fn [] value)
+     :clj (WeakReference. value)
+     :cljs (fn [] value)))
+
+(defn- referenced-value [reference]
+  (when reference
+    #?(:cljd (reference)
+       :clj (.get ^WeakReference reference)
+       :cljs (reference))))
+
 (defn interpreted-fn
   "Mark an SCI-interpreted function so a public evaluation boundary can bind
   it to the world from which the host obtained it."
@@ -41,10 +58,11 @@
         (fn [n]
           (let [args (vec (repeatedly n gensym))]
             `(~args
-              (contextualize
-               ~ctx
-               (world/call-with-context
-                ~ctx (fn [] (~original ~@args)))))))
+              (let [selected# (world/active-ctx ~ctx)]
+                (contextualize
+                 selected#
+                 (world/call-with-context
+                  selected# (fn [] (~original ~@args))))))))
         fixed-wrapper
         `(fn ~@(map fixed-clause (range 21)))
         variadic-wrapper
@@ -53,10 +71,11 @@
                 more (gensym "more")]
             `(fn ~@(map fixed-clause (range required))
                  ([~@args & ~more]
-                  (contextualize
-                   ~ctx
-                   (world/call-with-context
-                    ~ctx (fn [] (apply ~original ~@args ~more))))))))]
+                  (let [selected# (world/active-ctx ~ctx)]
+                    (contextualize
+                     selected#
+                     (world/call-with-context
+                      selected# (fn [] (apply ~original ~@args ~more)))))))))]
     `(if-let [required# (:variadic ~shape)]
        (case #?(:cljd required# :clj (int required#) :cljs required#)
          ~@(mapcat (fn [n] [n (variadic-wrapper n)]) (range 21))
@@ -64,10 +83,11 @@
                          {:required-arity required#})))
        (if (:fixed-many? ~shape)
          (fn [& args#]
-           (contextualize
-            ~ctx
-            (world/call-with-context
-             ~ctx (fn [] (apply ~original args#)))))
+           (let [selected# (world/active-ctx ~ctx)]
+             (contextualize
+              selected#
+              (world/call-with-context
+               selected# (fn [] (apply ~original args#))))))
          ~fixed-wrapper))))
 
 (declare contextualize)
@@ -75,16 +95,19 @@
 (defn- contextualize-function [ctx value info]
   (let [target (:sci.impl/world ctx)]
     (if (and (map? info)
-             (identical? target (:world info)))
+             (identical? target (referenced-value (:world-ref info))))
       value
-      (let [original (or (:original info) value)
+      (let [original (or (referenced-value (:original-ref info)) value)
             wrapped (with-meta
                       (context-wrapper (:shape info) ctx original)
                       (meta value))]
         (register-function! wrapped
-                            {:original original
+                            {:original-ref (metadata-reference original)
                              :shape (:shape info)
-                             :world target})))))
+                             ;; JVM WeakHashMap only expunges stale keys on a
+                             ;; later access. Its metadata must not keep a
+                             ;; discarded world alive while awaiting that.
+                             :world-ref (metadata-reference target)})))))
 
 (defn contextualize
   "Bind an interpreted function result to `ctx` for direct host invocation.
@@ -100,6 +123,9 @@
       (cond
         info
         (contextualize-function ctx value info)
+
+        (satisfies? lazyseq/ISequenceData value)
+        (lazyseq/contextualize ctx value contextualize)
 
         (vector? value)
         (with-meta (mapv #(contextualize ctx %) value) (meta value))
@@ -129,6 +155,9 @@
         (list? value)
         (with-meta (apply list (map #(contextualize ctx %) value))
           (meta value))
+
+        (seq? value)
+        (lazyseq/contextualize ctx value contextualize)
 
         :else value))))
 

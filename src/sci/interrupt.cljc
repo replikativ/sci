@@ -13,13 +13,15 @@
       (sci/init {:interrupt-fn my-interrupt-fn
                  :namespaces {'clojure.core interrupt/clojure-core}})
 
-  Each override reads `:interrupt-fn` from the current context at call time and
-  falls back to the native function when no `:interrupt-fn` is configured, so
-  merging `clojure-core` is always safe."
+  Each override reads `:interrupt-fn` from the current context at call time.
+  In forkable contexts the sequence producers use interpreter-owned lazy
+  state, and realization consults the consuming context's callback. Standard
+  contexts fall back to native functions when no callback is configured."
   (:require
    [clojure.string :as str]
    [sci.ctx-store :as store]
    [sci.impl.copy-vars :as copy-vars]
+   [sci.impl.lazy-producers :as producers]
    [sci.impl.utils :as utils]))
 
 (defn get-interrupt-fn
@@ -51,57 +53,71 @@
                :else        (constantly false))]
     (letfn [(gen [i]
               (lazy-seq
-                (when (pred i)
-                  (ifn)
-                  (cons i (gen (+ i step))))))]
+               (when (pred i)
+                 (ifn)
+                 (cons i (gen (+ i step))))))]
       (gen start))))
 
 (defn- sci-range
-  ([]    (let [ifn (get-interrupt-fn (store/get-ctx))] (if ifn (range-seq 0 nil 1 ifn) (range))))
-  ([end] (let [ifn (get-interrupt-fn (store/get-ctx))] (if ifn (range-seq 0 end 1 ifn) (range end))))
+  ([]
+   (let [ctx (store/get-ctx) ifn (get-interrupt-fn ctx)]
+     (cond (:sci.impl/world ctx) (producers/range)
+           ifn (range-seq 0 nil 1 ifn)
+           :else (range))))
+  ([end]
+   (let [ctx (store/get-ctx) ifn (get-interrupt-fn ctx)]
+     (cond (:sci.impl/world ctx) (producers/range end)
+           ifn (range-seq 0 end 1 ifn)
+           :else (range end))))
   ([start end]
-   (let [ifn (get-interrupt-fn (store/get-ctx))] (if ifn (range-seq start end 1 ifn) (range start end))))
+   (let [ctx (store/get-ctx) ifn (get-interrupt-fn ctx)]
+     (cond (:sci.impl/world ctx) (producers/range start end)
+           ifn (range-seq start end 1 ifn)
+           :else (range start end))))
   ([start end step]
-   (let [ifn (get-interrupt-fn (store/get-ctx))] (if ifn (range-seq start end step ifn) (range start end step)))))
+   (let [ctx (store/get-ctx) ifn (get-interrupt-fn ctx)]
+     (cond (:sci.impl/world ctx) (producers/range start end step)
+           ifn (range-seq start end step ifn)
+           :else (range start end step)))))
 
 (defn- sci-repeat
   ([x]
-   (let [ifn (get-interrupt-fn (store/get-ctx))]
-     (if-not ifn
-       (repeat x)
-       (letfn [(gen [] (lazy-seq (ifn) (cons x (gen))))]
-         (gen)))))
+   (let [ctx (store/get-ctx) ifn (get-interrupt-fn ctx)]
+     (cond (:sci.impl/world ctx) (producers/repeat x)
+           (not ifn) (repeat x)
+           :else (letfn [(gen [] (lazy-seq (ifn) (cons x (gen))))]
+                   (gen)))))
   ([n x]
-   (let [ifn (get-interrupt-fn (store/get-ctx))]
-     (if-not ifn
-       (repeat n x)
-       (letfn [(gen [i]
-                 (lazy-seq
-                   (when (pos? i)
-                     (ifn)
-                     (cons x (gen (dec i))))))]
-         (gen n))))))
+   (let [ctx (store/get-ctx) ifn (get-interrupt-fn ctx)]
+     (cond (:sci.impl/world ctx) (producers/repeat n x)
+           (not ifn) (repeat n x)
+           :else (letfn [(gen [i]
+                           (lazy-seq
+                            (when (pos? i)
+                              (ifn)
+                              (cons x (gen (dec i))))))]
+                   (gen n))))))
 
 (defn- sci-cycle [coll]
-  (let [ifn (get-interrupt-fn (store/get-ctx))]
-    (if (or (not ifn) (not (seq coll)))
-      (cycle coll)
-      (letfn [(gen [s]
-                (lazy-seq
-                  (ifn)
-                  (let [cur (or (seq s) (seq coll))]
-                    (cons (first cur) (gen (rest cur))))))]
-        (gen coll)))))
+  (let [ctx (store/get-ctx) ifn (get-interrupt-fn ctx)]
+    (cond (:sci.impl/world ctx) (producers/cycle coll)
+          (or (not ifn) (not (seq coll))) (cycle coll)
+          :else (letfn [(gen [s]
+                          (lazy-seq
+                           (ifn)
+                           (let [cur (or (seq s) (seq coll))]
+                             (cons (first cur) (gen (rest cur))))))]
+                  (gen coll)))))
 
 (defn- sci-iterate [f x]
-  (let [ifn (get-interrupt-fn (store/get-ctx))]
-    (if-not ifn
-      (iterate f x)
-      (letfn [(gen [v]
-                (lazy-seq
-                  (ifn)
-                  (cons v (gen (f v)))))]
-        (gen x)))))
+  (let [ctx (store/get-ctx) ifn (get-interrupt-fn ctx)]
+    (cond (:sci.impl/world ctx) (producers/iterate f x)
+          (not ifn) (iterate f x)
+          :else (letfn [(gen [v]
+                          (lazy-seq
+                           (ifn)
+                           (cons v (gen (f v)))))]
+                  (gen x)))))
 
 ;;; Regex - fire interrupt-fn during backtracking
 ;;;

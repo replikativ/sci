@@ -129,9 +129,11 @@ even when an instance is captured by a closure or nested in a persistent
 container. Immutable-field types retain direct storage.
 On the JVM, SCI-created promises are fork-local as well. SCI's `memoize` uses a
 fork-local atom for its cache. Effects performed by any watch are ordinary user
-capabilities and are not made reversible automatically. Managed lazy
-continuations, nested mutable host objects, and effects outside SCI remain
-future work unless the embedding application models or copies them.
+capabilities and are not made reversible automatically. JVM/JavaScript
+SCI-owned lazy continuations and core producer caches are fork-local; see
+[managed laziness](managed-laziness.md) for support boundaries and the
+embedding application's `sci/retire!` lifetime obligation. Nested mutable host
+objects and effects outside SCI still require application cooperation.
 Direct host lazy sequences are rejected rather than silently sharing their
 realization cache. CLJS native-protocol
 prototypes are cloned with Type data before child deftype/record values are

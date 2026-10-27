@@ -19,6 +19,7 @@
    [sci.impl.fns :as fns]
    [sci.impl.interop :as interop]
    [sci.impl.load :as load]
+   [sci.impl.lazy-seq :as lazyseq]
    [sci.impl.macros :as macros]
    [sci.impl.records :as records]
    [sci.impl.resolve :as resolve]
@@ -984,12 +985,27 @@
 
 (defn analyze-lazy-seq
   [ctx expr]
-  (let [body (rest expr)
+  (if (:sci.impl/world ctx)
+    ;; lazy-seq is an analyzer special form, so replacing its public macro
+    ;; alone does not change this path. Use an ordinary interpreted closure
+    ;; so captures and evaluation continue to select the consuming world.
+    (let [thunk (analyze-fn* ctx (with-meta (list* 'fn* [] (rest expr))
+                                  (meta expr)))]
+      ;; The constructor is interpreter machinery, not another capability
+      ;; users must add to :allow when lazy-seq itself is allowed.
+      (sci.impl.types/->Node
+       (lazyseq/lazy-seq* (t/eval thunk ctx bindings))
+       nil))
+    (let [body (rest expr)
         ctx (with-recur-target ctx true) ;; body is analyzed in context of implicit no-arg fn
         ana (return-do ctx expr body)]
     (sci.impl.types/->Node
-     (lazy-seq (t/eval ana ctx bindings))
-     nil)))
+     ;; The host lazy-seq macro marks its closure :once. JVM compilers may
+     ;; clear captured interpreter machinery before a failed call, preventing
+     ;; the native LazySeq from retrying the body on its next consumption.
+     #?(:clj (clojure.lang.LazySeq. (fn [] (t/eval ana ctx bindings)))
+        :default (lazy-seq (t/eval ana ctx bindings)))
+     nil))))
 
 (defn return-if
   [ctx expr]
