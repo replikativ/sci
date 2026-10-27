@@ -455,6 +455,13 @@
     (world/retire-world! runtime-world))
   nil)
 
+(defn fork-recovery?
+  "Whether `error` retains an unpublished fork target whose cleanup can be
+   retried with `recover-fork!`. Ordinary evaluation/fork failures return false.
+   Does not perform cleanup or expose the target interpreter."
+  [error]
+  (world/fork-recovery? error))
+
 (defn recover-fork!
   "Retry cleanup when `fork` failed and also reported a cleanup failure.
    The exception retains its unpublished target; this operation only retires
