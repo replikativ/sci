@@ -12,6 +12,14 @@ SCI is used in [babashka](https://github.com/babashka/babashka),
 
 ## Unreleased
 
+## 0.15.59-replikativ.7
+
+- Keep native namespace Var imports independent of the first interpreter's
+  lifetime, including alias-first registration. Retiring an interpreter no
+  longer prevents a new unrelated interpreter from initializing.
+- Add `sci.core/fork-recovery?` so embedding construction owners can identify
+  unpublished fork cleanup receipts through the public API.
+
 ## 0.15.59-replikativ.6
 
 - Make lazy sequence realization and core lazy producers fork-local without
