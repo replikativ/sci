@@ -9,12 +9,29 @@
             [sci.impl.execution :as execution])
   #?@(:cljd []
       :clj [(:import [java.lang.ref WeakReference]
+                     [java.util IdentityHashMap WeakHashMap]
                      [java.util.concurrent.atomic AtomicReferenceArray]
                      [java.util.concurrent.locks ReentrantReadWriteLock])]))
 
 (def absent #?(:cljd (Object.) :clj (Object.) :cljs (js/Object.)))
 
-(deftype DenseWorld [cells-holder registry gate resize-gate persistent?])
+(deftype DenseWorld [cells-holder registry gate resize-gate persistent? open? evaluation-depth])
+
+(defprotocol IForkableWorldCache
+  (-fork-world-cache! [owner source target]
+    "Copy an existing source realization into the unpublished target without
+     invoking deferred computation. Missing source state remains missing."))
+
+(defprotocol IWorldCache
+  (-retire-world-cache! [owner world]
+    "Release this managed owner's cache for one quiescent retired world.
+     This internal hook only removes private cache entries: no user callbacks
+     or I/O. It must be idempotent so failed retirement can be retried."))
+
+(defn assert-open! [^DenseWorld world]
+  (when-not @(.-open? world)
+    (throw (ex-info "SCI world has been retired." {:type ::retired-world})))
+  world)
 (deftype ReadWorld [world primary?])
 
 (defprotocol IWorldTracked
@@ -108,13 +125,28 @@
                 (vreset! holder new))))))))
   world)
 
+(defn- new-world-cache-index []
+  #?(:clj (WeakHashMap.)
+     :cljs
+     (when (and (exists? js/WeakRef) (exists? js/WeakMap))
+       (let [refs (js/Set.)]
+         {:refs refs
+          :by-owner (js/WeakMap.)
+          :registrations (volatile! 0)
+          :finalizer (when (exists? js/FinalizationRegistry)
+                       (js/FinalizationRegistry. (fn [ref] (.delete refs ref))))}))
+     :cljd nil))
+
 (defn new-world []
   (DenseWorld.
    (volatile! (new-cells 64))
-   (atom {:next-slot 0 :descriptors {} :managed-descriptors []})
+   (atom {:next-slot 0 :descriptors {} :managed-descriptors []
+          :world-caches (new-world-cache-index)})
    #?(:cljd nil :clj (ReentrantReadWriteLock.) :cljs nil)
    #?(:cljd nil :clj (ReentrantReadWriteLock.) :cljs nil)
-   (volatile! false)))
+   (volatile! false)
+   (volatile! true)
+   (volatile! 0)))
 
 (defn active-world-state []
   #?(:cljd (execution/active-world)
@@ -150,6 +182,109 @@
         (execution/set-binding-scope! state previous-scope)
         (execution/refresh-active-bindings! state)))))
 
+(defn selected-world
+  "The actual selected world, including the target selected during copying."
+  []
+  (some-> (active-world-state) (.-world)))
+
+(defn register-world-cache!
+  "Register an identity-based internal owner of fork-local realizations. The
+   lineage index retains the owner weakly and does not allocate dense slots.
+   Owners must implement both cache protocols and must not use content-based
+   hashing/equality (in particular, the owner is not a sequence view)."
+  [owner]
+  (let [^DenseWorld world (or (selected-world) (:sci.impl/world store/*ctx*))]
+    (when-not world
+      (throw (ex-info "Managed caches must be registered inside an SCI context."
+                      {:type ::missing-world})))
+    (assert-open! world)
+    (when-not (and (satisfies? IWorldCache owner)
+                   (satisfies? IForkableWorldCache owner))
+      (throw (ex-info "Managed cache owner must support fork and retirement."
+                      {:type ::invalid-world-cache-owner})))
+    (let [index (:world-caches @(.-registry world))]
+      (when-not index
+        (throw (ex-info "This host has no weak cache-owner support."
+                        {:type ::weak-cache-owners-unavailable})))
+      #?(:clj
+         (locking index (.put ^WeakHashMap index owner true))
+         :cljs
+         (when-not (.has (:by-owner index) owner)
+           (let [ref (js/WeakRef. owner)
+                 finalizer (:finalizer index)]
+             (.set (:by-owner index) owner ref)
+             (.add (:refs index) ref)
+             (if finalizer
+               (.register finalizer owner ref ref)
+               ;; Without finalization notifications, incremental registration
+               ;; periodically prunes dead refs. No owner is strongly retained.
+               (when (= 64 (vswap! (:registrations index) inc))
+                 (vreset! (:registrations index) 0)
+                 (.forEach (:refs index)
+                           (fn [entry]
+                             (when-not (.deref entry)
+                               (.delete (:refs index) entry))))))))
+         :cljd nil)))
+  owner)
+
+(defn world-cache-owners
+  "An eager strong snapshot of currently live cache owners in a lineage.
+   Inspection also removes dead weak entries. Closed worlds retain their
+   registry until cleanup succeeds, so retirement may call this function."
+  ([]
+   (if-let [world (or (selected-world) (:sci.impl/world store/*ctx*))]
+     (world-cache-owners world)
+     []))
+  ([^DenseWorld world]
+   (let [index (:world-caches @(.-registry world))]
+     #?(:clj
+        (if index
+          (locking index (vec (.keySet ^WeakHashMap index)))
+          [])
+        :cljs
+        (if index
+          (let [owners (volatile! [])]
+            (.forEach (:refs index)
+                      (fn [ref]
+                        (if-let [owner (.deref ref)]
+                          (vswap! owners conj owner)
+                          (do (.delete (:refs index) ref)
+                              (when-let [finalizer (:finalizer index)]
+                                (.unregister finalizer ref))))))
+            @owners)
+          [])
+        :cljd []))))
+
+(defn- with-counted-world-access [^DenseWorld world f]
+  (assert-open! world)
+  (vswap! (.-evaluation-depth world) inc)
+  (try
+    (f)
+    (finally (vswap! (.-evaluation-depth world) dec))))
+
+(defn- with-world-access [^DenseWorld world f]
+  ;; An active related evaluation already owns its read permit. Host access
+  ;; still needs that permit so retirement cannot clear slots underneath it.
+  (if (identical? world (selected-world))
+    (do (assert-open! world) (f))
+    #?(:clj
+       (let [lock (.readLock ^ReentrantReadWriteLock (.-gate world))]
+         (.lock lock)
+         (try
+           (assert-open! world)
+           (f)
+           (finally (.unlock lock))))
+       :default (with-counted-world-access world f))))
+
+(defn- assert-quiescent! [^DenseWorld world operation]
+  (when #?(:clj (let [^ReentrantReadWriteLock gate (.-gate world)]
+                  (or (pos? (.getReadHoldCount gate))
+                      (.isWriteLockedByCurrentThread gate)))
+           :default (pos? @(.-evaluation-depth world)))
+    (throw (ex-info (str "Cannot " (name operation)
+                         " a SCI world from inside its active evaluation or copy; suspend it first.")
+                    {:type ::active-world :operation operation}))))
+
 (defn with-active-world
   "Run `f` with the context's world installed. On the JVM evaluations take a
   shared gate permit; a fork takes the exclusive permit and therefore observes
@@ -157,16 +292,17 @@
   [ctx f]
   (if-let [world (:sci.impl/world ctx)]
     #?(:cljd
-       (call-with-active-world ctx f)
+       (with-counted-world-access world #(call-with-active-world ctx f))
        :clj
        (let [^DenseWorld world world
              lock (.readLock ^ReentrantReadWriteLock (.-gate world))]
          (.lock lock)
          (try
+           (assert-open! world)
            (call-with-active-world ctx f)
            (finally (.unlock lock))))
        :cljs
-       (call-with-active-world ctx f))
+       (with-counted-world-access world #(call-with-active-world ctx f)))
     (f)))
 
 (defn call-with-context
@@ -242,13 +378,15 @@
     (f)))
 
 (defn- slot-value [^DenseWorld world slot fallback]
-  (if (nil? slot)
-    fallback
-    (let [cells (current-cells world)]
-      (if (>= slot (cells-length cells))
-        fallback
-        (let [v (cells-get cells slot)]
-          (if (identical? absent v) fallback v))))))
+  (with-world-access
+   world
+   #(if (nil? slot)
+      fallback
+      (let [cells (current-cells world)]
+        (if (>= slot (cells-length cells))
+          fallback
+          (let [v (cells-get cells slot)]
+            (if (identical? absent v) fallback v)))))))
 
 (defn value [handle fallback]
   (if-let [^ReadWorld active (active-world-state)]
@@ -273,18 +411,26 @@
   [handle fallback]
   (let [ctx (selected-var-ctx handle)
         active (:sci.impl/read-world ctx)]
-    (if (or (nil? active) (.-primary? ^ReadWorld active))
+    (if (nil? active)
       fallback
       (let [world (.-world ^ReadWorld active)]
-        (slot-value world (:value-slot (descriptor world handle)) fallback)))))
+        (with-world-access
+         world
+         #(if (.-primary? ^ReadWorld active)
+            fallback
+            (slot-value world (:value-slot (descriptor world handle)) fallback)))))))
 
 (defn var-meta [handle fallback]
   (let [ctx (selected-var-ctx handle)
         active (:sci.impl/read-world ctx)]
-    (if (or (nil? active) (.-primary? ^ReadWorld active))
+    (if (nil? active)
       fallback
       (let [world (.-world ^ReadWorld active)]
-        (slot-value world (:meta-slot (descriptor world handle)) fallback)))))
+        (with-world-access
+         world
+         #(if (.-primary? ^ReadWorld active)
+            fallback
+            (slot-value world (:meta-slot (descriptor world handle)) fallback)))))))
 
 (defn namespace-meta [handle fallback]
   (let [active (active-world-state)]
@@ -311,6 +457,7 @@
 
 (defn- allocate-descriptor!
   [^DenseWorld world handle kind host-fork? value-fork-fn]
+  (assert-open! world)
   (let [registry (.-registry world)]
     (with-registry-lock
       registry
@@ -341,10 +488,11 @@
   not retained by the lineage registry. `fork-indexes` names values that need
   host `Forkable`/`:fork-fn` processing when a child world is copied."
   [kind values fork-indexes]
-  (let [^DenseWorld world (current-world)]
+  (let [^DenseWorld world (or (selected-world) (current-world))]
     (when-not world
       (throw (ex-info "Managed SCI state must be created inside an SCI context."
                       {:kind kind})))
+    (assert-open! world)
     (let [registry (.-registry world)
           desc (with-registry-lock
                  registry
@@ -392,6 +540,75 @@
          :clj (some? (.get ^WeakReference owner-ref))
          :cljs (some? (.deref owner-ref)))))
 
+(defn- retirement-cache-owners [^DenseWorld world]
+  (let [legacy (keep (fn [{:keys [owner-ref]}]
+                       #?(:cljd nil
+                          :clj (when owner-ref (.get ^WeakReference owner-ref))
+                          :cljs (when owner-ref (.deref owner-ref))))
+                     (:managed-descriptors @(.-registry world)))
+        seen #?(:clj (IdentityHashMap.) :cljs (js/Set.) :cljd nil)]
+    (into []
+          (filter (fn [owner]
+                    (and (satisfies? IWorldCache owner)
+                         #?(:clj (when-not (.containsKey ^IdentityHashMap seen owner)
+                                   (.put ^IdentityHashMap seen owner true)
+                                   true)
+                            :cljs (when-not (.has seen owner)
+                                    (.add seen owner)
+                                    true)
+                            :cljd true))))
+          (concat legacy (world-cache-owners world)))))
+
+(defn retire-world!
+  "Retire one interpreter world at a quiescent boundary. New evaluations and
+   forks are refused. Managed cache owners release their world-specific state;
+   this does not close foreign host resources or retire sibling worlds. Safe
+   to repeat after partial cleanup; keep the context until retirement succeeds."
+  [^DenseWorld world]
+  (assert-quiescent! world :retire)
+  (let [release! (fn []
+                   ;; Empty cells mark completed retirement. Failed cache
+                   ;; cleanup leaves cells intact and the world closed, so a
+                   ;; retry can finish cleanup without permitting evaluation.
+                   (when (or @(.-open? world)
+                             (pos? (cells-length (current-cells world))))
+                     (vreset! (.-open? world) false)
+                     (doseq [owner (retirement-cache-owners world)]
+                       (-retire-world-cache! owner world))
+                     (vreset! (.-cells-holder world) (new-cells 0)))
+                   nil)]
+    #?(:clj
+       (let [lock (.writeLock ^ReentrantReadWriteLock (.-gate world))]
+         (.lock lock)
+         (try (release!) (finally (.unlock lock))))
+       :default (release!))))
+
+(defn- fork-cleanup-failure [error cleanup-error target previous]
+  (ex-info "SCI fork failed and its unpublished world requires cleanup recovery."
+           (cond-> {:type ::fork-cleanup-failed
+                    :fork-error error
+                    :cleanup-error cleanup-error
+                    :recovery-world target}
+             previous (assoc :previous-recovery-failure previous))
+           error))
+
+(defn recover-failed-fork!
+  "Retry cleanup of the unpublished target retained by a failed SCI fork.
+   Never re-executes the fork or changes its source. A subsequent cleanup
+   failure retains the same target and original failure for another retry."
+  [error]
+  (let [{:keys [type fork-error recovery-world]} (ex-data error)]
+    (when-not (and (= ::fork-cleanup-failed type)
+                   (instance? DenseWorld recovery-world)
+                   (not @(.-open? ^DenseWorld recovery-world)))
+      (throw (ex-info "Expected an SCI fork cleanup recovery failure."
+                      {:type ::invalid-fork-recovery})))
+    (try
+      (retire-world! recovery-world)
+      (catch #?(:clj Throwable :cljs :default :cljd Object) cleanup-error
+        (throw (fork-cleanup-failure fork-error cleanup-error recovery-world error)))))
+  nil)
+
 (defn- sweep-managed! [^DenseWorld world]
   (let [cells (current-cells world)]
     (doseq [{:keys [owner-ref slots]}
@@ -407,13 +624,15 @@
   [home registry slot]
   (let [state (execution/current-state)]
     (if (identical? registry (execution/active-registry state))
-      (let [cells @(execution/active-cells-holder state)
-            value (if (>= slot (cells-length cells))
-                    absent
-                    (cells-get cells slot))]
-        (if (identical? value absent)
-          (slot-value home slot absent)
-          value))
+      (do
+        (assert-open! (selected-world))
+        (let [cells @(execution/active-cells-holder state)
+              value (if (>= slot (cells-length cells))
+                      absent
+                      (cells-get cells slot))]
+          (if (identical? value absent)
+            (slot-value home slot absent)
+            value)))
       (slot-value home slot absent))))
 
 (defn managed-value-in
@@ -433,16 +652,7 @@
                                   (.-registry ^DenseWorld
                                               (.-world ^ReadWorld active))))
         ^DenseWorld world (if related? (.-world ^ReadWorld active) home)]
-    #?(:cljd
-       (f world)
-       :clj
-       (if related?
-         (f world)
-         (let [lock (.readLock ^ReentrantReadWriteLock (.-gate world))]
-           (.lock lock)
-           (try (f world) (finally (.unlock lock)))))
-       :cljs
-       (f world))))
+    (with-world-access world #(f world))))
 
 (defn managed-swap!
   "CAS a directly described slot. The logical fallback represents a slot
@@ -875,60 +1085,98 @@
         target (new-cells (max 16 logical-n))
         descriptors (:descriptors registry-state)
         managed-descriptors (:managed-descriptors registry-state)
-        handles (set (keys descriptors))
+        ;; Membership concerns stable handle identity. Hashing arbitrary root
+        ;; values here can realize managed lazy sequences before fork-value
+        ;; even sees them (and can run arbitrary host hash/equals methods).
+        handles #?(:clj (let [index (IdentityHashMap.)]
+                          (doseq [handle (keys descriptors)]
+                            (.put index handle true))
+                          index)
+                    :cljs (js/Set. (to-array (keys descriptors)))
+                    :cljd (vec (keys descriptors)))
+        handle? (fn [value]
+                  #?(:clj (.containsKey ^IdentityHashMap handles value)
+                     :cljs (.has handles value)
+                     :cljd (boolean (some #(identical? % value) handles))))
         target-world (DenseWorld.
                       (volatile! target)
                       registry
                       #?(:cljd nil :clj (ReentrantReadWriteLock.) :cljs nil)
                       #?(:cljd nil :clj (ReentrantReadWriteLock.) :cljs nil)
-                      (volatile! true))]
+                      (volatile! true)
+                      (volatile! true)
+                      (volatile! 0))]
     (dotimes [i logical-n]
-      (cells-set! target i (cells-get source i)))
-    (when fork-value
-      ;; Per-cell copiers establish target-local type/control realizations
-      ;; before general Forkable values inspect the child world.
-      (doseq [[_ {:keys [value-slot value-fork-fn]}] descriptors
-              :when value-fork-fn
-              :when (< value-slot logical-n)
-              :let [v (cells-get target value-slot)]
-              :when (not (identical? absent v))]
-        (cells-set! target value-slot (value-fork-fn v)))
+      ;; The registry is shared by siblings, but each world's physical array
+      ;; only grows when that world allocates. Sibling-only slots are absent.
+      (cells-set! target i (if (< i (cells-length source))
+                            (cells-get source i)
+                            absent)))
+    (try
+      (when fork-value
+        ;; Establish target-local type/control realizations before general
+        ;; Forkable values inspect the selected child world.
+        (doseq [[_ {:keys [value-slot value-fork-fn]}] descriptors
+                :when value-fork-fn
+                :when (< value-slot logical-n)
+                :let [v (cells-get target value-slot)]
+                :when (not (identical? absent v))]
+          (cells-set! target value-slot (value-fork-fn v))))
       (call-with-selected-world
        target-world
        (fn []
-         (doseq [[_ {:keys [value-slot host-fork? value-fork-fn]}]
-                 descriptors
-                 :when (and host-fork? (nil? value-fork-fn))
-                 :when (< value-slot logical-n)
-                 :let [v (cells-get target value-slot)]
-                 :when (not (identical? absent v))]
-           (cells-set! target value-slot
-                       (if (contains? handles v) v (fork-value v))))
-         (doseq [{:keys [fork-slots]} managed-descriptors
-                 slot fork-slots
-                 :when (< slot logical-n)
-                 :let [v (cells-get target slot)]
-                 :when (not (identical? absent v))]
-           (cells-set! target slot (fork-value v))))))
-    target-world))
+         (when fork-value
+           (doseq [[_ {:keys [value-slot host-fork? value-fork-fn]}]
+                   descriptors
+                   :when (and host-fork? (nil? value-fork-fn))
+                   :when (< value-slot logical-n)
+                   :let [v (cells-get target value-slot)]
+                   :when (not (identical? absent v))]
+             (cells-set! target value-slot
+                         (if (handle? v) v (fork-value v))))
+           (doseq [{:keys [fork-slots]} managed-descriptors
+                   slot fork-slots
+                   :when (< slot logical-n)
+                   :let [v (cells-get target slot)]
+                   :when (not (identical? absent v))]
+             (cells-set! target slot (fork-value v))))
+         ;; Anonymous cache owners participate without reserving a dense slot
+         ;; per lazy node. Their snapshots never invoke deferred computations.
+         (doseq [owner (world-cache-owners world)]
+           (-fork-world-cache! owner world target-world))))
+      target-world
+      (catch #?(:clj Throwable :cljs :default :cljd Object) error
+        (try
+          (retire-world! target-world)
+          (catch #?(:clj Throwable :cljs :default :cljd Object) cleanup-error
+            (throw (fork-cleanup-failure error cleanup-error target-world nil))))
+        (throw error)))))
 
 (defn fork-world [^DenseWorld world fork-value snapshot-value snapshot-var-meta]
   #?(:cljd
      (do
-       (realize-primary! world snapshot-value snapshot-var-meta)
-       (copy-world world fork-value))
+       (assert-quiescent! world :fork)
+       (with-counted-world-access
+         world
+         #(do (realize-primary! world snapshot-value snapshot-var-meta)
+              (copy-world world fork-value))))
      :clj
      (let [^ReentrantReadWriteLock gate (.-gate world)]
-       (when (pos? (.getReadHoldCount gate))
+       (when (or (pos? (.getReadHoldCount gate))
+                 (.isWriteLockedByCurrentThread gate))
          (throw (IllegalStateException.
-                 "Cannot fork a SCI world from inside its active evaluation; suspend it first.")))
+                 "Cannot fork a SCI world from inside its active evaluation or copy; suspend it first.")))
        (let [lock (.writeLock gate)]
          (.lock lock)
          (try
+           (assert-open! world)
            (realize-primary! world snapshot-value snapshot-var-meta)
            (copy-world world fork-value)
            (finally (.unlock lock)))))
      :cljs
      (do
-       (realize-primary! world snapshot-value snapshot-var-meta)
-       (copy-world world fork-value))))
+       (assert-quiescent! world :fork)
+       (with-counted-world-access
+         world
+         #(do (realize-primary! world snapshot-value snapshot-var-meta)
+              (copy-world world fork-value))))))

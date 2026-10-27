@@ -1955,9 +1955,9 @@
 #?(:cljd nil
    :clj
    (deftest affine-host-resource-fork-policy-test
-     (testing "lazy realization is rejected"
+     (testing "foreign host lazy realization is rejected"
        (let [parent (tu/forkable-init nil)]
-         (sci/eval-string* parent "(def pending-xs (map inc [1 2 3]))")
+         (sci/intern parent 'user 'pending-xs (map inc [1 2 3]))
          (try
            (sci/fork parent)
            (is false "expected lazy sequence rejection")

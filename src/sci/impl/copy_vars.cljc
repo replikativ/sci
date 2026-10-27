@@ -5,7 +5,9 @@
    [clojure.string :as str]
    [sci.impl.cljs]
    [sci.impl.macros :as macros]
+   [sci.impl.syntax :as syntax]
    [sci.impl.utils :as utils :refer [clojure-core-ns]]
+   [sci.impl.vars :as vars]
    #?(:cljd [sci.lang :as lang] :default [sci.lang]))
   #?(:cljs (:require-macros [sci.impl.copy-vars :refer [copy-var copy-core-var macrofy]])))
 
@@ -86,12 +88,15 @@
           ;; Only exclude symbols that resolve to a non-core namespace (e.g. a
           ;; third-party fn named like a core inlined var). Core macros set up
           ;; via macrofy (ns, lazy-seq, ...) resolve to a bare unqualified symbol
-          ;; in CLJS, so a nil namespace counts as core.
+          ;; in CLJS, so a nil namespace counts as core. Self-hosted CLJS may
+          ;; instead resolve native macros into its exact cljs.core$macros
+          ;; namespace; arbitrary third-party $macros namespaces stay excluded.
           fqsym-ns (namespace fqsym)
           core-ns? (or (nil? fqsym-ns)
                        (= "clojure.core" fqsym-ns)
                        (= "cljd.core" fqsym-ns)
-                       (= "cljs.core" fqsym-ns))
+                       (= "cljs.core" fqsym-ns)
+                       (= "cljs.core$macros" fqsym-ns))
           inline (and core-ns? (contains? inlined-vars sym))
           fast-path (and core-ns? (or (= 'or sym)
                                       (= 'and sym)
@@ -190,6 +195,16 @@
                             (and (not elide-vars)
                                  extra-meta)
                             (merge extra-meta))))))
+
+(defn forkable-macro-var
+  "Copy one trusted native macro Var with immutable code output. Installed
+   only for forkable contexts, including consumers that invoke resolved
+   macros directly rather than through the interpreter's macroexpand API."
+  [sym v]
+  (let [f (vars/getRawRoot v)
+        wrapped (with-meta (fn [& args] (syntax/canonicalize (apply f args)))
+                  (meta f))]
+    (utils/new-var sym wrapped (meta v))))
 
 (defn new-var
   ([sym f] (new-var sym f nil nil))

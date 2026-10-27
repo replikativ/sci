@@ -27,10 +27,14 @@
      ;; Portable concrete runtime types for these hosts still need auditing.
      :cljd false))
 
-(defn- affine-resource-kind [value]
+(defn ^:no-doc affine-resource-kind [value]
   #?(:clj
      (cond
        (instance? clojure.lang.LazySeq value) :lazy-seq
+       (instance? clojure.lang.Iterate value) :iterate
+       (instance? clojure.lang.Cycle value) :cycle
+       (instance? clojure.lang.IteratorSeq value) :iterator-seq
+       (instance? clojure.lang.EnumerationSeq value) :enumeration-seq
        (instance? clojure.lang.Delay value)
        (when-not (realized? value) :pending-delay)
        (instance? java.util.concurrent.Future value)
@@ -78,6 +82,9 @@
      :cljs
      (cond
        (instance? cljs.core/LazySeq value) :lazy-seq
+       (instance? cljs.core/Iterate value) :iterate
+       (instance? cljs.core/Cycle value) :cycle
+       (instance? cljs.core/ES6IteratorSeq value) :iterator-seq
        (instance? cljs.core/Delay value)
        (when-not (realized? value) :pending-delay)
        (instance? js/Promise value) :promise
@@ -111,7 +118,10 @@
               (str "Cannot fork a SCI world containing an affine or external host resource (" (name affine-kind) "). Implement Forkable or provide :fork-fn to define an explicit policy.")
               {:type ::affine-resource
                :resource-kind affine-kind
-               :resource value}))
+               ;; Error reporting must not realize a rejected lazy stream or
+               ;; consume an iterator just to print its exception data.
+               :resource-type #?(:cljd "opaque-host-resource"
+                                  :default (str (type value)))}))
 
       #?(:clj (and (some? value) (.isArray ^Class (class value)))
          :cljs (array? value)
