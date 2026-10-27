@@ -4,6 +4,7 @@
    [sci.clojure-destructure-test]
    [sci.core-protocols-test]
    [sci.core-test]
+   [sci.cold-retirement-test]
    [sci.defrecords-and-deftype-test]
    [sci.destructure-test]
    [sci.error-test]
@@ -55,6 +56,7 @@
   (cljs.test/run-tests
    'sci.core-protocols-test
    'sci.core-test
+   'sci.cold-retirement-test
    'sci.destructure-test
    'sci.error-test
    'sci.hierarchies-test

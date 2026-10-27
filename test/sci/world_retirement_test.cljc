@@ -280,6 +280,9 @@
              target (atom nil)]
          (sci/intern parent 'user 'resource (RejectingFork. owner original target))
          (let [error (failure #(sci/fork parent))]
+           (is (sci/fork-recovery? error))
+           (is (false? (sci/fork-recovery? original)))
+           (is (false? (sci/fork-recovery? nil)))
            (is (= ::world/fork-cleanup-failed (:type (ex-data error))))
            (is (identical? original (:fork-error (ex-data error))))
            (is (:test-cache-failure (ex-data (:cleanup-error (ex-data error)))))

@@ -592,15 +592,21 @@
              previous (assoc :previous-recovery-failure previous))
            error))
 
+(defn fork-recovery?
+  "Whether a failure retains an unpublished fork target for cleanup retry."
+  [error]
+  (let [{:keys [type recovery-world]} (ex-data error)]
+    (boolean (and (= ::fork-cleanup-failed type)
+                  (instance? DenseWorld recovery-world)
+                  (not @(.-open? ^DenseWorld recovery-world))))))
+
 (defn recover-failed-fork!
   "Retry cleanup of the unpublished target retained by a failed SCI fork.
    Never re-executes the fork or changes its source. A subsequent cleanup
    failure retains the same target and original failure for another retry."
   [error]
-  (let [{:keys [type fork-error recovery-world]} (ex-data error)]
-    (when-not (and (= ::fork-cleanup-failed type)
-                   (instance? DenseWorld recovery-world)
-                   (not @(.-open? ^DenseWorld recovery-world)))
+  (let [{:keys [fork-error recovery-world]} (ex-data error)]
+    (when-not (fork-recovery? error)
       (throw (ex-info "Expected an SCI fork cleanup recovery failure."
                       {:type ::invalid-fork-recovery})))
     (try

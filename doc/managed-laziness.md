@@ -75,7 +75,8 @@ retired cannot use that home as a fallback.
 Retirement is idempotent. If a cooperating cache owner fails cleanup, the
 world remains closed and the retained context can retry retirement. If a fork
 fails and retiring its unpublished target also fails, the thrown exception
-retains both failures and a recovery capability. Keep it and use
+retains both failures and a recovery capability. `sci/fork-recovery?` identifies
+such a failure without running cleanup or exposing the target. Keep it and use
 `sci/recover-fork!`; this retries target cleanup, without repeating the fork or
 consuming its source. Do not drop that recovery exception before cleanup.
 

@@ -19,6 +19,14 @@
       (world/with-active-world
         ctx
         #(do
+         ;; Mark the exact shipped native handles before visiting environment
+         ;; Vars: an embedding may alias one under another namespace/key. Some
+         ;; lack :sci/built-in metadata, which must remain unchanged because it
+         ;; also governs mutation permissions and fork classification.
+         (doseq [v (concat (mapcat vals (vals namespaces/namespaces))
+                          (vals namespaces/forkable-core-overrides))
+                 :when (utils/var? v)]
+           (world/-mark-world-tracked! v nil))
          (doseq [[_ ns-map] (:namespaces @(:env ctx))
                  :let [ns-obj (:obj ns-map)]
                  :when ns-obj]
