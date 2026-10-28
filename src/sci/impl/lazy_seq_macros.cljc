@@ -16,6 +16,9 @@
                (-rest [this] (seq-rest this))
                cljs.core/INext
                (-next [this] (seq-next this))
+               cljs.core/IReduce
+               (-reduce [this f] (seq-reduce this f))
+               (-reduce [this f init] (seq-reduce this f init))
                cljs.core/ICollection
                (-conj [this x] (cons x this))
                cljs.core/IEmptyableCollection
@@ -43,6 +46,10 @@
                (next [this] (seq-next this))
                (more [this] (seq-rest this))
                (^clojure.lang.ISeq cons [this x] (clojure.lang.Cons. x this))
+               clojure.lang.IReduce
+               (reduce [this f] (seq-reduce this f))
+               clojure.lang.IReduceInit
+               (reduce [this f init] (seq-reduce this f init))
                clojure.lang.IPersistentCollection
                (count [this] (seq-count this))
                (empty [this] (with-meta '() (-seq-metadata this)))

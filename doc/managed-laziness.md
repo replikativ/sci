@@ -44,6 +44,22 @@ opaque host objects are left alone. This adapts compiler syntax, not arbitrary
 runtime lazy values. Standard native macro functions and interpreted user
 macros keep their existing behavior.
 
+## Reduction ownership
+
+Managed sequences implement reduction directly. Reduction walks validated
+segments without allocating a public contextualized view for each element.
+Each managed tail still resolves through its selected-world projection; foreign
+lazy or consuming tails are rejected before consumption. Interruption checks
+remain bounded, including inside native chunks, and early termination does not
+force the next tail.
+
+A host-side reduction owns its source world's read extent for the entire
+operation, including reducing callbacks. Forking or retiring that same world
+from a callback therefore refuses as active. Calling into another world restores
+the source selection on return. This extends the existing evaluation/copy
+reentry rule to direct host reduction; it does not make native external cursors
+forkable.
+
 ## Representation and lifetime
 
 A lazy value has a stable logical owner. Each world has an independent state
