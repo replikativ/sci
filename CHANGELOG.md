@@ -12,6 +12,14 @@ SCI is used in [babashka](https://github.com/babashka/babashka),
 
 ## Unreleased
 
+## 0.15.59-replikativ.8
+
+- Reduce managed sequences in validated segments while preserving selected-world
+  projections, cancellation checkpoints, and early termination.
+- Avoid repeated negative JVM protocol hierarchy scans on ordinary sequence
+  tails, retaining live external extensions and explicit adapter behavior.
+- Hold the source world's read extent through direct host reducing callbacks.
+
 ## 0.15.59-replikativ.7
 
 - Keep native namespace Var imports independent of the first interpreter's
