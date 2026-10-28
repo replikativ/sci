@@ -15,16 +15,21 @@
                      [java.util WeakHashMap Map List]
                      [clojure.lang ISeq SeqIterator IPending Murmur3])]))
 
+(defn- explicit-forkable? [value]
+  #?(:clj (or (instance? sci.fork.Forkable value)
+               (and (seq (:impls fork/Forkable)) (satisfies? fork/Forkable value)))
+     :default (satisfies? fork/Forkable value)))
+
 (defn checked-input
   "Reject a directly supplied opaque sequence/resource before a managed
    producer can hide it in a host closure. Nested host graphs still require
    explicit host cooperation."
   [value]
-  (when (and (not (satisfies? fork/Forkable value))
-             (fork/affine-resource-kind value))
-    (throw (ex-info "Foreign lazy or consuming sequence requires an explicit forkable adapter."
-                    {:type ::foreign-sequence
-                     :resource-kind (fork/affine-resource-kind value)})))
+  ;; An explicit adapter must short-circuit resource probes such as isDone.
+  (when-not (explicit-forkable? value)
+    (when-let [kind (fork/affine-resource-kind value)]
+      (throw (ex-info "Foreign lazy or consuming sequence requires an explicit forkable adapter."
+                      {:type ::foreign-sequence :resource-kind kind}))))
   value)
 
 (defprotocol ISequenceData
@@ -35,10 +40,19 @@
   (-seq-meta-clone [this m])
   (-seq-realized? [this]))
 
+(defn- sequence-data? [value]
+  #?(:clj (or (instance? sci.impl.lazy_seq.ISequenceData value)
+               ;; Protocol extensions remain supported and are observed live.
+               ;; Without extensions, a negative satisfies? walks/allocates the
+               ;; complete Java superclass graph on every native sequence tail.
+               (and (seq (:impls ISequenceData)) (satisfies? ISequenceData value)))
+     :default (satisfies? ISequenceData value)))
+
 (declare lazy-seq* contextualize sequence-view seq-value seq-first seq-next
          seq-rest seq-count seq-equiv seq-hash seq-java-hash seq-meta-clone
          seq-realized? seq-string java-list seq-iterator chunk-first* chunk-next*
-         chunk-rest* owner-context owner-value normalize-seq make-owner projection-data!)
+         chunk-rest* owner-context owner-value normalize-seq make-owner projection-data!
+         seq-reduce)
 
 (def ^:private realization-requires-normalization?
   ;; LazySeq's pending marker changed from its thunk to its normalization
@@ -213,7 +227,7 @@
                (recur (raw-value! owner))
                (call-seq value #(normalize-seq (raw-value! owner)))))
 
-           (satisfies? ISequenceData value)
+           (sequence-data? value)
            (let [selected (-seq-context value)]
              (if (identical? (:sci.impl/world selected) (world/selected-world))
                (recur (source-value value))
@@ -221,7 +235,7 @@
 
            :else
            (let [s (seq (checked-input value))]
-             (if (satisfies? ISequenceData s)
+             (if (sequence-data? s)
                (recur s)
                (checked-input s))))))
 
@@ -262,7 +276,7 @@
         Projection is cached beside raw realization, independently per world."
        ([ctx value]
         (contextualize ctx value
-                       (when (satisfies? ISequenceData value) (-seq-project value))))
+                       (when (sequence-data? value) (-seq-project value))))
        ([ctx value project]
         (cond
          (instance? ManagedSeq value)
@@ -334,6 +348,51 @@
 
      (defn- seq-rest [value]
        (call-seq value #(contextualize (store/get-ctx) (rest (-seq-data value)))))
+
+     (defn- reduction-data [initial]
+       (loop [value initial]
+         (interrupt!)
+         (if (sequence-data? value)
+           ;; Every managed tail may carry a selected-world projection. Raw
+           ;; normalization alone would unwrap its owner without projecting.
+           (recur (call-seq value #(-seq-data value)))
+           (let [s (seq (checked-input value))]
+             (if (sequence-data? s)
+               (recur s)
+               (checked-input s))))))
+
+     (defn- reduce-chunk [f init chunk]
+       (let [size (count chunk)]
+         (loop [index 0 result init]
+           (if (< index size)
+             (do
+               ;; Even an unusually large native chunk remains cancellable.
+               (when (zero? (bit-and index 31)) (interrupt!))
+               (let [result (f result (nth chunk index))]
+                 (if (reduced? result) result (recur (inc index) result))))
+             result))))
+
+     (defn- reduce-segments [f init initial]
+       (loop [result init s (reduction-data initial)]
+         (if s
+           (let [chunked? (chunked-seq? s)
+                 result (if chunked?
+                          (reduce-chunk f result (chunk-first s))
+                          (f result (first s)))]
+             (if (reduced? result)
+               @result
+               ;; Do not ask next to force a foreign tail before validation.
+               (recur result (reduction-data (if chunked? (chunk-rest s) (rest s))))))
+           result)))
+
+     (defn- seq-reduce
+       ([value f]
+        (call-seq value
+          #(if-let [s (reduction-data value)]
+             (reduce-segments f (first s) (rest s))
+             (f))))
+       ([value f init]
+        (call-seq value #(reduce-segments f init value))))
      (defn- seq-count [value] (call-seq value #(count (-seq-data value))))
      (defn- seq-meta-clone [value m]
        (call-seq value #(contextualize (store/get-ctx) (-seq-meta-clone value m) (-seq-project value))))
@@ -345,7 +404,7 @@
         (and (or (sequential? other) #?(:clj (instance? List other) :cljs false))
             (call-seq value
               #(loop [a (-seq-data value)
-                      b (if (satisfies? ISequenceData other)
+                      b (if (sequence-data? other)
                           (call-seq other (fn [] (-seq-data other)))
                           (seq other))]
                  (if a
