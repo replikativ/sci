@@ -179,8 +179,8 @@
   (if (nil? world)
     (f)
     (let [^objects state (current-publication-state)
-          depth (long (aget state 0))
-          run #(do (aset state 0 (inc depth))
+          depth (aget state 0)
+          run #(do (aset state 0 (num (inc (long depth))))
                    (try (f) (finally (aset state 0 depth))))
           [ok result]
           (try
@@ -189,7 +189,7 @@
                             (try (run) (finally (.unlock lock))))
                      :default (run))]
             (catch #?(:clj Throwable :cljs :default :cljd Object) e [false e]))
-          deferred-error (when (zero? depth) (run-deferred! state))]
+          deferred-error (when (zero? (long depth)) (run-deferred! state))]
       (cond (not ok) (throw result)
             deferred-error (throw deferred-error)
             :else result))))
@@ -315,7 +315,8 @@
 (defn selected-world
   "The actual selected world, including the target selected during copying."
   []
-  (some-> (active-world-state) (.-world)))
+  (when-let [^ReadWorld active (active-world-state)]
+    (.-world active)))
 
 (declare assert-accessible!)
 
