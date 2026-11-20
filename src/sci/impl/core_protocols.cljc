@@ -112,16 +112,19 @@
     v))
 
 (defn- primary-root-write!
-  "A root-only write of a still-mutable primary world, then the fork race
-   check (`world/sync-primary-root!`)."
+  "A host atom's root write (it ran user code) in a still-mutable primary
+   world, then the fork race check (`world/sync-primary-root!`)."
   [ref result]
   (world/sync-primary-root! ref #(clojure.core/deref ref))
   result)
 
+(defn- mutable-primary-vreset! [v x]
+  (world/mutable-primary-write! v x #(clojure.core/vreset! v %)))
+
 (defn forkable-vreset!*
   [v x]
   (if (world/mutable-primary-world?)
-    (primary-root-write! v (clojure.core/vreset! v x))
+    (mutable-primary-vreset! v x)
     (if (world/tracked? v)
       (if (world/primary-world?)
         ;; slot and volatile in one slot section
@@ -132,7 +135,7 @@
 (defn forkable-vswap!*
   [v f & args]
   (if (world/mutable-primary-world?)
-    (primary-root-write! v (clojure.core/vreset! v (apply f (clojure.core/deref v) args)))
+    (mutable-primary-vreset! v (apply f (clojure.core/deref v) args))
     (if (world/tracked? v)
       (forkable-vreset!* v (apply f (tracked-value v) args))
       (clojure.core/vreset! v (apply f (clojure.core/deref v) args)))))

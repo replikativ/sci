@@ -1114,19 +1114,46 @@
      (reset-slot! world (:value-slot (descriptor world handle)) value mirror)
      ::no-world)))
 
+(defn- primary-slot [^DenseWorld world handle]
+  (when-let [slot (:value-slot (descriptor world handle))]
+    (when (present-slot? world slot) slot)))
+
+(defn mutable-primary-write!
+  "Write `value` to the host object of `handle` (a volatile) in a
+   still-mutable primary world: `(write-root! value)` inside one slot
+   section, so the first fork's realization (which holds the section
+   exclusively) reads the root before or after the write, never in between
+   related writes. If the realization happened meanwhile, the write takes the
+   realized path: slot first, then the root mirrored from it."
+  [handle value write-root!]
+  (if-let [^ReadWorld active (active-world-state)]
+    (let [^DenseWorld world (.-world active)]
+      (with-cells-read-lock
+        world
+        #(if-let [slot (when @(.-persistent? world) (primary-slot world handle))]
+           (do (cells-set! (current-cells world) slot value)
+               (mirror! world slot write-root!))
+           (write-root! value)))
+      value)
+    (do (write-root! value) value)))
+
 (defn sync-primary-root!
-  "After a root-only write to `handle` (a volatile or host atom) in a
-   still-mutable primary world: if a fork has meanwhile started realizing
-   that world, publish the current root (`read-root`) into the slot. The
-   realization either read this write already or runs before this sync."
+  "After a root write to `handle` that ran user code (a host atom's swap!)
+   in a primary world: once that world is realized, make its slot agree with
+   the current root (`read-root`). Each syncing writer re-reads the root after
+   writing the slot, so the last one leaves them equal. The root write itself
+   precedes this section; no JVM/CLJS path tracks a host atom."
   [handle read-root]
   (when-let [^ReadWorld active (active-world-state)]
     (let [^DenseWorld world (.-world active)]
       (when (and (.-primary? active) @(.-persistent? world))
-        (when-let [slot (:value-slot (descriptor world handle))]
-          (when (present-slot? world slot)
-            (with-cells-read-lock
-              world #(cells-set! (current-cells world) slot (read-root))))))))
+        (when-let [slot (primary-slot world handle)]
+          (with-cells-read-lock
+            world
+            #(loop []
+               (let [r (read-root)]
+                 (cells-set! (current-cells world) slot r)
+                 (when-not (identical? r (read-root)) (recur)))))))))
   nil)
 
 (defn reset-var-meta!
@@ -1258,14 +1285,13 @@
       captured)))
 
 ;; A primary world reads its host objects (Var roots, volatiles) directly
-;; until its first fork. Writes through SCI keep the slot and the host object
-;; together in one slot section; a root-only write of a still-mutable primary
-;; (volatile, host atom) is followed by `sync-primary-root!`.
+;; until its first fork. Every write through SCI to such a host object runs
+;; in a slot section (with its slot once realized; a still-mutable volatile
+;; root via `mutable-primary-write!`), so this realization, holding the
+;; sections exclusively, reads a consistent set of roots. Only a host atom's
+;; swap! (user code, not tracked on JVM/CLJS) writes its root outside one.
 (defn- realize-primary! [^DenseWorld world snapshot-value snapshot-var-meta]
   (when-not @(.-persistent? world)
-    ;; Set before the roots are read. A root-only writer that missed this
-    ;; flag wrote before it (its root is read below); one that sees it
-    ;; republishes its root after this copy section (`sync-primary-root!`).
     (vreset! (.-persistent? world) true)
     (doseq [[handle {:keys [kind value-slot meta-slot]}]
             (:descriptors @(.-registry world))]
