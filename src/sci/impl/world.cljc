@@ -745,19 +745,25 @@
                                     (atom {:retained {} :done? false}))
                   @(.-retirement world)))]
     (when-not (:done? @r)
-      (let [owners (retirement-cache-owners world)
-            retained (reduce (fn [m owner]
-                               (if-let [entry (when (satisfies? IRetainedWorldCache owner)
-                                                (-world-cache-entry owner world))]
-                                 (assoc m owner entry)
-                                 m))
-                             {} owners)]
-        ;; Published before any owner releases its entry: a running
-        ;; evaluation that misses the owner's entry finds this one.
-        (swap! r update :retained merge retained)
-        (doseq [owner owners]
-          (-retire-world-cache! owner world))
-        (swap! r assoc :done? true))))
+      ;; A slot section: a fork whose copy is in progress copies the caches
+      ;; before they are released (this waits for that copy only); a fork
+      ;; starting later finds the world closed inside its own copy section.
+      (with-cells-read-lock
+        world
+        (fn []
+          (let [owners (retirement-cache-owners world)
+                retained (reduce (fn [m owner]
+                                   (if-let [entry (when (satisfies? IRetainedWorldCache owner)
+                                                    (-world-cache-entry owner world))]
+                                     (assoc m owner entry)
+                                     m))
+                                 {} owners)]
+            ;; Published before any owner releases its entry: a running
+            ;; evaluation that misses the owner's entry finds this one.
+            (swap! r update :retained merge retained)
+            (doseq [owner owners]
+              (-retire-world-cache! owner world))
+            (swap! r assoc :done? true))))))
   nil)
 
 (defn- fork-cleanup-failure [error cleanup-error target previous]

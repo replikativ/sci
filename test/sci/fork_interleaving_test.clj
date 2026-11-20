@@ -102,3 +102,25 @@
       (deref t1 5000 ::timeout))
     (is (= (sci/eval-string* ctx "@v") (sci/eval-string* (sci/fork ctx) "@v"))
         "a later fork copies the value the primary reads")))
+
+(deftest retirement-racing-a-fork-copy-keeps-the-childs-lazy-values
+  (let [ctx (forkable {})
+        _ (sci/eval-string* ctx "(def xs (lazy-seq [1 2]))")
+        owners @#'world/world-cache-owners
+        fork-thread (promise)
+        retirement (promise)]
+    (let [child (with-redefs [world/world-cache-owners
+                              (fn [& args]
+                                (when (and (identical? (Thread/currentThread) @fork-thread)
+                                           (not (realized? retirement)))
+                                  ;; the cells are copied; retire the source now
+                                  (let [r (future (sci/retire! ctx) :retired)]
+                                    (deliver retirement r)
+                                    (deref r 500 ::waiting)))
+                                (apply owners args))]
+                  (deref (future (deliver fork-thread (Thread/currentThread)) (sci/fork ctx))
+                         10000 ::timeout))]
+      (is (= :retired (deref @retirement 5000 ::timeout)))
+      (is (map? child))
+      (when (map? child)
+        (is (= [1 2] (sci/eval-string* child "(vec xs)")))))))
