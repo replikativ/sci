@@ -63,12 +63,17 @@ This shape combines four useful precedents:
   but a single def, namespace, type or method publication is never torn,
   and every handle reachable in the child has its own slots. A delay or lazy
   sequence still being realized forks as pending. A JVM Future held in the
-  world forks by its state at the cut: completed before it, as its value,
-  failure or cancellation (the Future is shared); still pending or running,
-  as a completed future whose `deref`/`.get` throws an ex-info with ex-data
-  `{:type :sci/forked-future}` (`realized?` and `future-done?` true,
-  `future-cancelled?` false). The parent's task keeps running; nothing is
-  waited for or re-run. ClojureScript has no future (`future` is a JVM addon);
+  world forks by its state when the copy reads it: a trusted Future
+  (exactly `FutureTask` or `CompletableFuture`, or one from
+  `clojure.core/future`) that is done is shared with its value, failure or
+  cancellation; a pending one, or any other Future (its `isDone` is host code
+  and is never called), forks as a completed future whose `deref`/`.get`
+  throws an ex-info with ex-data `{:type :sci/forked-future}` (`realized?`
+  and `future-done?` true, `future-cancelled?` false). The parent's task
+  keeps running; nothing is waited for or re-run. Host futures are not part
+  of the consistent cut: task completion is not a SCI write, so each Future
+  is classified at its own moment during the copy, and two related Futures
+  can fork as a combination they never had at one instant. ClojureScript has no future (`future` is a JVM addon);
   a JS Promise in a world cell is still rejected. Host `Forkable` callbacks run after the copy and must tolerate
   their source being mutated concurrently.
 - `retire!` closes a world at once: new evaluations, host accesses and forks

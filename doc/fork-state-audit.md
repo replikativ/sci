@@ -312,9 +312,13 @@ SCI's managed future conveyor runs the body in its captured world; a fork does
 not wait for it. At the generic host-value boundary, a Future already
 completed or cancelled at the cut is shared: its task lifecycle can no longer
 diverge, although values reachable from its result retain their ordinary
-shallow host policy. The copy section records which Futures held in world
-cells were done at the cut, so one completing just after it is not mistaken
-for a completed one. A Future still pending or running at the cut forks as
+shallow host policy. The copy section records which trusted Futures held in
+world cells (exactly `FutureTask`, `CompletableFuture`, or `clojure.core/future`'s
+wrapper, whose `isDone` is a volatile read) were done when it read them; an
+untrusted Future's `isDone` is host code and is never called. Completion is
+not a SCI write, so each Future is classified at its own moment during the
+copy: related Futures are not cut consistently with each other. A Future
+still pending or running when read, or untrusted, forks as
 `sci.fork/ForkedFuture`: completed and not cancelled, its `deref`/`.get`
 throws an ex-info with ex-data `{:type :sci/forked-future}`. The parent's task
 keeps running and is never waited for, re-run or changed. CLJS Promises cannot expose a

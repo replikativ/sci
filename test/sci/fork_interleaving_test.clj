@@ -200,3 +200,24 @@
           [value revision] (sci/eval-string* ctx q)]
       (is (= value revision) "one definition's value with another's metadata")
       (is (= [value revision] (sci/eval-string* (sci/fork ctx) q))))))
+
+(deftest an-untrusted-future-is-never-asked-whether-it-is-done
+  ;; isDone of an arbitrary Future is host code; a fork never calls it.
+  (let [called (atom 0)
+        task (reify java.util.concurrent.Future
+               (isDone [_] (swap! called inc) true)
+               (isCancelled [_] false)
+               (cancel [_ _] false)
+               (get [_] :host-value)
+               (get [_ _ _] :host-value))
+        ctx (forkable {:namespaces {'host {'task task}}})
+        _ (sci/eval-string* ctx "(def task host/task)")
+        child (sci/fork ctx)]
+    (is (zero? @called))
+    (is (= :sci/forked-future
+           (sci/eval-string* child "(try @task (catch Exception e (:type (ex-data e))))")))
+    (testing "trusted completed futures are still shared"
+      (let [cf (java.util.concurrent.CompletableFuture/completedFuture :done)
+            ctx (forkable {:namespaces {'host {'cf cf}}})
+            _ (sci/eval-string* ctx "(def cf host/cf)")]
+        (is (identical? cf (sci/eval-string* (sci/fork ctx) "cf")))))))

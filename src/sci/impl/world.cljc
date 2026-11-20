@@ -1402,6 +1402,8 @@
                (dotimes [i logical-n]
                  (let [v (cells-get target i)]
                    (when (and (instance? java.util.concurrent.Future v)
+                              ;; never an untrusted isDone: host code
+                              (fork/trusted-future? v)
                               (.isDone ^java.util.concurrent.Future v))
                      (.put done v true))))
                done)

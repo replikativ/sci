@@ -11,10 +11,25 @@
     "Return this value's realization in the child world."))
 
 ;; A forked world never waits for, re-runs or shares a task still running in
-;; its parent. The copy section records which world-held Futures were done at
-;; the cut (`*done-at-cut*`, an IdentityHashMap); without it the Future's
-;; current state is used.
+;; its parent. The copy section records which world-held trusted Futures were
+;; done when it read them (`*done-at-cut*`, an IdentityHashMap); without it
+;; their current state is used. Each Future is read at its own moment during
+;; the copy: task completion is not a SCI write, so related Futures are not
+;; part of one consistent cut.
 (def ^:no-doc ^:dynamic *done-at-cut* nil)
+
+#?(:clj
+   (defn ^:no-doc trusted-future?
+     "Futures whose isDone is a plain volatile read, safe to call while the
+      copy section excludes every writer: exactly FutureTask and
+      CompletableFuture (subclasses may override isDone), and the future-call
+      wrapper clojure.core/future returns (it delegates to a FutureTask). Any
+      other Future's isDone is host code and is never called by a fork."
+     [value]
+     (let [c (class value)]
+       (or (identical? c java.util.concurrent.FutureTask)
+           (identical? c java.util.concurrent.CompletableFuture)
+           (.startsWith (.getName ^Class c) "clojure.core$future_call$reify")))))
 
 #?(:clj
    (defn- forked-future-error []
@@ -43,13 +58,15 @@
 
 #?(:clj
    (defn- fork-future
-     "A Future done at the cut is shared: its value, failure or cancellation
-      can no longer change. Any other forks as a `ForkedFuture`; the parent's
-      task keeps running and is never waited for or re-run."
+     "A trusted Future done when the copy read it is shared: its value,
+      failure or cancellation can no longer change. Any other Future (pending,
+      or of an untrusted class) forks as a `ForkedFuture`; the parent's task
+      keeps running and is never waited for, re-run or asked anything."
      [^java.util.concurrent.Future value]
-     (if (if-let [^java.util.IdentityHashMap done *done-at-cut*]
-           (.containsKey done value)
-           (.isDone value))
+     (if (and (trusted-future? value)
+              (if-let [^java.util.IdentityHashMap done *done-at-cut*]
+                (.containsKey done value)
+                (.isDone value)))
        value
        (ForkedFuture.))))
 
