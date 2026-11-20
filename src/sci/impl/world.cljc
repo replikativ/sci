@@ -180,7 +180,8 @@
     (f)
     (let [^objects state (current-publication-state)
           depth (aget state 0)
-          run #(do (aset state 0 (num (inc (long depth))))
+          run #(do (aset state 0 #?(:clj (num (inc (long depth)))
+                                    :default (inc depth)))
                    (try (f) (finally (aset state 0 depth))))
           [ok result]
           (try
