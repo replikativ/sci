@@ -1369,6 +1369,17 @@
       (cells-set! target i (if (< i (cells-length source))
                             (cells-get source i)
                             absent)))
+    ;; SCI's own descriptor fork fns (loaded-libs ref, CLJS type data,
+    ;; ClojureDart method tables) snapshot SCI-owned mutable state, so they
+    ;; run here, cut with the cells and the environment. They are internal
+    ;; and never block or run user code. They establish target-local
+    ;; realizations before host Forkable values see the child world.
+    (doseq [[_ {:keys [value-slot value-fork-fn]}] (:descriptors registry-state)
+            :when value-fork-fn
+            :when (< value-slot logical-n)
+            :let [v (cells-get target value-slot)]
+            :when (not (identical? absent v))]
+      (cells-set! target value-slot (value-fork-fn v)))
     [(dense-world target (.-registry world) true) registry-state
      ;; Which world-held Futures were done at the cut: the fork policy shares
      ;; those and forks the others as pending-at-the-cut (`sci.fork`).
@@ -1403,14 +1414,6 @@
                   #?(:clj (.containsKey ^IdentityHashMap handles value)
                      :cljs (.has handles value)
                      :cljd (boolean (some #(identical? % value) handles))))]
-    ;; Establish target-local type/control realizations before general
-    ;; Forkable values inspect the selected child world.
-    (doseq [[_ {:keys [value-slot value-fork-fn]}] descriptors
-            :when value-fork-fn
-            :when (< value-slot logical-n)
-            :let [v (cells-get target value-slot)]
-            :when (not (identical? absent v))]
-      (cells-set! target value-slot (value-fork-fn v)))
     (call-with-selected-world
      target-world
      (fn []

@@ -142,3 +142,23 @@
         "retired child worlds are garbage collected")
     (is (= 1 (sci/eval-string* parent "shared")))
     (is (= 1 (sci/eval-string* (sci/fork parent) "shared")))))
+
+(deftest loaded-libs-are-cut-with-the-environment
+  (let [ctx (forkable {:load-fn (fn [{:keys [namespace]}]
+                                  {:file (str namespace ".clj")
+                                   :source (str "(ns " namespace ") (def loaded 1)")})})
+        fork-values! @#'world/fork-values!
+        fork-thread (promise)
+        child (with-redefs [world/fork-values!
+                            (fn [& args]
+                              (when (identical? (Thread/currentThread) @fork-thread)
+                                ;; after the copy section: the parent loads newlib
+                                (deref (future (sci/eval-string* ctx "(require 'newlib)")) 5000 :timeout))
+                              (apply fork-values! args))]
+                (deref (future (deliver fork-thread (Thread/currentThread)) (sci/fork ctx))
+                       10000 ::timeout))]
+    (is (= [true true] (sci/eval-string* ctx "[(boolean (find-ns 'newlib)) (contains? (loaded-libs) 'newlib)]")))
+    (is (map? child))
+    (when (map? child)
+      (is (= [false false]
+             (sci/eval-string* child "[(boolean (find-ns 'newlib)) (contains? (loaded-libs) 'newlib)]"))))))
