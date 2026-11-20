@@ -91,15 +91,22 @@
         (is (<= 5 @calls 32)))
       (finally (reset! cancelled? false) (sci/retire! ctx)))))
 
-(deftest host-reduction-owns-its-world-through-the-reducing-callback
-  (doseq [operation [sci/fork sci/retire!]]
-    (let [ctx (sci/init {:runtime-mode :forkable})]
-      (try
-        (let [value (sci/eval-string* ctx "(range 3)")]
-          (is (thrown? #?(:clj Exception :cljs js/Error)
-                       (reduce (fn [_ _] (operation ctx)) nil value))))
-        (is (= 42 (sci/eval-string* ctx "42")))
-        (finally (sci/retire! ctx))))))
+(deftest host-reduction-can-fork-or-retire-from-the-reducing-callback
+  ;; The callback runs inside the reduction's world: a fork there is a cut of
+  ;; that world; a retirement closes it while the reduction finishes.
+  (let [ctx (sci/init {:runtime-mode :forkable})
+        value (sci/eval-string* ctx "(def n (atom 0))
+                                     (defn s [i] (lazy-seq (when (< i 3) (swap! n inc) (cons i (s (inc i))))))
+                                     (s 0)")
+        children (reduce (fn [acc _] (conj acc (sci/fork ctx))) [] value)]
+    (is (= 3 (count children)))
+    (is (= [1 2 3] (mapv #(sci/eval-string* % "@n") children)))
+    (is (= 3 (sci/eval-string* ctx "@n"))))
+  (let [ctx (sci/init {:runtime-mode :forkable})
+        value (sci/eval-string* ctx "(range 3)")]
+    (is (= [0 1 2] (reduce (fn [acc x] (sci/retire! ctx) (conj acc x)) [] value)))
+    (is (thrown-with-msg? #?(:clj Exception :cljs js/Error) #"retired"
+                          (sci/eval-string* ctx "42")))))
 
 (deftest reducing-callback-restores-the-source-after-another-world-call
   (let [ctx (sci/init {:runtime-mode :forkable}) other (sci/init {:runtime-mode :forkable})]

@@ -415,6 +415,11 @@
 (defn fork
   "Forks a context (as produced with `init`) into an isolated runtime world.
 
+  A fork never waits for an evaluation: it may run while other threads
+  evaluate in `ctx`, or from inside an evaluation of `ctx` itself. The child
+  then sees the writes published before the fork (a cut between individual
+  writes such as one def), not necessarily a whole evaluation.
+
   Existing SCI Vars and SCI-created mutable primitives retain identity, but
   their values diverge after the fork. Host values may implement
   `sci.fork/Forkable`; `opts` may contain `:fork-fn`, which overrides the
@@ -427,16 +432,21 @@
                      (:fork-fn opts)
                      (:fork-fn ctx))
            fork-value (fork/value-forker fork-fn)
-           forked-world (world/fork-world
-                         source-world fork-value
-                         #(cond
-                            (utils/var? %) (vars/getRawRoot %)
-                            (utils/namespace? %) (meta %)
-                            (utils/sci-type? %) (t/getVal %)
-                            :else (c/deref %))
-                         meta)]
+           ;; The environment is read inside the copy section, after the
+           ;; cells: every mapping it holds was published after its slots.
+           [forked-world env]
+           (world/fork-world
+            source-world fork-value
+            #(cond
+               (utils/var? %) (vars/getRawRoot %)
+               (utils/namespace? %) (meta %)
+               (utils/sci-type? %) (t/getVal %)
+               :else (c/deref %))
+            meta
+            (fn [f] (store/with-ctx ctx (f)))
+            #(deref (:env ctx)))]
        (assoc ctx
-              :env (atom @(:env ctx))
+              :env (atom env)
               :fork-fn fork-fn
               :sci.impl/primary? false
               :sci.impl/world forked-world
@@ -446,10 +456,12 @@
      (update ctx :env (fn [env] (atom @env))))))
 
 (defn retire!
-  "Retire a quiescent forkable context and release its managed realization
-   caches. Future evaluation or forking through this context is refused;
-   related worlds remain usable. This does not close arbitrary host resources.
-   Standard contexts have no managed world and are unaffected."
+  "Retire a forkable context now and release its managed realization caches.
+   Future evaluation or forking through this context is refused; evaluations
+   already running in it (also the caller's own) finish against it, and its
+   memory is reclaimed by GC. Related worlds remain usable. This does not
+   close arbitrary host resources. Standard contexts have no managed world
+   and are unaffected."
   [ctx]
   (when-let [runtime-world (:sci.impl/world ctx)]
     (world/retire-world! runtime-world))

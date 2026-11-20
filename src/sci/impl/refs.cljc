@@ -313,13 +313,15 @@
 
 (deftype PendingDelayState [thunk delegate attempted failure]
   fork/Forkable
+  ;; A realization is published to the world slot (`delay-value`) when it
+  ;; completes; a fork's cut taken before that, also while the thunk is
+  ;; still running, copies the delay as pending. The live host delay is
+  ;; never consulted here: it may have completed after the cut, or still be
+  ;; running user code.
   (fork-value [_]
-    (cond
-      @failure (FailedDelayState. @failure)
-      (or @attempted (realized? delegate)) (RealizedDelayState. @delegate)
-      :else (PendingDelayState. thunk (host-delay thunk)
-                                (clojure.core/atom false)
-                                (clojure.core/atom nil))))
+    (PendingDelayState. thunk (host-delay thunk)
+                        (clojure.core/atom false)
+                        (clojure.core/atom nil)))
   IDelayState
   (-delay-value [_]
     (reset! attempted true)
@@ -330,6 +332,15 @@
         (throw error))))
   (-delay-realized? [_]
     (or @attempted (realized? delegate))))
+
+;; ClojureScript: a failed attempt leaves the delay retryable in its world but
+;; counts as realized, and a fork copies it as failed.
+(deftype AttemptedDelayState [pending error]
+  fork/Forkable
+  (fork-value [_] (FailedDelayState. error))
+  IDelayState
+  (-delay-value [_] (-delay-value pending))
+  (-delay-realized? [_] true))
 
 (declare delay-value delay-realized?)
 
@@ -363,8 +374,34 @@
 (defn- selected-delay-state [home registry state-slot]
   (world/managed-value home registry state-slot))
 
+(defn- publish-delay-state! [home registry state-slot pending state]
+  ;; Replace exactly the pending state this realization ran (in the selected
+  ;; related world, which may so far have read it from the home world).
+  (world/managed-compare-and-set! home registry state-slot pending state
+                                  (fn [_ _] nil) (fn [_ _ _ _] nil))
+  nil)
+
 (defn delay-value [home registry state-slot]
-  (-delay-value (selected-delay-state home registry state-slot)))
+  (let [state (selected-delay-state home registry state-slot)]
+    (if (or (instance? PendingDelayState state)
+            (instance? AttemptedDelayState state))
+      (let [value (try
+                    (-delay-value state)
+                    (catch #?(:cljd Object :clj Throwable :cljs :default) error
+                      ;; JVM delays cache a thrown exception; CLJS delays stay
+                      ;; pending and retryable.
+                      (publish-delay-state!
+                       home registry state-slot state
+                       #?(:clj (FailedDelayState. error)
+                          :default (AttemptedDelayState.
+                                    (if (instance? AttemptedDelayState state)
+                                      (.-pending ^AttemptedDelayState state)
+                                      state)
+                                    error)))
+                      (throw error)))]
+        (publish-delay-state! home registry state-slot state (RealizedDelayState. value))
+        value)
+      (-delay-value state))))
 
 (defn delay-realized? [home registry state-slot]
   (-delay-realized? (selected-delay-state home registry state-slot)))

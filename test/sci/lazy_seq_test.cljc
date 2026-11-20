@@ -347,7 +347,7 @@
 
 #?(:cljd nil
    :clj
-   (deftest fork-waits-for-an-active-realization
+   (deftest fork-does-not-wait-for-an-active-realization
      (let [entered (promise)
            release (promise)
            calls (atom 0)
@@ -360,16 +360,17 @@
        (let [reader (future (run parent "(first xs)"))]
          (try
            (is (= true (deref entered 2000 ::timeout)))
-           (let [forking (future (sci/fork parent))]
+           (let [forking (future (sci/fork parent))
+                 child (deref forking 2000 ::timeout)]
              (try
-               (is (= ::waiting (deref forking 50 ::waiting)))
+               (is (map? child) "the fork did not wait for the realization")
                (deliver release true)
                (is (= :value (deref reader 2000 ::timeout)))
-               (let [child (deref forking 2000 ::timeout)]
-                 (is (map? child))
-                 (when (map? child)
-                   (is (= :value (run child "(first xs)")))))
-               (is (= 1 @calls) "child inherits the completed realization")
+               (when (map? child)
+                 (is (= :value (run child "(first xs)"))))
+               (is (= 2 @calls) "the child realizes its still-pending copy itself")
+               (is (= :value (run parent "(first xs)")))
+               (is (= 2 @calls))
                (finally (future-cancel forking))))
            (finally
              (deliver release true)

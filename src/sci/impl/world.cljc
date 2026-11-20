@@ -2,9 +2,23 @@
   "Dense, fork-local runtime state for SCI contexts.
 
   Stable handles are assigned integer slots once per context lineage. A world
-  stores slot values densely and a frozen fork copies that array while the
-  source world is quiescent. Mutable primitives CAS only their own slot, so
-  unrelated atoms never contend on a shared world root."
+  stores slot values densely; a fork copies that array. Mutable primitives CAS
+  only their own slot, so unrelated atoms never contend on a shared world root.
+
+  Locking (JVM). Evaluation takes no world lock and reads slots lock-free.
+  - `slot-gate` (read): every slot write, together with the host-object
+    mirror of a primary world (Var root/meta, Namespace meta, Type data,
+    volatile) and a lazy realization step. No user code runs inside.
+  - `publish-gate` (read): a publication of several writes that must appear
+    together, e.g. a def (value, meta, namespace mapping). No user code runs
+    inside; watch notifications are deferred until it ends.
+  - A fork takes both write locks only for the copy: primary realization, the
+    cells, the lazy realization caches and the namespace environment. It
+    excludes writers for that copy and never waits for an evaluation.
+  - A resize takes `slot-gate` exclusively for the array copy.
+  A fork is therefore a cut between individual publications. Every
+  publication makes its result reachable last: slots are written before an
+  environment mapping or slot value refers to the handle."
   (:require [sci.ctx-store :as store]
             [sci.impl.execution :as execution])
   #?@(:cljd []
@@ -15,18 +29,31 @@
 
 (def absent #?(:cljd (Object.) :clj (Object.) :cljs (js/Object.)))
 
-(deftype DenseWorld [cells-holder registry gate resize-gate persistent? open? evaluation-depth])
+;; `gate` is retained for embedders that read the field; SCI no longer locks
+;; it, so a read permit taken there never delays a fork or a retirement.
+;; `retirement` is nil while open, else an atom of
+;; {:retained {owner realization} :done? bool}.
+(deftype DenseWorld [cells-holder registry gate slot-gate publish-gate
+                     persistent? open? retirement])
 
 (defprotocol IForkableWorldCache
   (-fork-world-cache! [owner source target]
     "Copy an existing source realization into the unpublished target without
-     invoking deferred computation. Missing source state remains missing."))
+     invoking deferred computation. Missing source state remains missing.
+     Called inside the fork's copy section: it must not block or run user
+     code."))
 
 (defprotocol IWorldCache
   (-retire-world-cache! [owner world]
-    "Release this managed owner's cache for one quiescent retired world.
+    "Release this managed owner's cache for one retired world.
      This internal hook only removes private cache entries: no user callbacks
      or I/O. It must be idempotent so failed retirement can be retried."))
+
+(defprotocol IRetainedWorldCache
+  (-world-cache-entry [owner world]
+    "This owner's realization for `world`, or nil. Retirement keeps it in the
+     retired world itself, so evaluations still running there find it after
+     the owner released it."))
 
 (defn assert-open! [^DenseWorld world]
   (when-not @(.-open? world)
@@ -84,19 +111,116 @@
 (defn- current-cells [^DenseWorld world]
   @(.-cells-holder world))
 
-(defn- with-cells-read-lock [^DenseWorld world f]
+(defn- with-cells-read-lock
+  "A slot write section: excluded by a resize or a fork's copy. `f` must not
+   run user code or wait on anything but these locks."
+  [^DenseWorld world f]
   #?(:cljd (f)
-     :clj (let [lock (.readLock ^ReentrantReadWriteLock (.-resize-gate world))]
+     :clj (let [lock (.readLock ^ReentrantReadWriteLock (.-slot-gate world))]
             (.lock lock)
             (try (f) (finally (.unlock lock))))
      :cljs (f)))
 
+(declare selected-world)
+
+(defn with-selected-slot-section
+  "Run `f` (no user code) as one slot write of the selected world, so a fork's
+   copy sees it entirely or not at all. Used for lazy realization steps."
+  [f]
+  (if-let [world (selected-world)]
+    (with-cells-read-lock world f)
+    (f)))
+
 (defn- with-cells-write-lock [^DenseWorld world f]
   #?(:cljd (f)
-     :clj (let [lock (.writeLock ^ReentrantReadWriteLock (.-resize-gate world))]
+     :clj (let [lock (.writeLock ^ReentrantReadWriteLock (.-slot-gate world))]
             (.lock lock)
             (try (f) (finally (.unlock lock))))
      :cljs (f)))
+
+;; Callbacks (Var watches) reached inside a publication run after it ends.
+;; JVM: per thread [depth deferred-thunks]; elsewhere one state.
+#?(:clj
+   (def ^:private ^ThreadLocal publication-state
+     (ThreadLocal/withInitial
+      (reify java.util.function.Supplier
+        (get [_] (object-array [0 nil])))))
+   :default
+   (def ^:private publication-state (volatile! (object-array [0 nil]))))
+
+(defn- current-publication-state []
+  #?(:clj (.get ^ThreadLocal publication-state)
+     :default @publication-state))
+
+(defn run-after-publication!
+  "Run `thunk` now, or after the publication this thread is inside ends.
+   Used for user callbacks (watches) triggered by a published write."
+  [thunk]
+  (let [^objects state (current-publication-state)]
+    (if (pos? (long (aget state 0)))
+      (aset state 1 (conj (or (aget state 1) []) thunk))
+      (thunk))
+    nil))
+
+(defn- run-deferred! [^objects state]
+  (let [thunks (aget state 1)]
+    (aset state 1 nil)
+    (reduce (fn [error thunk]
+              (try (thunk) error
+                   (catch #?(:clj Throwable :cljs :default :cljd Object) e
+                     (or error e))))
+            nil thunks)))
+
+(defn publishing-in
+  "Run `f` as one publication in `world`: a fork's copy observes all of its
+   writes or none. `f` must not run user code; callbacks it triggers through
+   `run-after-publication!` run after the publication, in order."
+  [^DenseWorld world f]
+  (if (nil? world)
+    (f)
+    (let [^objects state (current-publication-state)
+          depth (long (aget state 0))
+          run #(do (aset state 0 (inc depth))
+                   (try (f) (finally (aset state 0 depth))))
+          [ok result]
+          (try
+            [true #?(:clj (let [lock (.readLock ^ReentrantReadWriteLock (.-publish-gate world))]
+                            (.lock lock)
+                            (try (run) (finally (.unlock lock))))
+                     :default (run))]
+            (catch #?(:clj Throwable :cljs :default :cljd Object) e [false e]))
+          deferred-error (when (zero? depth) (run-deferred! state))]
+      (cond (not ok) (throw result)
+            deferred-error (throw deferred-error)
+            :else result))))
+
+(declare current-world)
+
+(defn publishing
+  "`publishing-in` the world of SCI's current context, or plain `(f)` outside
+   a forkable context."
+  [f]
+  (publishing-in (current-world) f))
+
+(defn- with-copy-section
+  "The fork's copy: excludes every publication and slot write of `world`,
+   never an evaluation."
+  [^DenseWorld world f]
+  #?(:clj
+     (let [^ReentrantReadWriteLock publish (.-publish-gate world)
+           ^ReentrantReadWriteLock slots (.-slot-gate world)]
+       (when (or (pos? (.getReadHoldCount publish))
+                 (pos? (.getReadHoldCount slots)))
+         (throw (IllegalStateException.
+                 "Cannot fork a SCI world from inside one of its publications.")))
+       (let [p (.writeLock publish)
+             c (.writeLock slots)]
+         (.lock p)
+         (try
+           (.lock c)
+           (try (f) (finally (.unlock c)))
+           (finally (.unlock p)))))
+     :default (f)))
 
 (defn- with-coordination [coordination f]
   #?(:cljd (f)
@@ -137,16 +261,22 @@
                        (js/FinalizationRegistry. (fn [ref] (.delete refs ref))))}))
      :cljd nil))
 
-(defn new-world []
+(defn- dense-world [cells registry persistent?]
   (DenseWorld.
-   (volatile! (new-cells 64))
-   (atom {:next-slot 0 :descriptors {} :managed-descriptors []
-          :world-caches (new-world-cache-index)})
+   (volatile! cells)
+   registry
    #?(:cljd nil :clj (ReentrantReadWriteLock.) :cljs nil)
    #?(:cljd nil :clj (ReentrantReadWriteLock.) :cljs nil)
-   (volatile! false)
+   #?(:cljd nil :clj (ReentrantReadWriteLock.) :cljs nil)
+   (volatile! persistent?)
    (volatile! true)
-   (volatile! 0)))
+   (atom nil)))
+
+(defn new-world []
+  (dense-world (new-cells 64)
+               (atom {:next-slot 0 :descriptors {} :managed-descriptors []
+                      :world-caches (new-world-cache-index)})
+               false))
 
 (defn active-world-state []
   #?(:cljd (execution/active-world)
@@ -187,6 +317,8 @@
   []
   (some-> (active-world-state) (.-world)))
 
+(declare assert-accessible!)
+
 (defn register-world-cache!
   "Register an identity-based internal owner of fork-local realizations. The
    lineage index retains the owner weakly and does not allocate dense slots.
@@ -197,7 +329,7 @@
     (when-not world
       (throw (ex-info "Managed caches must be registered inside an SCI context."
                       {:type ::missing-world})))
-    (assert-open! world)
+    (assert-accessible! world)
     (when-not (and (satisfies? IWorldCache owner)
                    (satisfies? IForkableWorldCache owner))
       (throw (ex-info "Managed cache owner must support fork and retirement."
@@ -255,54 +387,80 @@
           [])
         :cljd []))))
 
-(defn- with-counted-world-access [^DenseWorld world f]
-  (assert-open! world)
-  (vswap! (.-evaluation-depth world) inc)
-  (try
-    (f)
-    (finally (vswap! (.-evaluation-depth world) dec))))
+;; Worlds an evaluation on this thread was admitted to (`call-admitted`):
+;; e.g. the forms of one eval-string*, each entering the world separately.
+#?(:clj
+   (def ^:private ^ThreadLocal admitted (ThreadLocal.))
+   :default
+   (def ^:private admitted (volatile! nil)))
+
+(defn- admitted-worlds []
+  #?(:clj (.get ^ThreadLocal admitted) :default @admitted))
+
+(defn- assert-accessible!
+  "Entering or reading `world` from outside it requires an open world. An
+   evaluation already running in it (selected, or admitted on this thread)
+   finishes there even after retirement."
+  [^DenseWorld world]
+  (when-not @(.-open? world)
+    (when-not (or (identical? world (selected-world))
+                  (some #(identical? world %) (admitted-worlds)))
+      (assert-open! world)))
+  world)
+
+(defn call-admitted
+  "Run `f`, an evaluation of `ctx` that may enter its world several times
+   (one eval-string*), as one evaluation: admitted while the world is open,
+   it finishes even if the world is retired meanwhile."
+  [ctx f]
+  (if-let [world (:sci.impl/world ctx)]
+    (do
+      (assert-accessible! world)
+      (let [previous (admitted-worlds)]
+        #?(:clj (.set ^ThreadLocal admitted (cons world previous))
+           :default (vreset! admitted (cons world previous)))
+        (try (f)
+             (finally
+               #?(:clj (.set ^ThreadLocal admitted previous)
+                  :default (vreset! admitted previous))))))
+    (f)))
 
 (defn- with-world-access [^DenseWorld world f]
-  ;; An active related evaluation already owns its read permit. Host access
-  ;; still needs that permit so retirement cannot clear slots underneath it.
-  (if (identical? world (selected-world))
-    (do (assert-open! world) (f))
-    #?(:clj
-       (let [lock (.readLock ^ReentrantReadWriteLock (.-gate world))]
-         (.lock lock)
-         (try
-           (assert-open! world)
-           (f)
-           (finally (.unlock lock))))
-       :default (with-counted-world-access world f))))
+  (assert-accessible! world)
+  (f))
 
-(defn- assert-quiescent! [^DenseWorld world operation]
-  (when #?(:clj (let [^ReentrantReadWriteLock gate (.-gate world)]
-                  (or (pos? (.getReadHoldCount gate))
-                      (.isWriteLockedByCurrentThread gate)))
-           :default (pos? @(.-evaluation-depth world)))
+;; Worlds whose fork callbacks run on this thread. Such a callback can neither
+;; fork nor retire its source: that would recurse into the same copy.
+#?(:clj
+   (def ^:private ^ThreadLocal copying (ThreadLocal.))
+   :default
+   (def ^:private copying (volatile! nil)))
+
+(defn- copying-worlds []
+  #?(:clj (.get ^ThreadLocal copying) :default @copying))
+
+(defn- set-copying-worlds! [worlds]
+  #?(:clj (.set ^ThreadLocal copying worlds) :default (vreset! copying worlds)))
+
+(defn- with-copying [^DenseWorld world f]
+  (let [previous (copying-worlds)]
+    (set-copying-worlds! (cons world previous))
+    (try (f) (finally (set-copying-worlds! previous)))))
+
+(defn- assert-not-copying! [^DenseWorld world operation]
+  (when (some #(identical? world %) (copying-worlds))
     (throw (ex-info (str "Cannot " (name operation)
-                         " a SCI world from inside its active evaluation or copy; suspend it first.")
+                         " a SCI world from inside its active evaluation or copy.")
                     {:type ::active-world :operation operation}))))
 
 (defn with-active-world
-  "Run `f` with the context's world installed. On the JVM evaluations take a
-  shared gate permit; a fork takes the exclusive permit and therefore observes
-  a quiescent source world without adding locks to individual reads."
+  "Run `f` with the context's world installed. Evaluation takes no world
+  lock: a fork excludes only slot writers, for its copy, and a retirement
+  only refuses new entries."
   [ctx f]
   (if-let [world (:sci.impl/world ctx)]
-    #?(:cljd
-       (with-counted-world-access world #(call-with-active-world ctx f))
-       :clj
-       (let [^DenseWorld world world
-             lock (.readLock ^ReentrantReadWriteLock (.-gate world))]
-         (.lock lock)
-         (try
-           (assert-open! world)
-           (call-with-active-world ctx f)
-           (finally (.unlock lock))))
-       :cljs
-       (with-counted-world-access world #(call-with-active-world ctx f)))
+    (do (assert-accessible! world)
+        (call-with-active-world ctx f))
     (f)))
 
 (defn call-with-context
@@ -457,7 +615,7 @@
 
 (defn- allocate-descriptor!
   [^DenseWorld world handle kind host-fork? value-fork-fn]
-  (assert-open! world)
+  (assert-accessible! world)
   (let [registry (.-registry world)]
     (with-registry-lock
       registry
@@ -492,7 +650,7 @@
     (when-not world
       (throw (ex-info "Managed SCI state must be created inside an SCI context."
                       {:kind kind})))
-    (assert-open! world)
+    (assert-accessible! world)
     (let [registry (.-registry world)
           desc (with-registry-lock
                  registry
@@ -559,29 +717,43 @@
                             :cljd true))))
           (concat legacy (world-cache-owners world)))))
 
+(defn retired-cache-entry
+  "The realization `owner` held for the retired `world` when it was retired,
+   or nil. Evaluations still running in a retired world read their caches
+   here after the owners released them."
+  [^DenseWorld world owner]
+  (when-let [r @(.-retirement world)]
+    (get (:retained @r) owner)))
+
 (defn retire-world!
-  "Retire one interpreter world at a quiescent boundary. New evaluations and
-   forks are refused. Managed cache owners release their world-specific state;
-   this does not close foreign host resources or retire sibling worlds. Safe
-   to repeat after partial cleanup; keep the context until retirement succeeds."
+  "Retire one interpreter world now. New evaluations and forks are refused;
+   evaluations already running in it finish against it. Managed cache owners
+   release their world-specific state (the world itself keeps what running
+   evaluations still need, and is reclaimed by GC with it); this does not
+   close foreign host resources or retire sibling worlds. Safe to repeat
+   after a failed cache cleanup."
   [^DenseWorld world]
-  (assert-quiescent! world :retire)
-  (let [release! (fn []
-                   ;; Empty cells mark completed retirement. Failed cache
-                   ;; cleanup leaves cells intact and the world closed, so a
-                   ;; retry can finish cleanup without permitting evaluation.
-                   (when (or @(.-open? world)
-                             (pos? (cells-length (current-cells world))))
-                     (vreset! (.-open? world) false)
-                     (doseq [owner (retirement-cache-owners world)]
-                       (-retire-world-cache! owner world))
-                     (vreset! (.-cells-holder world) (new-cells 0)))
-                   nil)]
-    #?(:clj
-       (let [lock (.writeLock ^ReentrantReadWriteLock (.-gate world))]
-         (.lock lock)
-         (try (release!) (finally (.unlock lock))))
-       :default (release!))))
+  (assert-not-copying! world :retire)
+  (vreset! (.-open? world) false)
+  (let [r (or @(.-retirement world)
+              (do (compare-and-set! (.-retirement world) nil
+                                    (atom {:retained {} :done? false}))
+                  @(.-retirement world)))]
+    (when-not (:done? @r)
+      (let [owners (retirement-cache-owners world)
+            retained (reduce (fn [m owner]
+                               (if-let [entry (when (satisfies? IRetainedWorldCache owner)
+                                                (-world-cache-entry owner world))]
+                                 (assoc m owner entry)
+                                 m))
+                             {} owners)]
+        ;; Published before any owner releases its entry: a running
+        ;; evaluation that misses the owner's entry finds this one.
+        (swap! r update :retained merge retained)
+        (doseq [owner owners]
+          (-retire-world-cache! owner world))
+        (swap! r assoc :done? true))))
+  nil)
 
 (defn- fork-cleanup-failure [error cleanup-error target previous]
   (ex-info "SCI fork failed and its unpublished world requires cleanup recovery."
@@ -630,8 +802,9 @@
   [home registry slot]
   (let [state (execution/current-state)]
     (if (identical? registry (execution/active-registry state))
+      ;; The active world: an evaluation running there finishes even after
+      ;; the world was retired.
       (do
-        (assert-open! (selected-world))
         (let [cells @(execution/active-cells-holder state)
               value (if (>= slot (cells-length cells))
                       absent
@@ -819,6 +992,19 @@
            (recur)
            nil))))))
 
+(defn- mirror!
+  "Inside a slot section, after `slot` was written: make the host object of a
+   primary world (`mirror` writes it, no user code) agree with the slot.
+   Concurrent writers each re-read the slot after mirroring it, so the last
+   mirror leaves the host object equal to the slot."
+  [^DenseWorld world slot mirror]
+  (when mirror
+    (loop []
+      (let [v (cells-get (current-cells world) slot)]
+        (mirror v)
+        (when-not (identical? v (cells-get (current-cells world) slot))
+          (recur))))))
+
 (defn register!
   ([handle value]
    (register! handle value nil))
@@ -851,27 +1037,30 @@
               desc)))))))
 
 (defn register-var!
+  "Write a Var's value and metadata (and watches) in one slot section.
+   `mirror-root`, when given, writes the primary world's Var root in that
+   same section (see `mirror!`)."
   ([handle value m]
-   (register-var! handle value m nil))
+   (register-var! handle value m nil nil))
   ([handle value m watches]
+   (register-var! handle value m watches nil))
+  ([handle value m watches mirror-root]
    (when-let [^DenseWorld world (current-world)]
      (-mark-world-tracked! handle
                            (when-not (:sci/built-in m) store/*ctx*))
      (let [{:keys [value-slot meta-slot]}
            (allocate-descriptor! world handle :var (not (:sci/built-in m))
-                                 (:sci.impl/fork-fn m))]
-       (ensure-capacity! world (inc meta-slot))
+                                 (:sci.impl/fork-fn m))
+           watch-slot (when (seq watches)
+                        (:watch-slot (allocate-var-watch-slot! world handle watches)))]
+       (ensure-capacity! world (inc (max meta-slot (or watch-slot 0))))
        (with-cells-read-lock
          world
          #(let [cells (current-cells world)]
             (cells-set! cells value-slot value)
-            (cells-set! cells meta-slot m)))
-       (when (seq watches)
-           (let [{:keys [watch-slot]}
-               (allocate-var-watch-slot! world handle watches)]
-           (ensure-capacity! world (inc watch-slot))
-           (with-cells-read-lock
-             world #(cells-set! (current-cells world) watch-slot watches))))))
+            (cells-set! cells meta-slot m)
+            (when watch-slot (cells-set! cells watch-slot watches))
+            (mirror! world value-slot mirror-root)))))
    handle))
 
 (defn register-namespace! [handle m]
@@ -901,127 +1090,138 @@
               (cells-set! cells value-slot data))))))
    handle))
 
-(defn- reset-slot! [^DenseWorld world slot value]
+(defn- reset-slot! [^DenseWorld world slot value mirror]
   (if (nil? slot)
     ::no-world
     (do
       (ensure-capacity! world (inc slot))
       (with-cells-read-lock
-        world #(cells-set! (current-cells world) slot value)))))
+        world #(do (cells-set! (current-cells world) slot value)
+                   (mirror! world slot mirror)
+                   value)))))
 
-(defn reset-value! [handle value]
-  (if-let [world (current-world)]
-    (reset-slot! world (:value-slot (descriptor world handle)) value)
-    ::no-world))
+(defn reset-value!
+  "Reset a tracked slot; `mirror` (optional) writes the primary world's host
+   object in the same slot section."
+  ([handle value] (reset-value! handle value nil))
+  ([handle value mirror]
+   (if-let [world (current-world)]
+     (reset-slot! world (:value-slot (descriptor world handle)) value mirror)
+     ::no-world)))
 
-(defn reset-var-meta! [handle m]
-  (if-let [^DenseWorld world (current-world)]
-    (let [{:keys [meta-slot]} (or (descriptor world handle)
-                                  (allocate-descriptor! world handle :var
-                                                        (not (:sci/built-in m))
-                                                        (:sci.impl/fork-fn m)))]
-      (reset-slot! world meta-slot m))
-    ::no-world))
+(defn sync-primary-root!
+  "After a root-only write to `handle` (a volatile or host atom) in a
+   still-mutable primary world: if a fork has meanwhile started realizing
+   that world, publish the current root (`read-root`) into the slot. The
+   realization either read this write already or runs before this sync."
+  [handle read-root]
+  (when-let [^ReadWorld active (active-world-state)]
+    (let [^DenseWorld world (.-world active)]
+      (when (and (.-primary? active) @(.-persistent? world))
+        (when-let [slot (:value-slot (descriptor world handle))]
+          (when (present-slot? world slot)
+            (with-cells-read-lock
+              world #(cells-set! (current-cells world) slot (read-root))))))))
+  nil)
 
-(defn reset-namespace-meta! [handle m]
-  (if-let [^DenseWorld world (current-world)]
-    (let [{:keys [value-slot]}
-          (or (descriptor world handle)
-              (allocate-descriptor! world handle :namespace false nil))]
-      (reset-slot! world value-slot m))
-    ::no-world))
+(defn reset-var-meta!
+  ([handle m] (reset-var-meta! handle m nil))
+  ([handle m mirror]
+   (if-let [^DenseWorld world (current-world)]
+     (let [{:keys [meta-slot]} (or (descriptor world handle)
+                                   (allocate-descriptor! world handle :var
+                                                         (not (:sci/built-in m))
+                                                         (:sci.impl/fork-fn m)))]
+       (reset-slot! world meta-slot m mirror))
+     ::no-world)))
 
-(defn reset-type-data! [handle data]
-  (if-let [^DenseWorld world (current-world)]
-    (let [{:keys [value-slot]}
-          (or (descriptor world handle)
-              (allocate-descriptor! world handle :type false nil))]
-      (reset-slot! world value-slot data))
-    ::no-world))
+(defn reset-namespace-meta!
+  ([handle m] (reset-namespace-meta! handle m nil))
+  ([handle m mirror]
+   (if-let [^DenseWorld world (current-world)]
+     (let [{:keys [value-slot]}
+           (or (descriptor world handle)
+               (allocate-descriptor! world handle :namespace false nil))]
+       (reset-slot! world value-slot m mirror))
+     ::no-world)))
 
-(defn alter-var-meta! [handle fallback f args]
-  (if-let [^DenseWorld world (current-world)]
-    (let [{:keys [meta-slot]} (or (descriptor world handle)
-                                  (allocate-descriptor! world handle :var
-                                                        (not (:sci/built-in fallback))
-                                                        (:sci.impl/fork-fn fallback)))]
-      (ensure-capacity! world (inc meta-slot))
-      (with-cells-read-lock
-        world
-        #(loop []
-           (let [cells (current-cells world)
-                 raw-old (cells-get cells meta-slot)
-                 old (if (identical? absent raw-old) fallback raw-old)
-                 new (apply f old args)]
-             (if (cells-cas! cells meta-slot raw-old new) new (recur))))))
-    ::no-world))
+(defn reset-type-data!
+  ([handle data] (reset-type-data! handle data nil))
+  ([handle data mirror]
+   (if-let [^DenseWorld world (current-world)]
+     (let [{:keys [value-slot]}
+           (or (descriptor world handle)
+               (allocate-descriptor! world handle :type false nil))]
+       (reset-slot! world value-slot data mirror))
+     ::no-world)))
 
-(defn alter-namespace-meta! [handle fallback f args]
-  (if-let [^DenseWorld world (current-world)]
-    (let [{:keys [value-slot]}
-          (or (descriptor world handle)
-              (allocate-descriptor! world handle :namespace false nil))]
-      (ensure-capacity! world (inc value-slot))
-      (with-cells-read-lock
-        world
-        #(loop []
-           (let [cells (current-cells world)
-                 raw-old (cells-get cells value-slot)
-                 old (if (identical? absent raw-old) fallback raw-old)
-                 new (apply f old args)]
-             (if (cells-cas! cells value-slot raw-old new) new (recur))))))
-    ::no-world))
+(defn- alter-slot!
+  "Apply `f` (user code) outside every lock, then CAS the result in a slot
+   section; retry when the slot changed meanwhile."
+  [^DenseWorld world slot fallback f args mirror]
+  (ensure-capacity! world (inc slot))
+  (loop []
+    (let [raw-old (cells-get (current-cells world) slot)
+          old (if (identical? absent raw-old) fallback raw-old)
+          new (apply f old args)]
+      (if (with-cells-read-lock
+            world
+            #(when (cells-cas! (current-cells world) slot raw-old new)
+               (mirror! world slot mirror)
+               true))
+        new
+        (recur)))))
 
-(defn alter-type-data! [handle fallback f args]
-  (if-let [^DenseWorld world (current-world)]
-    (let [{:keys [value-slot]}
-          (or (descriptor world handle)
-              (allocate-descriptor! world handle :type false nil))]
-      (ensure-capacity! world (inc value-slot))
-      (with-cells-read-lock
-        world
-        #(loop []
-           (let [cells (current-cells world)
-                 raw-old (cells-get cells value-slot)
-                 old (if (identical? absent raw-old) fallback raw-old)
-                 new (apply f old args)]
-             (if (cells-cas! cells value-slot raw-old new) new (recur))))))
-    ::no-world))
+(defn alter-var-meta!
+  ([handle fallback f args] (alter-var-meta! handle fallback f args nil))
+  ([handle fallback f args mirror]
+   (if-let [^DenseWorld world (current-world)]
+     (let [{:keys [meta-slot]} (or (descriptor world handle)
+                                   (allocate-descriptor! world handle :var
+                                                         (not (:sci/built-in fallback))
+                                                         (:sci.impl/fork-fn fallback)))]
+       (alter-slot! world meta-slot fallback f args mirror))
+     ::no-world)))
+
+(defn alter-namespace-meta!
+  ([handle fallback f args] (alter-namespace-meta! handle fallback f args nil))
+  ([handle fallback f args mirror]
+   (if-let [^DenseWorld world (current-world)]
+     (let [{:keys [value-slot]}
+           (or (descriptor world handle)
+               (allocate-descriptor! world handle :namespace false nil))]
+       (alter-slot! world value-slot fallback f args mirror))
+     ::no-world)))
+
+(defn alter-type-data!
+  ([handle fallback f args] (alter-type-data! handle fallback f args nil))
+  ([handle fallback f args mirror]
+   (if-let [^DenseWorld world (current-world)]
+     (let [{:keys [value-slot]}
+           (or (descriptor world handle)
+               (allocate-descriptor! world handle :type false nil))]
+       (alter-slot! world value-slot fallback f args mirror))
+     ::no-world)))
 
 (defn alter-var-watches! [handle fallback f args]
   (if-let [^DenseWorld world (current-world)]
     (let [{:keys [watch-slot]}
           (allocate-var-watch-slot! world handle fallback)]
-      (ensure-capacity! world (inc watch-slot))
-      (with-cells-read-lock
-        world
-        #(loop []
-           (let [cells (current-cells world)
-                 raw-old (cells-get cells watch-slot)
-                 old (if (identical? absent raw-old) fallback raw-old)
-                 new (apply f old args)]
-             (if (cells-cas! cells watch-slot raw-old new) new (recur))))))
+      (alter-slot! world watch-slot fallback f args nil))
     ::no-world))
 
 (defn swap-value!
   "Atomically update one tracked slot. Unrelated SCI atoms do not contend and
-  cannot cause `f` to be retried."
+  cannot cause `f` to be retried. `f` and `validate!` run outside every lock."
   [handle f args validate! notify!]
   (let [^DenseWorld world (current-world)
         slot (:value-slot (descriptor world handle))]
     (loop []
-      (let [cells (current-cells world)
-            old (cells-get cells slot)
-            new (apply f old args)
-            committed (with-cells-read-lock
-                        world
-                        #(let [cells (current-cells world)]
-                           (if-not (identical? old (cells-get cells slot))
-                             false
-                             (do
-                               (validate! new)
-                               (cells-cas! cells slot old new)))))]
-        (if committed
+      (let [old (cells-get (current-cells world) slot)
+            new (apply f old args)]
+        (validate! new)
+        (if (with-cells-read-lock
+              world #(cells-cas! (current-cells world) slot old new))
           (do (notify! old new) new)
           (recur))))))
 
@@ -1031,18 +1231,15 @@
 (defn compare-and-set-tracked! [handle expected new validate! notify!]
   (let [^DenseWorld world (current-world)
         slot (:value-slot (descriptor world handle))
-        result (with-cells-read-lock
-                 world
-                 #(let [cells (current-cells world)
-                        old (cells-get cells slot)]
-                    (if-not (identical? expected old)
-                      ::failed
-                      (do
-                        (validate! new)
-                        (if (cells-cas! cells slot old new) old ::failed)))))]
-    (if (identical? ::failed result)
+        old (cells-get (current-cells world) slot)]
+    (if-not (identical? expected old)
       false
-      (do (notify! result new) true))))
+      (do
+        (validate! new)
+        (if (with-cells-read-lock
+              world #(cells-cas! (current-cells world) slot old new))
+          (do (notify! old new) true)
+          false)))))
 
 (defn active-ctx
   "Use the currently evaluating descendant context for an interpreted closure.
@@ -1055,40 +1252,65 @@
       active
       captured)))
 
+;; A primary world reads its host objects (Var roots, volatiles) directly
+;; until its first fork. Writes through SCI keep the slot and the host object
+;; together in one slot section; a root-only write of a still-mutable primary
+;; (volatile, host atom) is followed by `sync-primary-root!`.
 (defn- realize-primary! [^DenseWorld world snapshot-value snapshot-var-meta]
   (when-not @(.-persistent? world)
+    ;; Set before the roots are read. A root-only writer that missed this
+    ;; flag wrote before it (its root is read below); one that sees it
+    ;; republishes its root after this copy section (`sync-primary-root!`).
+    (vreset! (.-persistent? world) true)
     (doseq [[handle {:keys [kind value-slot meta-slot]}]
             (:descriptors @(.-registry world))]
       (when (present-slot? world value-slot)
         (cells-set! (current-cells world) value-slot (snapshot-value handle))
         (when (= :var kind)
-          (cells-set! (current-cells world) meta-slot (snapshot-var-meta handle)))))
-    (vreset! (.-persistent? world) true))
+          (cells-set! (current-cells world) meta-slot (snapshot-var-meta handle))))))
   world)
 
-(defn- call-with-selected-world [^DenseWorld world f]
-  (let [state #?(:cljd (execution/current-state)
-                 :clj (.get ^ThreadLocal execution/current)
-                 :cljs (execution/current-state))
-        previous (execution/active-world state)
-        previous-scope (execution/binding-scope state)]
-    (install-active-world! state (ReadWorld. world false))
-    (execution/set-binding-scope! state world)
-    (execution/refresh-active-bindings! state)
-    (try
-      (f)
-      (finally
-        (install-active-world! state previous)
-        (execution/set-binding-scope! state previous-scope)
-        (execution/refresh-active-bindings! state)))))
+(defn- call-with-selected-world
+  ([world f] (call-with-selected-world world false f))
+  ([^DenseWorld world primary? f]
+   (let [state #?(:cljd (execution/current-state)
+                  :clj (.get ^ThreadLocal execution/current)
+                  :cljs (execution/current-state))
+         previous (execution/active-world state)
+         previous-scope (execution/binding-scope state)]
+     (install-active-world! state (ReadWorld. world primary?))
+     (execution/set-binding-scope! state world)
+     (execution/refresh-active-bindings! state)
+     (try
+       (f)
+       (finally
+         (install-active-world! state previous)
+         (execution/set-binding-scope! state previous-scope)
+         (execution/refresh-active-bindings! state))))))
 
-(defn- copy-world [^DenseWorld world fork-value]
+(defn- copy-cells!
+  "Inside the copy section: the source's cells as a new unpublished world
+   (sharing the lineage registry) and the registry state they were cut at."
+  [^DenseWorld world]
   (sweep-managed! world)
   (let [source (current-cells world)
-        registry (.-registry world)
-        registry-state @registry
+        registry-state @(.-registry world)
         logical-n (:next-slot registry-state)
-        target (new-cells (max 16 logical-n))
+        target (new-cells (max 16 logical-n))]
+    (dotimes [i logical-n]
+      ;; The registry is shared by siblings, but each world's physical array
+      ;; only grows when that world allocates. Sibling-only slots are absent.
+      (cells-set! target i (if (< i (cells-length source))
+                            (cells-get source i)
+                            absent)))
+    [(dense-world target (.-registry world) true) registry-state]))
+
+(defn- fork-values!
+  "After the copy section: host `Forkable`/`:fork-fn` processing of the
+   unpublished target. Runs host code; holds no lock of the source."
+  [^DenseWorld target-world registry-state fork-value]
+  (let [target (current-cells target-world)
+        logical-n (:next-slot registry-state)
         descriptors (:descriptors registry-state)
         managed-descriptors (:managed-descriptors registry-state)
         ;; Membership concerns stable handle identity. Hashing arbitrary root
@@ -1098,91 +1320,85 @@
                           (doseq [handle (keys descriptors)]
                             (.put index handle true))
                           index)
-                    :cljs (js/Set. (to-array (keys descriptors)))
-                    :cljd (vec (keys descriptors)))
+                   :cljs (js/Set. (to-array (keys descriptors)))
+                   :cljd (vec (keys descriptors)))
         handle? (fn [value]
                   #?(:clj (.containsKey ^IdentityHashMap handles value)
                      :cljs (.has handles value)
-                     :cljd (boolean (some #(identical? % value) handles))))
-        target-world (DenseWorld.
-                      (volatile! target)
-                      registry
-                      #?(:cljd nil :clj (ReentrantReadWriteLock.) :cljs nil)
-                      #?(:cljd nil :clj (ReentrantReadWriteLock.) :cljs nil)
-                      (volatile! true)
-                      (volatile! true)
-                      (volatile! 0))]
-    (dotimes [i logical-n]
-      ;; The registry is shared by siblings, but each world's physical array
-      ;; only grows when that world allocates. Sibling-only slots are absent.
-      (cells-set! target i (if (< i (cells-length source))
-                            (cells-get source i)
-                            absent)))
-    (try
-      (when fork-value
-        ;; Establish target-local type/control realizations before general
-        ;; Forkable values inspect the selected child world.
-        (doseq [[_ {:keys [value-slot value-fork-fn]}] descriptors
-                :when value-fork-fn
-                :when (< value-slot logical-n)
-                :let [v (cells-get target value-slot)]
-                :when (not (identical? absent v))]
-          (cells-set! target value-slot (value-fork-fn v))))
-      (call-with-selected-world
-       target-world
-       (fn []
-         (when fork-value
-           (doseq [[_ {:keys [value-slot host-fork? value-fork-fn]}]
-                   descriptors
-                   :when (and host-fork? (nil? value-fork-fn))
-                   :when (< value-slot logical-n)
-                   :let [v (cells-get target value-slot)]
-                   :when (not (identical? absent v))]
-             (cells-set! target value-slot
-                         (if (handle? v) v (fork-value v))))
-           (doseq [{:keys [fork-slots]} managed-descriptors
-                   slot fork-slots
-                   :when (< slot logical-n)
-                   :let [v (cells-get target slot)]
-                   :when (not (identical? absent v))]
-             (cells-set! target slot (fork-value v))))
-         ;; Anonymous cache owners participate without reserving a dense slot
-         ;; per lazy node. Their snapshots never invoke deferred computations.
-         (doseq [owner (world-cache-owners world)]
-           (-fork-world-cache! owner world target-world))))
-      target-world
-      (catch #?(:clj Throwable :cljs :default :cljd Object) error
-        (try
-          (retire-world! target-world)
-          (catch #?(:clj Throwable :cljs :default :cljd Object) cleanup-error
-            (throw (fork-cleanup-failure error cleanup-error target-world nil))))
-        (throw error)))))
+                     :cljd (boolean (some #(identical? % value) handles))))]
+    ;; Establish target-local type/control realizations before general
+    ;; Forkable values inspect the selected child world.
+    (doseq [[_ {:keys [value-slot value-fork-fn]}] descriptors
+            :when value-fork-fn
+            :when (< value-slot logical-n)
+            :let [v (cells-get target value-slot)]
+            :when (not (identical? absent v))]
+      (cells-set! target value-slot (value-fork-fn v)))
+    (call-with-selected-world
+     target-world
+     (fn []
+       (doseq [[_ {:keys [value-slot host-fork? value-fork-fn]}]
+               descriptors
+               :when (and host-fork? (nil? value-fork-fn))
+               :when (< value-slot logical-n)
+               :let [v (cells-get target value-slot)]
+               :when (not (identical? absent v))]
+         (cells-set! target value-slot
+                     (if (handle? v) v (fork-value v))))
+       (doseq [{:keys [fork-slots]} managed-descriptors
+               slot fork-slots
+               :when (< slot logical-n)
+               :let [v (cells-get target slot)]
+               :when (not (identical? absent v))]
+         (cells-set! target slot (fork-value v)))))))
 
-(defn fork-world [^DenseWorld world fork-value snapshot-value snapshot-var-meta]
-  #?(:cljd
-     (do
-       (assert-quiescent! world :fork)
-       (with-counted-world-access
-         world
-         #(do (realize-primary! world snapshot-value snapshot-var-meta)
-              (copy-world world fork-value))))
-     :clj
-     (let [^ReentrantReadWriteLock gate (.-gate world)]
-       (when (or (pos? (.getReadHoldCount gate))
-                 (.isWriteLockedByCurrentThread gate))
-         (throw (IllegalStateException.
-                 "Cannot fork a SCI world from inside its active evaluation or copy; suspend it first.")))
-       (let [lock (.writeLock gate)]
-         (.lock lock)
-         (try
-           (assert-open! world)
-           (realize-primary! world snapshot-value snapshot-var-meta)
-           (copy-world world fork-value)
-           (finally (.unlock lock)))))
-     :cljs
-     (do
-       (assert-quiescent! world :fork)
-       (with-counted-world-access
-         world
-         #(do (realize-primary! world snapshot-value snapshot-var-meta)
-              (copy-world world fork-value))))))
+(defn fork-world
+  "Fork `world`. The copy section excludes the source's slot writers and
+   publications (never its evaluations, which may include the caller's own):
+   it realizes a primary, copies the cells and the lazy realization caches
+   and calls `snapshot-extra` (the namespace environment), so all of them are
+   cut at one point. Host fork processing of the unpublished target runs
+   afterwards. `in-source` runs a thunk with the source's context bound
+   (primary realization reads host objects through it). Returns
+   [target-world extra]."
+  ([world fork-value snapshot-value snapshot-var-meta]
+   (first (fork-world world fork-value snapshot-value snapshot-var-meta
+                      (fn [f] (f)) (constantly nil))))
+  ([^DenseWorld world fork-value snapshot-value snapshot-var-meta in-source snapshot-extra]
+   (assert-not-copying! world :fork)
+   (assert-open! world)
+   (let [target (volatile! nil)]
+     (try
+       (with-copying
+        world
+        (fn []
+          (let [[target-world registry-state extra]
+             (with-copy-section
+               world
+               (fn []
+                 (assert-open! world)
+                 (in-source
+                  #(call-with-selected-world
+                    world true
+                    (fn [] (realize-primary! world snapshot-value snapshot-var-meta))))
+                 (let [[target-world registry-state] (copy-cells! world)]
+                   (vreset! target target-world)
+                   ;; Anonymous cache owners participate without reserving a
+                   ;; dense slot per lazy node. Their snapshots never invoke
+                   ;; deferred computations, block or run user code.
+                   (call-with-selected-world
+                    target-world
+                    (fn []
+                      (doseq [owner (world-cache-owners world)]
+                        (-fork-world-cache! owner world target-world))))
+                   [target-world registry-state (snapshot-extra)])))]
+         (when fork-value
+           (fork-values! target-world registry-state fork-value))
+         [target-world extra])))
+       (catch #?(:clj Throwable :cljs :default :cljd Object) error
+         (when-let [target-world @target]
+           (try
+             (retire-world! target-world)
+             (catch #?(:clj Throwable :cljs :default :cljd Object) cleanup-error
+               (throw (fork-cleanup-failure error cleanup-error target-world nil)))))
+         (throw error))))))

@@ -100,15 +100,17 @@
      (let [reader (r/indexing-push-back-reader (r/string-push-back-reader s))
            eval-string+? (when opts (:sci.impl/eval-string+ opts))
            parse-opts (parser/parse-opts ctx nil)]
-       (loop [ret nil]
-         (let [expr (parser/parse-next* reader parse-opts)]
-           (if (utils/kw-identical? parser/eof expr)
-             (if eval-string+?
-               {:val ret
-                :ns @utils/current-ns}
-               ret)
-             (let [ret (eval-form ctx expr)]
-               (recur ret)))))))))
+       (world/call-admitted
+        ctx
+        #(loop [ret nil]
+           (let [expr (parser/parse-next* reader parse-opts)]
+             (if (utils/kw-identical? parser/eof expr)
+               (if eval-string+?
+                 {:val ret
+                  :ns @utils/current-ns}
+                 ret)
+               (let [ret (eval-form ctx expr)]
+                 (recur ret))))))))))
 
 (defn eval-string
   ([s] (eval-string s nil))

@@ -131,7 +131,7 @@
            (is (= [:root 1]
                   (sci/eval-string* child "[*scope* @state]"))))))
 
-     (deftest forked-future-participates-in-world-quiescence-test
+     (deftest fork-does-not-wait-for-a-forked-future-test
        (let [entered (promise)
              release (promise)
              parent (tu/forkable-init
@@ -144,11 +144,10 @@
          (is (= true (deref entered 1000 ::timeout)))
          (let [forking (future (sci/fork child))]
            (try
-             (is (= ::waiting (deref forking 50 ::waiting)))
+             (is (map? (deref forking 1000 ::timeout)))
              (finally
                (deliver release true)))
-           (is (= true (deref task 1000 ::timeout)))
-           (is (map? (deref forking 1000 ::timeout))))))))
+           (is (= true (deref task 1000 ::timeout))))))))
 
 #?(:cljd nil
    :clj

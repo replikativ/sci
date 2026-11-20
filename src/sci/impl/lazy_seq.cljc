@@ -107,15 +107,25 @@
        world/IForkableWorldCache
        (-fork-world-cache! [_ source target]
          (when-let [^SeqBox source-box (cache-get caches source)]
-           ;; Source evaluation is quiescent. Copy realization state without
-           ;; invoking its thunk, normalizing it, or sharing its lock.
-           (cache-put! caches target
-                       (with-box source-box #(box @(.-state source-box))))))
+           ;; Inside the fork's copy section, which excludes realization
+           ;; steps (they are slot writes) but not a realization running
+           ;; user code under the box lock. Copy the state without that
+           ;; lock, without invoking its thunk or normalizing it: a box being
+           ;; realized copies as pending (its thunk), one being normalized
+           ;; copies its raw value.
+           (let [state @(.-state source-box)]
+             (cache-put! caches target
+                         (box (if (= :normalizing (:phase state))
+                                {:phase :raw :value (:raw state)}
+                                state))))))
        world/IWorldCache
        (-retire-world-cache! [_ selected]
          #?(:clj (locking caches (.remove ^Map caches selected))
             :cljs (.delete caches selected))
-         nil))
+         nil)
+       world/IRetainedWorldCache
+       (-world-cache-entry [_ selected]
+         (cache-get caches selected)))
 
      (defn- owner-context [^Owner owner preferred]
        (let [current store/*ctx*
@@ -126,7 +136,10 @@
                              {:type ::missing-context})))))
 
      (defn- owner-box [^Owner owner]
-       (or (cache-get (.-caches owner) (world/selected-world))
+       (or (let [selected (world/selected-world)]
+             (or (cache-get (.-caches owner) selected)
+                 ;; An evaluation still running in a retired world.
+                 (when selected (world/retired-cache-entry selected owner))))
            (throw (ex-info "Lazy value has no realization in the selected SCI world."
                            {:type ::foreign-world}))))
 
@@ -138,7 +151,6 @@
           (when-not (and selected (:sci.impl/world ctx))
             (throw (ex-info "Managed lazy values must be created inside a forkable SCI context."
                             {:type ::missing-context})))
-          (world/assert-open! selected)
           (let [owner (Owner. (weak ctx) #?(:clj (WeakHashMap.) :cljs (js/WeakMap.))
                               (:sci.impl/lineage ctx) projection-source)]
             (cache-put! (.-caches owner) selected (box state))
@@ -201,7 +213,8 @@
                  (let [value ((:thunk state))]
                    ;; Invocation failures leave the thunk retryable. Clear it
                    ;; only after it returns, matching LazySeq rather than Delay.
-                   (vreset! (.-state b) {:phase :raw :value value})
+                   (world/with-selected-slot-section
+                     #(vreset! (.-state b) {:phase :raw :value value}))
                    value)
                  (:value state)))))))
 
@@ -252,12 +265,22 @@
                    ;; normalization. Newer JVMs retain a pending marker until
                    ;; normalization succeeds; both abandon the raw result on
                    ;; failure. CLJS retains its raw result instead.
-                   #?(:clj (vreset! (.-state b)
-                                    {:phase (if realization-requires-normalization?
-                                              :normalizing :ready)
-                                     :value nil}))
-                   (let [result (normalize-seq raw)]
-                     (vreset! (.-state b) {:phase :ready :value result})
+                   ;; A fork copies a :normalizing box from its :raw value;
+                   ;; a failed normalization drops it.
+                   #?(:clj (world/with-selected-slot-section
+                             #(vreset! (.-state b)
+                                       {:phase :normalizing :value nil :raw raw})))
+                   (let [result #?(:clj (try (normalize-seq raw)
+                                             (catch Throwable t
+                                               (world/with-selected-slot-section
+                                                 #(vreset! (.-state b)
+                                                           {:phase (if realization-requires-normalization?
+                                                                     :normalizing :ready)
+                                                            :value nil}))
+                                               (throw t)))
+                                   :default (normalize-seq raw))]
+                     (world/with-selected-slot-section
+                       #(vreset! (.-state b) {:phase :ready :value result}))
                      result))))))))
 
      (defn lazy-seq*

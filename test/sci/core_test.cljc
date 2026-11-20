@@ -2029,7 +2029,7 @@
 
 #?(:cljd nil
    :clj
-   (deftest fork-waits-for-active-evaluation-test
+   (deftest fork-does-not-wait-for-active-evaluation-test
      (let [entered (promise)
            release (promise)
            parent (tu/forkable-init {:bindings {'block! (fn []
@@ -2038,10 +2038,9 @@
            evaluation (future (sci/eval-string* parent "(block!)"))]
        (is (= true (deref entered 1000 ::timeout)))
        (let [forking (future (sci/fork parent))]
-         (is (= ::waiting (deref forking 50 ::waiting)))
+         (is (map? (deref forking 1000 ::timeout)))
          (deliver release true)
-         (is (= true (deref evaluation 1000 ::timeout)))
-         (is (map? (deref forking 1000 ::timeout)))))))
+         (is (= true (deref evaluation 1000 ::timeout)))))))
 
 #?(:cljd nil
    :clj

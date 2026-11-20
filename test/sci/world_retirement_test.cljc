@@ -99,13 +99,13 @@
       (is (= 3 (sci/call-with-context child #(reset! a 3))))
       (is (= 3 (sci/eval-string* child "@a"))))))
 
-(deftest retirement-inside-evaluation-is-rejected
+(deftest retirement-inside-evaluation-closes-after-it
   (let [target (atom nil)
         ctx (forkable-context {:bindings {'retire! #(sci/retire! @target)}})]
     (reset! target ctx)
-    (is (re-find #"Cannot retire.*active evaluation"
-                 (ex-message (failure #(sci/eval-string* ctx "(retire!)")))))
-    (is (= :still-open (sci/eval-string* ctx ":still-open")))
+    (is (= :finished (sci/eval-string* ctx "(def a (atom 1)) (retire!) (swap! a inc) :finished"))
+        "the running evaluation finishes against its world")
+    (is (retired-error? (failure #(sci/eval-string* ctx ":late"))))
     (is (nil? (sci/retire! ctx)))))
 
 (deftest a-child-cannot-fall-back-into-a-retired-home-world
@@ -125,36 +125,33 @@
     (is (false? @touched?))
     (is (= :live (sci/eval-string* child ":live")))))
 
-(deftest nested-child-evaluation-cannot-retire-its-active-parent
+(deftest nested-child-evaluation-can-retire-its-active-parent
   (let [parent-ref (atom nil)
         child-ref (atom nil)
         parent (forkable-context
                 {:bindings {'retire-parent! #(sci/retire! @parent-ref)
-                            'enter-child! #(sci/eval-string* @child-ref "(retire-parent!)")}})]
+                            'enter-child! #(sci/eval-string* @child-ref "(retire-parent!) :child-done")}})]
     (reset! parent-ref parent)
     (reset! child-ref (sci/fork parent))
-    (is (re-find #"Cannot retire.*active evaluation"
-                 (ex-message (failure #(sci/eval-string* parent "(enter-child!)")))))
-    (is (= :parent-open (sci/eval-string* parent ":parent-open")))
+    (is (= [:child-done :parent-done]
+           (sci/eval-string* parent "[(enter-child!) :parent-done]")))
+    (is (retired-error? (failure #(sci/eval-string* parent ":late"))))
     (is (= :child-open (sci/eval-string* @child-ref ":child-open")))))
 
 #?(:clj
-   (deftest retirement-waits-for-another-threads-evaluation
+   (deftest retirement-does-not-wait-for-another-threads-evaluation
      (let [entered (promise)
            release (promise)
-           requested (promise)
            ctx (forkable-context {:bindings {'block! #(do (deliver entered true) @release)}})
            evaluation (future (sci/eval-string* ctx "(block!)"))]
        (try
          (is (= true (deref entered 5000 ::timeout)))
-         (let [retirement (future (deliver requested true) (sci/retire! ctx))]
+         (let [retirement (future (sci/retire! ctx))]
            (try
-             (is (= true (deref requested 5000 ::timeout)))
-             (is (= ::waiting (deref retirement 50 ::waiting)))
-             (deliver release :finished)
-             (is (= :finished (deref evaluation 5000 ::timeout)))
              (is (nil? (deref retirement 5000 ::timeout)))
              (is (retired-error? (failure #(sci/eval-string* ctx ":late"))))
+             (deliver release :finished)
+             (is (= :finished (deref evaluation 5000 ::timeout)))
              (finally (future-cancel retirement))))
          (finally
            (deliver release :finished)
