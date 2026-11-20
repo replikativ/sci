@@ -55,11 +55,20 @@ This shape combines four useful precedents:
 - Writes before the first fork have ordinary SCI/Clojure mutable behavior.
   The first fork materializes the primary values into dense slots; later
   writes update the selected world's slots.
-- On the JVM, evaluation of a form holds a shared permit for its world and a
-  fork takes the exclusive permit. A concurrent fork therefore waits for
-  active forms in that source world and gets a quiescent snapshot. Different
-  worlds have independent gates. Calling `fork` recursively from inside an
-  evaluation of that same world is rejected instead of deadlocking.
+- A fork never waits for an evaluation. Evaluation takes no world lock; a
+  fork excludes only the world's slot writers, for the length of its copy
+  (no user code runs inside that section), and may also be called from
+  inside an evaluation of the same world. The child gets a cut between
+  individual publications: `(do (def a 1) (def b 2))` can fork as "a only",
+  but a single def, namespace, type or method publication is never torn,
+  and every handle reachable in the child has its own slots. A delay or lazy
+  sequence still being realized forks as pending; a still-running Future
+  held in the world is refused as an external resource (a fork does not wait
+  for it). Host `Forkable` callbacks run after the copy and must tolerate
+  their source being mutated concurrently.
+- `retire!` closes a world at once: new evaluations, host accesses and forks
+  are refused, while evaluations already running in it (also the caller's own)
+  finish against it. Its memory is reclaimed by GC.
 
 ## Host cooperation
 

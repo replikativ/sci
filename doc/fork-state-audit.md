@@ -105,8 +105,8 @@ yet.
 
 Keep two APIs and make their distinction explicit:
 
-- `fork` remains a quiescent heap/world snapshot and captures no running
-  bindings.
+- `fork` remains a heap/world snapshot (a cut between individual writes,
+  taken without waiting for evaluations) and captures no running bindings.
 - A future `fork-execution` operates only at a suspension point and snapshots
   `(world, binding-frame, continuation, resource capabilities)`.
 
@@ -140,7 +140,7 @@ child-only dynamic metadata cannot affect a nested parent evaluation.
 | SCI `memoize` cache | Closure owns a fork-local `SciAtom` cache | Implemented; inherited entries are shared as immutable values and later cache fills diverge |
 | JVM Promise | Stable SCI handle with world-local pending/delivered state | Implemented; a pending child has no inherited waiters and delivery is branch-local |
 | CLJS Promise | Native asynchronous host value | Direct world-cell values are rejected as external; `:fork-fn` must choose deliberate sharing or application virtualization |
-| Future / async task | Work launched through the binding conveyor runs in its captured world; a managed fork waits for it | A still-pending direct host Future is rejected; a completed Future may be shared as immutable task outcome state |
+| Future / async task | Work launched through the binding conveyor runs in its captured world; a fork does not wait for it | A still-pending Future held in the world is rejected; a completed Future may be shared as immutable task outcome state |
 | Transient collection | Detected as affine when directly stored in a world cell | Fork rejected by default; `:fork-fn` may impose an explicit application policy |
 | JVM array / CLJS JavaScript array | Shallow-copied once per source identity | Implemented for direct world-cell values; nested elements retain their own policy |
 | Host atom/ref/agent/volatile/native multimethod, common JVM atomic/synchronization holders | Detected as unmanaged mutable or affine host state | Fork rejected by default; `Forkable` wrapper or `:fork-fn` must choose copy or sharing |
@@ -271,19 +271,18 @@ pending(thunk) -> running(owner) -> success(value)
                               \-> failure(exception)
 ```
 
-A quiescent world fork copies `pending`, `success`, or `failure`. `running`
-should be impossible for an evaluation-owned delay because fork waits for the
-active form; a delay running in an unmanaged host task is an external resource
-and must block or reject the fork.
+A world fork copies `pending`, `success`, or `failure`; a delay that is
+`running` when the fork copies forks as `pending`, and the child runs the
+thunk again in its own world. The fork does not wait for the running thunk.
 
-This is now implemented with a stable `SciDelay` and one managed state slot.
+This is implemented with a stable `SciDelay` and one managed state slot.
 The host delay inside a pending state supplies the normal once-only and
-concurrent-force behavior. Forking a still-pending state constructs a fresh
-host delay over the same thunk; forking an already realized state records its
-value or thrown exception directly. JVM Clojure caches a thrown exception,
-while ClojureScript leaves a throwing delay pending and retryable; SCI retains
-that platform distinction. Because a fork quiesces managed evaluation, it
-cannot observe an evaluation-owned realization halfway through.
+concurrent-force behavior. A completed realization is published to the slot
+(`success`, or on the JVM `failure`); forking any state that is still
+pending at the cut constructs a fresh host delay over the same thunk, never
+consulting the live host delay. JVM Clojure caches a thrown exception, while
+ClojureScript leaves a throwing delay pending and retryable; SCI retains that
+platform distinction.
 
 ### Promise
 
@@ -305,13 +304,12 @@ not copied into a child.
 ### Future and asynchronous computation
 
 A running host Future cannot be copied honestly. The immediate correction is
-to convey the selected SCI world and hold its evaluation permit whenever the
-future body runs. Fork policy can then choose among explicit sharing, waiting
+to convey the selected SCI world whenever the future body runs. Fork policy can then choose among explicit sharing, waiting
 for completion and copying the result, restartable computation, cancellation,
 or rejection. Full continuation forking requires managed CPS/fiber state.
 
-SCI's managed future conveyor now makes a world fork wait until the body has
-released its evaluation permit. At the generic host-value boundary, a pending
+SCI's managed future conveyor runs the body in its captured world; a fork does
+not wait for it. At the generic host-value boundary, a pending
 `Future` is rejected while an already completed or cancelled Future is shared:
 its task lifecycle can no longer diverge, although values reachable from its
 result retain their ordinary shallow host policy. CLJS Promises cannot expose a
@@ -346,8 +344,8 @@ their ordinary sharing or explicit `Forkable` policy. JVM/JavaScript SCI lazy
 sequences now use logical owners with per-world realization boxes. Forking
 copies pending or completed state without running lazy bodies; weak owner
 indexing avoids a permanent dense slot per element, and explicit retirement
-releases world-dependent cache cycles. This snapshots computation at a
-quiescent boundary, not midway through an executing body. Foreign lazy values
+releases world-dependent cache cycles. A body still executing when the fork
+copies is not continued in the child: its sequence forks as pending. Foreign lazy values
 still require an explicit policy. See [managed laziness](managed-laziness.md).
 
 ### Transients and mutable aggregates

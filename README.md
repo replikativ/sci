@@ -640,8 +640,8 @@ facilities not owned by SCI such as Java objects, remain shared.
 
 Runtime state is stored in dense lineage-local slots. A fork copies those
 slots, favoring the expected case where ordinary reads and writes are much
-more frequent than forks. On the JVM a fork waits for active forms in its
-source world, so the copied state is a quiescent snapshot.
+more frequent than forks. A fork never waits for active evaluations; it copies
+a consistent cut between individual writes of its source world.
 
 See [Forkable SCI worlds](doc/forking.md) for the lifecycle, semantic boundary,
 and current limitations of this experimental model.

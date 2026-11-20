@@ -22,9 +22,12 @@ that computation or make its external effects reversible.
    small native behavior probe selects this contract. Chunked producers keep
    their host's chunk realization behavior; forcing one item can therefore
    evaluate a whole chunk.
-6. JVM realization in one world is serialized per sequence cache. Forking
-   waits for active evaluation and snapshots at a quiescent boundary.
-   Fork/retirement reentry from that world's own evaluation or copy is refused.
+6. JVM realization in one world is serialized per sequence cache. A fork does
+   not wait for it: a sequence being realized forks as pending (the child
+   realizes it again), one being normalized forks from its raw value.
+   Retirement closes the world at once; evaluations already running there
+   keep their realizations. Fork/retirement reentry from a fork's own copy
+   callbacks is refused.
 
 These are value and isolation guarantees, not guarantees that a sequence
 completes, is deterministic, or has no effects. In particular, hashing an

@@ -12,6 +12,24 @@ SCI is used in [babashka](https://github.com/babashka/babashka),
 
 ## Unreleased
 
+- Forks and retirement never wait for an evaluation. Evaluation takes no
+  world lock; a fork excludes only slot writers for the length of its copy
+  (primary realization, cells, lazy caches and the namespace environment,
+  which is now copied at the same cut) and may be called from inside an
+  evaluation of the same interpreter. A fork is a cut between individual
+  publications (a def, namespace, type or method is never torn); delays and
+  lazy sequences being realized fork as pending; a running Future held in
+  the world is refused instead of awaited.
+- `retire!` closes a world at once: new evaluations and forks are refused,
+  running evaluations (also the caller's own) finish against it, and memory
+  is reclaimed by GC.
+- No user code runs under a world lock: `alter-meta!`, `alter-var-root`,
+  validators and swap functions run before the slot commit (q7).
+- Slots are written before a namespace mapping publishes their handle
+  (`deftype` at analysis, `intern` of a new Var, `create-ns`,
+  `add-namespace!`), and `def` analysis no longer overwrites a concurrent
+  publication to the same namespace.
+
 ## 0.15.59-replikativ.8
 
 - Reduce managed sequences in validated segments while preserving selected-world
