@@ -25,8 +25,11 @@ SCI is used in [babashka](https://github.com/babashka/babashka),
   which is now copied at the same cut) and may be called from inside an
   evaluation of the same interpreter. A fork is a cut between individual
   publications (a def, namespace, type or method is never torn); delays and
-  lazy sequences being realized fork as pending; a running Future held in
-  the world is refused instead of awaited.
+  lazy sequences being realized fork as pending; a Future held in the world that is still running at the cut forks as a
+  completed future whose deref throws ex-data `{:type :sci/forked-future}`
+  (`realized?`/`future-done?` true, `future-cancelled?` false); one completed
+  before the cut forks as its value or failure. The parent's task is never
+  waited for, re-run or changed.
 - `retire!` closes a world at once: new evaluations and forks are refused,
   running evaluations (also the caller's own) finish against it, and memory
   is reclaimed by GC.

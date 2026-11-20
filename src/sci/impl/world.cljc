@@ -20,6 +20,7 @@
   publication makes its result reachable last: slots are written before an
   environment mapping or slot value refers to the handle."
   (:require [sci.ctx-store :as store]
+            [sci.fork :as fork]
             [sci.impl.execution :as execution])
   #?@(:cljd []
       :clj [(:import [java.lang.ref WeakReference]
@@ -1305,12 +1306,23 @@
       (cells-set! target i (if (< i (cells-length source))
                             (cells-get source i)
                             absent)))
-    [(dense-world target (.-registry world) true) registry-state]))
+    [(dense-world target (.-registry world) true) registry-state
+     ;; Which world-held Futures were done at the cut: the fork policy shares
+     ;; those and forks the others as pending-at-the-cut (`sci.fork`).
+     #?(:clj (let [done (IdentityHashMap.)]
+               (dotimes [i logical-n]
+                 (let [v (cells-get target i)]
+                   (when (and (instance? java.util.concurrent.Future v)
+                              (.isDone ^java.util.concurrent.Future v))
+                     (.put done v true))))
+               done)
+        :default nil)]))
 
 (defn- fork-values!
   "After the copy section: host `Forkable`/`:fork-fn` processing of the
    unpublished target. Runs host code; holds no lock of the source."
-  [^DenseWorld target-world registry-state fork-value]
+  [^DenseWorld target-world registry-state fork-value done-at-cut]
+  (binding [fork/*done-at-cut* done-at-cut]
   (let [target (current-cells target-world)
         logical-n (:next-slot registry-state)
         descriptors (:descriptors registry-state)
@@ -1352,7 +1364,7 @@
                :when (< slot logical-n)
                :let [v (cells-get target slot)]
                :when (not (identical? absent v))]
-         (cells-set! target slot (fork-value v)))))))
+         (cells-set! target slot (fork-value v))))))))
 
 (defn fork-world
   "Fork `world`. The copy section excludes the source's slot writers and
@@ -1374,7 +1386,7 @@
        (with-copying
         world
         (fn []
-          (let [[target-world registry-state extra]
+          (let [[target-world registry-state extra done-at-cut]
              (with-copy-section
                world
                (fn []
@@ -1383,7 +1395,7 @@
                   #(call-with-selected-world
                     world true
                     (fn [] (realize-primary! world snapshot-value snapshot-var-meta))))
-                 (let [[target-world registry-state] (copy-cells! world)]
+                 (let [[target-world registry-state done-at-cut] (copy-cells! world)]
                    (vreset! target target-world)
                    ;; Anonymous cache owners participate without reserving a
                    ;; dense slot per lazy node. Their snapshots never invoke
@@ -1393,9 +1405,9 @@
                     (fn []
                       (doseq [owner (world-cache-owners world)]
                         (-fork-world-cache! owner world target-world))))
-                   [target-world registry-state (snapshot-extra)])))]
+                   [target-world registry-state (snapshot-extra) done-at-cut])))]
          (when fork-value
-           (fork-values! target-world registry-state fork-value))
+           (fork-values! target-world registry-state fork-value done-at-cut))
          [target-world extra])))
        (catch #?(:clj Throwable :cljs :default :cljd Object) error
          (when-let [target-world @target]

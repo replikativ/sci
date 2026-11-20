@@ -1963,11 +1963,9 @@
            (is false "expected lazy sequence rejection")
            (catch clojure.lang.ExceptionInfo e
              (is (= :lazy-seq (:resource-kind (ex-data e))))))))
-     (testing "pending tasks and consuming resources are rejected"
+     (testing "pending delays and consuming resources are rejected"
        (doseq [[resource expected-kind]
-               [[(java.util.concurrent.FutureTask. (fn [] :done))
-                 :pending-future]
-                [(delay :done) :pending-delay]
+               [[(delay :done) :pending-delay]
                 [(java.io.StringReader. "input") :closeable]
                 [(java.util.Random. 42) :random-generator]
                 [(java.util.ArrayList.) :java-collection]]]
@@ -1983,6 +1981,19 @@
              (catch clojure.lang.ExceptionInfo e
                (is (= expected-kind
                       (:resource-kind (ex-data e)))))))))
+     (testing "a pending Future forks as completed with a forked error"
+       (let [task (java.util.concurrent.FutureTask. (fn [] :done))
+             user-ns (sci/create-ns 'user)
+             parent (tu/forkable-init
+                     {:namespaces
+                      {'user {'task (sci/new-var 'task task {:ns user-ns})}}})
+             forked (sci/eval-string* (sci/fork parent) "task")]
+         (is (not (identical? task forked)))
+         (is (and (future-done? forked) (realized? forked)
+                  (not (future-cancelled? forked))))
+         (is (= :sci/forked-future
+                (:type (ex-data (try @forked (catch clojure.lang.ExceptionInfo e e))))))
+         (is (not (.isDone task)) "the source task is untouched")))
      (testing "a completed Future has immutable task state and may be shared"
        (let [task (java.util.concurrent.FutureTask. (fn [] :done))
              _ (.run task)

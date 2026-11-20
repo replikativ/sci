@@ -258,17 +258,50 @@
             "a later fork copies the published realization"))
       (finally (deliver release :released)))))
 
-(deftest a-running-future-in-world-state-is-refused-not-awaited
-  ;; A fork no longer waits for a managed future's body: a still-running
-  ;; Future held in the world is an affine host resource, as for any pending
-  ;; Future; once it completed it is shared.
+(defn- deref-outcome [ctx s]
+  (sci/eval-string*
+   ;; A failed task throws ExecutionException (no ex-data) around its cause.
+   ctx (str "(try [:value @" s "]
+              (catch Exception e
+                (if (ex-data e) [:thrown (ex-data e)] [:failed (ex-data (ex-cause e))])))")))
+
+(deftest futures-fork-by-their-state-at-the-cut
   (let [release (promise)
-        ctx (forkable (addons/future {:namespaces {'host {'wait #(deref release 10000 :timeout)}}}))]
-    (sci/eval-string* ctx "(def f (future (host/wait) :done))")
-    (try
-      (let [result (within 2000 #(try (sci/fork ctx) (catch Exception e e)))]
-        (is (= :pending-future (:resource-kind (ex-data result)))))
-      (deliver release :released)
-      (is (= :done (sci/eval-string* ctx "@f")))
-      (is (= :done (sci/eval-string* (sci/fork ctx) "@f")))
-      (finally (deliver release :released)))))
+        runs (atom 0)
+        ctx (forkable (addons/future
+                       {:namespaces {'host {'wait #(deref release 10000 :timeout)
+                                            'ran #(swap! runs inc)}}}))
+        state (fn [v] (str "[(realized? " v ") (future-done? " v ") (future-cancelled? " v ") (future? " v ")]"))]
+    (testing "a future completed before the cut forks as its value"
+      (sci/eval-string* ctx "(def ok (future :done)) @ok")
+      (let [child (sci/fork ctx)]
+        (is (= [:value :done] (deref-outcome child "ok")))
+        (is (= [true true false true] (sci/eval-string* child (state "ok"))))))
+    (testing "a failed one forks as the same failure"
+      (sci/eval-string* ctx "(def bad (future (throw (ex-info \"boom\" {:k 1}))))
+                             (try @bad (catch Exception _ nil))")
+      (let [child (sci/fork ctx)]
+        (is (= [:failed {:k 1}] (deref-outcome child "bad")))
+        (is (= [:failed {:k 1}] (deref-outcome ctx "bad")))))
+    (testing "a future running at the cut forks as completed with a forked error"
+      (sci/eval-string* ctx "(def f (future (host/ran) (host/wait) :parent-result))")
+      (try
+        (let [child (within 2000 #(sci/fork ctx))]
+          (is (map? child) "the fork did not wait for the running future")
+          (when (map? child)
+            (is (= [:thrown {:type :sci/forked-future}] (deref-outcome child "f")))
+            (is (= {:type :sci/forked-future}
+                   (sci/eval-string* child "(try (deref f 10 :timeout)
+                                             (catch Exception e (ex-data e)))")))
+            (is (= [true true false true] (sci/eval-string* child (state "f"))))
+            (is (= [:thrown {:type :sci/forked-future}]
+                   (deref-outcome (sci/fork child) "f"))
+                "a grandchild keeps the forked future"))
+          (is (false? (sci/eval-string* ctx "(future-done? f)")) "the parent's future keeps running")
+          (deliver release :released)
+          (is (= [:value :parent-result] (deref-outcome ctx "f")))
+          (when (map? child)
+            (is (= [:thrown {:type :sci/forked-future}] (deref-outcome child "f"))
+                "the parent's later result does not reach the child"))
+          (is (= 1 @runs) "nothing was re-run"))
+        (finally (deliver release :released))))))

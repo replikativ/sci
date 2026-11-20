@@ -62,9 +62,14 @@ This shape combines four useful precedents:
   individual publications: `(do (def a 1) (def b 2))` can fork as "a only",
   but a single def, namespace, type or method publication is never torn,
   and every handle reachable in the child has its own slots. A delay or lazy
-  sequence still being realized forks as pending; a still-running Future
-  held in the world is refused as an external resource (a fork does not wait
-  for it). Host `Forkable` callbacks run after the copy and must tolerate
+  sequence still being realized forks as pending. A JVM Future held in the
+  world forks by its state at the cut: completed before it, as its value,
+  failure or cancellation (the Future is shared); still pending or running,
+  as a completed future whose `deref`/`.get` throws an ex-info with ex-data
+  `{:type :sci/forked-future}` (`realized?` and `future-done?` true,
+  `future-cancelled?` false). The parent's task keeps running; nothing is
+  waited for or re-run. ClojureScript has no future (`future` is a JVM addon);
+  a JS Promise in a world cell is still rejected. Host `Forkable` callbacks run after the copy and must tolerate
   their source being mutated concurrently.
 - `retire!` closes a world at once: new evaluations, host accesses and forks
   are refused, while evaluations already running in it (also the caller's own)
@@ -106,10 +111,10 @@ holds mutable children must implement the protocol and copy its own graph.
 Unclassified values retain the compatibility behavior of being shared, except
 for known affine or mutable host primitives that SCI can identify safely.
 Direct host atoms, refs, agents, volatiles, multimethods, transient
-collections, lazy sequences, pending tasks, Promises, and known consuming or
-external resources are rejected unless an explicit policy handles them. A
-completed JVM Future or realized host Delay may be shared because its lifecycle
-is immutable. Mutable Java collections and common atomic/synchronization
+collections, lazy sequences, pending host delays, Promises, and known consuming
+or external resources are rejected unless an explicit policy handles them. A
+realized host Delay may be shared because its lifecycle is immutable; a JVM
+Future forks by its state at the cut (see above). Mutable Java collections and common atomic/synchronization
 holders are rejected as well; Clojure persistent collections are unaffected.
 
 `sci/init` and the two-argument `sci/fork` also accept `:fork-fn`, a legacy

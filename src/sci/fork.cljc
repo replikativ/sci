@@ -10,6 +10,49 @@
   (fork-value [this]
     "Return this value's realization in the child world."))
 
+;; A forked world never waits for, re-runs or shares a task still running in
+;; its parent. The copy section records which world-held Futures were done at
+;; the cut (`*done-at-cut*`, an IdentityHashMap); without it the Future's
+;; current state is used.
+(def ^:no-doc ^:dynamic *done-at-cut* nil)
+
+#?(:clj
+   (defn- forked-future-error []
+     (ex-info "This future was still running when its SCI world was forked; its result exists only in the parent world."
+              {:type :sci/forked-future})))
+
+#?(:clj
+   (deftype ForkedFuture []
+     ;; The child's realization of a Future still pending or running at the
+     ;; cut: completed, not cancelled, and deref throws ex-data
+     ;; {:type :sci/forked-future}.
+     Forkable
+     (fork-value [this] this)
+     java.util.concurrent.Future
+     (get [_] (throw (forked-future-error)))
+     (get [_ _ _] (throw (forked-future-error)))
+     (isDone [_] true)
+     (isCancelled [_] false)
+     (cancel [_ _] false)
+     clojure.lang.IDeref
+     (deref [_] (throw (forked-future-error)))
+     clojure.lang.IBlockingDeref
+     (deref [_ _ _] (throw (forked-future-error)))
+     clojure.lang.IPending
+     (isRealized [_] true)))
+
+#?(:clj
+   (defn- fork-future
+     "A Future done at the cut is shared: its value, failure or cancellation
+      can no longer change. Any other forks as a `ForkedFuture`; the parent's
+      task keeps running and is never waited for or re-run."
+     [^java.util.concurrent.Future value]
+     (if (if-let [^java.util.IdentityHashMap done *done-at-cut*]
+           (.containsKey done value)
+           (.isDone value))
+       value
+       (ForkedFuture.))))
+
 (defn- transient-value? [value]
   #?(:clj (instance? clojure.lang.ITransientCollection value)
      :cljs (satisfies? ITransientCollection value)
@@ -37,8 +80,6 @@
        (instance? clojure.lang.EnumerationSeq value) :enumeration-seq
        (instance? clojure.lang.Delay value)
        (when-not (realized? value) :pending-delay)
-       (instance? java.util.concurrent.Future value)
-       (when-not (.isDone ^java.util.concurrent.Future value) :pending-future)
        (instance? java.io.Closeable value) :closeable
        (instance? java.lang.AutoCloseable value) :auto-closeable
        (instance? java.util.Iterator value) :iterator
@@ -101,6 +142,9 @@
 (defn- default-fork-value [value]
   (let [affine-kind (affine-resource-kind value)]
     (cond
+      #?@(:clj [(instance? java.util.concurrent.Future value)
+                (fork-future value)])
+
       (transient-value? value)
       (throw (ex-info
               "Cannot fork a SCI world containing an affine transient collection. Provide :fork-fn to define an explicit policy."

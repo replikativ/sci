@@ -93,7 +93,7 @@ continuation wrapper for Promise `then`, `catch`, and `finally`: unlike an
 independent task's shallow frame, it retains the persistent parent chain so a
 continuation can leave a `binding` scope entered before `await`. Both the world
 and dynamic bindings therefore survive suspension. A running Future is still
-a non-copyable host resource.
+not copied: a child gets a forked future in its place (see below).
 
 CLJS and ClojureDart still use one volatile execution-state cell rather than a
 general async-local facility. Managed Promise continuations install and
@@ -140,7 +140,7 @@ child-only dynamic metadata cannot affect a nested parent evaluation.
 | SCI `memoize` cache | Closure owns a fork-local `SciAtom` cache | Implemented; inherited entries are shared as immutable values and later cache fills diverge |
 | JVM Promise | Stable SCI handle with world-local pending/delivered state | Implemented; a pending child has no inherited waiters and delivery is branch-local |
 | CLJS Promise | Native asynchronous host value | Direct world-cell values are rejected as external; `:fork-fn` must choose deliberate sharing or application virtualization |
-| Future / async task | Work launched through the binding conveyor runs in its captured world; a fork does not wait for it | A still-pending Future held in the world is rejected; a completed Future may be shared as immutable task outcome state |
+| Future / async task | Work launched through the binding conveyor runs in its captured world; a fork does not wait for it | A Future completed before the cut is shared as immutable task outcome state; one pending or running at the cut forks as a completed future whose deref throws `{:type :sci/forked-future}` |
 | Transient collection | Detected as affine when directly stored in a world cell | Fork rejected by default; `:fork-fn` may impose an explicit application policy |
 | JVM array / CLJS JavaScript array | Shallow-copied once per source identity | Implemented for direct world-cell values; nested elements retain their own policy |
 | Host atom/ref/agent/volatile/native multimethod, common JVM atomic/synchronization holders | Detected as unmanaged mutable or affine host state | Fork rejected by default; `Forkable` wrapper or `:fork-fn` must choose copy or sharing |
@@ -309,10 +309,15 @@ for completion and copying the result, restartable computation, cancellation,
 or rejection. Full continuation forking requires managed CPS/fiber state.
 
 SCI's managed future conveyor runs the body in its captured world; a fork does
-not wait for it. At the generic host-value boundary, a pending
-`Future` is rejected while an already completed or cancelled Future is shared:
-its task lifecycle can no longer diverge, although values reachable from its
-result retain their ordinary shallow host policy. CLJS Promises cannot expose a
+not wait for it. At the generic host-value boundary, a Future already
+completed or cancelled at the cut is shared: its task lifecycle can no longer
+diverge, although values reachable from its result retain their ordinary
+shallow host policy. The copy section records which Futures held in world
+cells were done at the cut, so one completing just after it is not mistaken
+for a completed one. A Future still pending or running at the cut forks as
+`sci.fork/ForkedFuture`: completed and not cancelled, its `deref`/`.get`
+throws an ex-info with ex-data `{:type :sci/forked-future}`. The parent's task
+keeps running and is never waited for, re-run or changed. CLJS Promises cannot expose a
 portable synchronous completion snapshot and are therefore rejected when
 stored directly unless the application supplies a policy.
 
