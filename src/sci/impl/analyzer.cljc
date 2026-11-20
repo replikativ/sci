@@ -861,24 +861,28 @@
                                x " in namespace "
                                cnn)
                           expr)
-                         (if #?(:cljd (get the-current-ns name)
-                                :clj (.get ^java.util.Map the-current-ns name)
-                                :cljs (.get the-current-ns name))
-                           the-current-ns
-                           (assoc the-current-ns name
-                                  (doto (lang/->Var nil name
-                                                    {:name name
-                                                     :ns @utils/current-ns
-                                                     :file @utils/current-file}
-                                                    false
-                                                    false
-                                                    nil
-                                                    @utils/current-ns
-                                                    false)
-                                    (vars/unbind)))))]
-    (swap! env
-           (fn [env]
-             (update env :namespaces assoc cnn the-current-ns))))
+                         the-current-ns)]
+    (when-not #?(:cljd (get the-current-ns name)
+                 :clj (.get ^java.util.Map the-current-ns name)
+                 :cljs (.get the-current-ns name))
+      ;; The unbound Var's slots are written before the mapping publishes
+      ;; it. Only this name is added: concurrent publications to the same
+      ;; namespace (another def, a deftype) are kept.
+      (let [new-var (doto (lang/->Var nil name
+                                      {:name name
+                                       :ns @utils/current-ns
+                                       :file @utils/current-file}
+                                      false
+                                      false
+                                      nil
+                                      @utils/current-ns
+                                      false)
+                      (vars/unbind))]
+        (swap! env
+               (fn [env]
+                 (if (get-in env [:namespaces cnn name])
+                   env
+                   (assoc-in env [:namespaces cnn name] new-var)))))))
   nil)
 
 (defn analyze-def
