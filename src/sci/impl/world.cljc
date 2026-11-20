@@ -67,7 +67,30 @@
 (defprotocol IWorldTracked
   (-world-tracked? [handle])
   (-world-home-ctx [handle])
-  (-mark-world-tracked! [handle home-ctx]))
+  (-mark-world-tracked! [handle home-ctx])
+  (-release-world-home! [handle world]
+    "If this handle's home context belongs to the retired `world`, hold it
+     only weakly from now on: the lineage registry retains the handle, and
+     must not retain the retired world through it."))
+
+(defn ^:no-doc weak-home
+  "A weak reference to a retired home context, where the host has one."
+  [ctx]
+  #?(:clj (WeakReference. ctx)
+     :cljs (if (exists? js/WeakRef) (js/WeakRef. ctx) ctx)
+     :cljd ctx))
+
+(defn ^:no-doc home-ctx
+  "The home context a handle records: a context map, a weak one, or nil."
+  [tracked]
+  (cond (map? tracked) tracked
+        #?(:clj (instance? WeakReference tracked)
+           :cljs (and (exists? js/WeakRef) (instance? js/WeakRef tracked))
+           :cljd false)
+        #?(:clj (.get ^WeakReference tracked)
+           :cljs (.deref tracked)
+           :cljd nil)
+        :else nil))
 
 (defn read-world [world primary?]
   (ReadWorld. world primary?))
@@ -763,6 +786,12 @@
             (swap! r update :retained merge retained)
             (doseq [owner owners]
               (-retire-world-cache! owner world))
+            ;; Vars whose home is this world keep it only weakly: the shared
+            ;; registry retains them for the lineage's lifetime.
+            (doseq [handle (keys (:descriptors @(.-registry world)))
+                    :when #?(:clj (instance? sci.impl.world.IWorldTracked handle)
+                             :default (satisfies? IWorldTracked handle))]
+              (-release-world-home! handle world))
             (swap! r assoc :done? true))))))
   nil)
 

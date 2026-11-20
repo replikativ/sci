@@ -124,3 +124,21 @@
       (is (map? child))
       (when (map? child)
         (is (= [1 2] (sci/eval-string* child "(vec xs)")))))))
+
+(deftest retired-children-that-defined-vars-are-reclaimed
+  (let [parent (forkable {})
+        _ (sci/eval-string* parent "(def shared 1)")
+        refs (vec (for [i (range 8)]
+                    (let [child (sci/fork parent)]
+                      (sci/eval-string* child (str "(def child-only-" i " (vec (range 10000))) (def shared " i ")"))
+                      (let [r (WeakReference. (:sci.impl/world child))]
+                        (sci/retire! child)
+                        r))))
+        cleared? #(every? (fn [^WeakReference r] (nil? (.get r))) refs)]
+    (is (loop [n 0]
+          (cond (cleared?) true
+                (= n 20) false
+                :else (do (System/gc) (await-condition 50 cleared?) (recur (inc n)))))
+        "retired child worlds are garbage collected")
+    (is (= 1 (sci/eval-string* parent "shared")))
+    (is (= 1 (sci/eval-string* (sci/fork parent) "shared")))))

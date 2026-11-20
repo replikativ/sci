@@ -137,12 +137,20 @@
   (-mirror-meta! [_ m] (set! meta m))
   world/IWorldTracked
   (-world-tracked? [_] (boolean world-tracked))
-  (-world-home-ctx [_] (when (map? world-tracked) world-tracked))
-  (-mark-world-tracked! [this home-ctx]
+  ;; nil, true (no unambiguous home), a home context, or once that home's
+  ;; world is retired, a weak reference to it
+  (-world-home-ctx [_] (world/home-ctx world-tracked))
+  (-release-world-home! [this retired]
     (let [current world-tracked]
-      (when (and (map? current)
+      (when (and (map? current) (identical? retired (:sci.impl/world current)))
+        #?(:cljd (set! world-tracked (world/weak-home current))
+           :default (set! (.-world-tracked this) (world/weak-home current))))))
+  (-mark-world-tracked! [this home-ctx]
+    (let [current world-tracked
+          home (world/home-ctx current)]
+      (when (and home
                  home-ctx
-                 (not (identical? (:sci.impl/lineage current)
+                 (not (identical? (:sci.impl/lineage home)
                                   (:sci.impl/lineage home-ctx))))
         ;; A stable host/built-in Var can be installed in unrelated contexts.
         ;; It then has no unambiguous implicit home; callers select a world
