@@ -9,9 +9,11 @@
   - `slot-gate` (read): every slot write, together with the host-object
     mirror of a primary world (Var root/meta, Namespace meta, Type data,
     volatile) and a lazy realization step. No user code runs inside.
-  - `publish-gate` (read): a publication of several writes that must appear
-    together, e.g. a def (value, meta, namespace mapping). No user code runs
-    inside; watch notifications are deferred until it ends.
+  - `publish-gate` (read): a publication of several slot writes that must
+    appear together, e.g. a def's value and metadata. No user code runs
+    inside: Var watch notifications are deferred until it ends, and the
+    namespace-environment atom (whose watches and validator are user code)
+    is never updated inside.
   - A fork takes both write locks only for the copy: primary realization, the
     cells, the lazy realization caches and the namespace environment. It
     excludes writers for that copy and never waits for an evaluation.

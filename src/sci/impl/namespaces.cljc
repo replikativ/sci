@@ -983,16 +983,16 @@
         _ (utils/check-namespace-writable! ctx @env cnn)
         t (if existing existing (sci.lang/->Type data))]
     ;; One publication: the type's data and its namespace mapping.
-    (world/publishing
-     (fn []
-       (when existing (types/setVal existing data))
-       (world/register-type!
-        t data #?(:cljs sci.impl.deftype/fork-type-data :default nil))
-       (swap! env (fn [env]
-                    (-> env
-                        (update-in [:namespaces cnn :types] assoc type-name t)
-                        ;; Remove any var that might have been created by (declare)
-                        (update-in [:namespaces cnn] dissoc type-name))))))
+    ;; The type's slot is written before the mapping publishes it. The env
+    ;; swap is outside any section: env watches are user code.
+    (when existing (types/setVal existing data))
+    (world/register-type!
+     t data #?(:cljs sci.impl.deftype/fork-type-data :default nil))
+    (swap! env (fn [env]
+                 (-> env
+                     (update-in [:namespaces cnn :types] assoc type-name t)
+                     ;; Remove any var that might have been created by (declare)
+                     (update-in [:namespaces cnn] dissoc type-name))))
     t))
 
 (def sci-impl-records

@@ -29,26 +29,22 @@
         m (types/eval m ctx bindings)
         m (assoc m :name var-name :file file)
         cnn (types/getName (:ns m))
-        assoc-in-env
-        (fn [env]
-          (let [the-current-ns (get (get env :namespaces) cnn)
-                prev (get the-current-ns var-name)
-                prev (if-not (utils/var? prev)
-                       (let [_ (utils/check-namespace-writable! ctx env cnn)
-                             m (meta prev)]
-                         (lang/->Var prev var-name m false false nil (:ns m) false))
-                       prev)
-                v (do (when-not (identical? utils/var-unbound init)
-                        (vars/bindRoot prev init))
-                      (utils/reset-meta!* prev m)
-                      prev)
-                the-current-ns (assoc the-current-ns var-name v)]
-            (assoc-in env [:namespaces cnn] the-current-ns)))
-        ;; One publication: value, metadata and mapping (watches run after).
-        env (world/publishing-in (:sci.impl/world ctx)
-                                 #(swap! (:env ctx) assoc-in-env))]
-    ;; return var
-    (get (get (get env :namespaces) cnn) var-name)))
+        env (:env ctx)
+        prev (get (get (get @env :namespaces) cnn) var-name)
+        v (if (utils/var? prev)
+            prev
+            (do (utils/check-namespace-writable! ctx @env cnn)
+                (let [m (meta prev)]
+                  (lang/->Var prev var-name m false false nil (:ns m) false))))]
+    ;; Value and metadata are one publication (Var watches run after it).
+    (world/publishing-in (:sci.impl/world ctx)
+                         #(do (when-not (identical? utils/var-unbound init)
+                                (vars/bindRoot v init))
+                              (utils/reset-meta!* v m)))
+    ;; The mapping follows its slots. Outside the publication: watches and a
+    ;; validator on the env atom are user code.
+    (swap! env assoc-in [:namespaces cnn var-name] v)
+    v))
 
 #?(:cljd
    (defmacro resolve-symbol [bindings sym]
