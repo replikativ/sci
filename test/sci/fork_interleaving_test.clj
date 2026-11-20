@@ -125,6 +125,19 @@
       (when (map? child)
         (is (= [1 2] (sci/eval-string* child "(vec xs)")))))))
 
+(defn- collected?
+  "Whether every weak reference is cleared after (repeated) GC."
+  [refs]
+  (let [cleared? #(every? (fn [^WeakReference r] (nil? (.get r))) refs)]
+    (loop [n 0]
+      (cond (cleared?) true
+            (= n 20) false
+            :else (do (System/gc) (await-condition 50 cleared?) (recur (inc n)))))))
+
+(defn- cells-length [ctx]
+  (.length ^java.util.concurrent.atomic.AtomicReferenceArray
+           @(.-cells-holder ^sci.impl.world.DenseWorld (:sci.impl/world ctx))))
+
 (deftest retired-children-that-defined-vars-are-reclaimed
   (let [parent (forkable {})
         _ (sci/eval-string* parent "(def shared 1)")
@@ -162,3 +175,28 @@
     (when (map? child)
       (is (= [false false]
              (sci/eval-string* child "[(boolean (find-ns 'newlib)) (contains? (loaded-libs) 'newlib)]"))))))
+
+(deftest concurrent-definitions-of-one-var-never-tear-value-and-metadata
+  (let [ctx (forkable {})
+        _ (sci/eval-string* ctx "(def ^{:revision 0} x 0)")
+        register-var! @#'world/register-var!
+        t1-thread (promise)
+        t2 (promise)]
+    (with-redefs [world/register-var!
+                  (fn [& args]
+                    (let [result (apply register-var! args)]
+                      (when (and (identical? (Thread/currentThread) @t1-thread)
+                                 (= 1 (second args)) (not (realized? t2)))
+                        ;; t1 wrote x's value; its metadata is still to come
+                        (let [f (future (sci/eval-string* ctx "(def ^{:revision 2} x 2)"))]
+                          (deliver t2 f)
+                          (deref f 500 ::waiting)))
+                      result))]
+      (deref (future (deliver t1-thread (Thread/currentThread))
+                     (sci/eval-string* ctx "(def ^{:revision 1} x 1)"))
+             10000 ::timeout)
+      (deref @t2 10000 ::timeout))
+    (let [q "[x (:revision (meta #'x))]"
+          [value revision] (sci/eval-string* ctx q)]
+      (is (= value revision) "one definition's value with another's metadata")
+      (is (= [value revision] (sci/eval-string* (sci/fork ctx) q))))))

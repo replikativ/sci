@@ -36,11 +36,15 @@
             (do (utils/check-namespace-writable! ctx @env cnn)
                 (let [m (meta prev)]
                   (lang/->Var prev var-name m false false nil (:ns m) false))))]
-    ;; Value and metadata are one publication (Var watches run after it).
+    ;; Value and metadata are one publication (Var watches run after it),
+    ;; and one definition's pair is never interleaved with another's.
     (world/publishing-in (:sci.impl/world ctx)
-                         #(do (when-not (identical? utils/var-unbound init)
+                         #(world/with-handle-lock
+                            v
+                            (fn []
+                              (when-not (identical? utils/var-unbound init)
                                 (vars/bindRoot v init))
-                              (utils/reset-meta!* v m)))
+                              (utils/reset-meta!* v m))))
     ;; The mapping follows its slots. Outside the publication: watches and a
     ;; validator on the env atom are user code.
     (swap! env assoc-in [:namespaces cnn var-name] v)

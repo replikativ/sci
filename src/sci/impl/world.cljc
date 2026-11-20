@@ -221,6 +221,21 @@
             deferred-error (throw deferred-error)
             :else result))))
 
+;; Writers of one handle's slot pair (a def's value and metadata) are
+;; serialized by a striped monitor, so two definitions never interleave into
+;; one's value with the other's metadata. `f` runs no user code and takes no
+;; other monitor that may be held across user code.
+#?(:clj
+   (def ^:private handle-locks
+     (let [a (object-array 64)]
+       (dotimes [i 64] (aset a i (Object.)))
+       a)))
+
+(defn with-handle-lock [handle f]
+  #?(:clj (locking (aget ^objects handle-locks (bit-and (System/identityHashCode handle) 63))
+            (f))
+     :default (f)))
+
 (declare current-world)
 
 (defn publishing
