@@ -78,7 +78,9 @@ This shape combines four useful precedents:
   their source being mutated concurrently.
 - `retire!` closes a world at once: new evaluations, host accesses and forks
   are refused, while evaluations already running in it (also the caller's own)
-  finish against it. Its memory is reclaimed by GC.
+  finish against it. When no evaluation is left in it (counted per world),
+  its cells and caches are cleared; the closed world itself stays as the home
+  of Vars it defined, so access through them keeps failing as retired.
 
 ## Host cooperation
 

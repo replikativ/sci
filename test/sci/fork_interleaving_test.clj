@@ -138,23 +138,62 @@
   (.length ^java.util.concurrent.atomic.AtomicReferenceArray
            @(.-cells-holder ^sci.impl.world.DenseWorld (:sci.impl/world ctx))))
 
-(deftest retired-children-that-defined-vars-are-reclaimed
+(deftest retired-heaps-do-not-accumulate
+  ;; The retired world itself may stay (Var homes keep it, so access to a
+  ;; retired Var is refused); its cells and caches must not.
   (let [parent (forkable {})
         _ (sci/eval-string* parent "(def shared 1)")
-        refs (vec (for [i (range 8)]
-                    (let [child (sci/fork parent)]
-                      (sci/eval-string* child (str "(def child-only-" i " (vec (range 10000))) (def shared " i ")"))
-                      (let [r (WeakReference. (:sci.impl/world child))]
-                        (sci/retire! child)
-                        r))))
-        cleared? #(every? (fn [^WeakReference r] (nil? (.get r))) refs)]
-    (is (loop [n 0]
-          (cond (cleared?) true
-                (= n 20) false
-                :else (do (System/gc) (await-condition 50 cleared?) (recur (inc n)))))
-        "retired child worlds are garbage collected")
+        children (vec (for [i (range 8)]
+                        (let [child (sci/fork parent)
+                              big (sci/eval-string*
+                                   child (str "(def child-only-" i " (vec (range 100000))) (def shared " i ") child-only-" i))]
+                          (sci/retire! child)
+                          [(WeakReference. big) (cells-length child)])))]
+    (is (every? zero? (map second children)) "a retired world with no evaluation in it is cleared")
+    (is (collected? (map first children)) "retired heaps are garbage collected")
     (is (= 1 (sci/eval-string* parent "shared")))
     (is (= 1 (sci/eval-string* (sci/fork parent) "shared")))))
+
+(deftest an-interned-closure-root-does-not-retain-a-retired-heap
+  (let [parent (forkable {})
+        child (sci/fork parent)
+        big (sci/eval-string* child "(let [big (vec (range 100000))]
+                                       (intern 'user 'leak (fn [] (count big)))
+                                       big)")
+        ;; the registry keeps the Var and its root closure, which captures
+        ;; the child's context: the retired heap must still go
+        heap (WeakReference. @(.-cells-holder ^sci.impl.world.DenseWorld (:sci.impl/world child)))]
+    (is (= 100000 (sci/eval-string* child "(leak)")))
+    (sci/retire! child)
+    (is (collected? [heap]))
+    (is (= 100000 (count big)))
+    (is (= :parent-live (sci/eval-string* parent ":parent-live")) "the lineage registry stayed alive")))
+
+(deftest a-var-defined-by-an-admitted-evaluation-after-retirement-is-reclaimed
+  (let [entered (promise) go (promise) captured (atom nil)
+        parent (forkable {:namespaces {'host {'pause #(do (deliver entered true) (deref go 5000 :timeout))
+                                              'capture #(reset! captured (WeakReference. %))}}})
+        child (sci/fork parent)
+        t1 (future (sci/eval-string* child "(host/pause) (def late (vec (range 100000))) (host/capture late) :done"))]
+    (is (true? (deref entered 5000 ::timeout)))
+    (sci/retire! child)
+    (deliver go true)
+    (is (= :done (deref t1 5000 ::timeout)) "the admitted evaluation finished")
+    (is (zero? (cells-length child)) "the last evaluation leaving the retired world cleared it")
+    (is (collected? [@captured]))
+    (is (= :parent-live (sci/eval-string* parent ":parent-live")))))
+
+(deftest a-retired-var-access-errors-also-after-gc
+  (let [parent (forkable {})
+        v (let [child (sci/fork parent)
+                v (sci/eval-string* child "(def weak-only 123) #'weak-only")]
+            (sci/retire! child)
+            v)]
+    (dotimes [_ 5] (System/gc) (await-condition 20 (constantly false)))
+    (is (re-find #"retired"
+                 (str (try (deref v) (catch Exception e (ex-message e)))))
+        "never a silent fallback to the raw root")
+    (is (= :parent-live (sci/eval-string* parent ":parent-live")))))
 
 (deftest loaded-libs-are-cut-with-the-environment
   (let [ctx (forkable {:load-fn (fn [{:keys [namespace]}]
@@ -221,3 +260,4 @@
             ctx (forkable {:namespaces {'host {'cf cf}}})
             _ (sci/eval-string* ctx "(def cf host/cf)")]
         (is (identical? cf (sci/eval-string* (sci/fork ctx) "cf")))))))
+

@@ -36,8 +36,10 @@
 ;; it, so a read permit taken there never delays a fork or a retirement.
 ;; `retirement` is nil while open, else an atom of
 ;; {:retained {owner realization} :done? bool}.
+;; `in-flight` counts evaluations and host accesses inside the world; a
+;; retired world is cleared (cells, retained caches) when it drops to zero.
 (deftype DenseWorld [cells-holder registry gate slot-gate publish-gate
-                     persistent? open? retirement])
+                     persistent? open? retirement in-flight])
 
 (defprotocol IForkableWorldCache
   (-fork-world-cache! [owner source target]
@@ -67,30 +69,7 @@
 (defprotocol IWorldTracked
   (-world-tracked? [handle])
   (-world-home-ctx [handle])
-  (-mark-world-tracked! [handle home-ctx])
-  (-release-world-home! [handle world]
-    "If this handle's home context belongs to the retired `world`, hold it
-     only weakly from now on: the lineage registry retains the handle, and
-     must not retain the retired world through it."))
-
-(defn ^:no-doc weak-home
-  "A weak reference to a retired home context, where the host has one."
-  [ctx]
-  #?(:clj (WeakReference. ctx)
-     :cljs (if (exists? js/WeakRef) (js/WeakRef. ctx) ctx)
-     :cljd ctx))
-
-(defn ^:no-doc home-ctx
-  "The home context a handle records: a context map, a weak one, or nil."
-  [tracked]
-  (cond (map? tracked) tracked
-        #?(:clj (instance? WeakReference tracked)
-           :cljs (and (exists? js/WeakRef) (instance? js/WeakRef tracked))
-           :cljd false)
-        #?(:clj (.get ^WeakReference tracked)
-           :cljs (.deref tracked)
-           :cljd nil)
-        :else nil))
+  (-mark-world-tracked! [handle home-ctx]))
 
 (defn read-world [world primary?]
   (ReadWorld. world primary?))
@@ -312,7 +291,8 @@
    #?(:cljd nil :clj (ReentrantReadWriteLock.) :cljs nil)
    (volatile! persistent?)
    (volatile! true)
-   (atom nil)))
+   (atom nil)
+   #?(:clj (java.util.concurrent.atomic.AtomicLong.) :default (volatile! 0))))
 
 (defn new-world []
   (dense-world (new-cells 64)
@@ -451,26 +431,57 @@
       (assert-open! world)))
   world)
 
+(declare reclaim-if-idle!)
+
+(defn- enter-world! [^DenseWorld world]
+  #?(:clj (.incrementAndGet ^java.util.concurrent.atomic.AtomicLong (.-in-flight world))
+     :default (vswap! (.-in-flight world) inc)))
+
+(defn- leave-world! [^DenseWorld world]
+  (when (zero? #?(:clj (.decrementAndGet ^java.util.concurrent.atomic.AtomicLong (.-in-flight world))
+                  :default (vswap! (.-in-flight world) dec)))
+    (when-not @(.-open? world)
+      (reclaim-if-idle! world))))
+
+(defn- in-flight [^DenseWorld world]
+  #?(:clj (.get ^java.util.concurrent.atomic.AtomicLong (.-in-flight world))
+     :default @(.-in-flight world)))
+
+(defn- with-counted-entry
+  "Run `f` as an entry into `world` from outside it: counted, so a retired
+   world is cleared only after its last evaluation left. The count is taken
+   before the open check: a retirement either sees it or this entry sees the
+   world closed (and is refused, unless already admitted)."
+  [^DenseWorld world f]
+  (enter-world! world)
+  (try
+    (assert-accessible! world)
+    (f)
+    (finally (leave-world! world))))
+
 (defn call-admitted
   "Run `f`, an evaluation of `ctx` that may enter its world several times
    (one eval-string*), as one evaluation: admitted while the world is open,
    it finishes even if the world is retired meanwhile."
   [ctx f]
   (if-let [world (:sci.impl/world ctx)]
-    (do
-      (assert-accessible! world)
-      (let [previous (admitted-worlds)]
-        #?(:clj (.set ^ThreadLocal admitted (cons world previous))
-           :default (vreset! admitted (cons world previous)))
-        (try (f)
-             (finally
-               #?(:clj (.set ^ThreadLocal admitted previous)
-                  :default (vreset! admitted previous))))))
+    (with-counted-entry
+      world
+      (fn []
+        (let [previous (admitted-worlds)]
+          #?(:clj (.set ^ThreadLocal admitted (cons world previous))
+             :default (vreset! admitted (cons world previous)))
+          (try (f)
+               (finally
+                 #?(:clj (.set ^ThreadLocal admitted previous)
+                    :default (vreset! admitted previous)))))))
     (f)))
 
 (defn- with-world-access [^DenseWorld world f]
-  (assert-accessible! world)
-  (f))
+  ;; Inside the world (selected) the enclosing entry is already counted.
+  (if (identical? world (selected-world))
+    (f)
+    (with-counted-entry world f)))
 
 ;; Worlds whose fork callbacks run on this thread. Such a callback can neither
 ;; fork nor retire its source: that would recurse into the same copy.
@@ -502,8 +513,7 @@
   only refuses new entries."
   [ctx f]
   (if-let [world (:sci.impl/world ctx)]
-    (do (assert-accessible! world)
-        (call-with-active-world ctx f))
+    (with-counted-entry world #(call-with-active-world ctx f))
     (f)))
 
 (defn call-with-context
@@ -771,10 +781,12 @@
 (defn retire-world!
   "Retire one interpreter world now. New evaluations and forks are refused;
    evaluations already running in it finish against it. Managed cache owners
-   release their world-specific state (the world itself keeps what running
-   evaluations still need, and is reclaimed by GC with it); this does not
-   close foreign host resources or retire sibling worlds. Safe to repeat
-   after a failed cache cleanup."
+   release their world-specific state (the world keeps what running
+   evaluations still need). When no evaluation is in the world, now or once
+   the last one leaves, its cells and retained caches are cleared; the small
+   closed world remains for Vars whose home it is, which then refuse access.
+   This does not close foreign host resources or retire sibling worlds. Safe
+   to repeat after a failed cache cleanup."
   [^DenseWorld world]
   (assert-not-copying! world :retire)
   (vreset! (.-open? world) false)
@@ -801,13 +813,26 @@
             (swap! r update :retained merge retained)
             (doseq [owner owners]
               (-retire-world-cache! owner world))
-            ;; Vars whose home is this world keep it only weakly: the shared
-            ;; registry retains them for the lineage's lifetime.
-            (doseq [handle (keys (:descriptors @(.-registry world)))
-                    :when #?(:clj (instance? sci.impl.world.IWorldTracked handle)
-                             :default (satisfies? IWorldTracked handle))]
-              (-release-world-home! handle world))
-            (swap! r assoc :done? true))))))
+            (swap! r assoc :done? true))))
+      (when (zero? (in-flight world))
+        (reclaim-if-idle! world))))
+  nil)
+
+(defn- reclaim-if-idle!
+  "Clear a retired world once no evaluation is in it: its cells and the
+   caches retirement kept for running evaluations. The closed world object
+   stays as long as a Var's home refers to it, so a later access through
+   such a Var is refused, never answered from a fallback. Runs in a slot
+   section (after a fork copy in progress); idempotent."
+  [^DenseWorld world]
+  (when-let [r @(.-retirement world)]
+    (when (:done? @r)
+      (with-cells-read-lock
+        world
+        (fn []
+          (when (zero? (in-flight world))
+            (vreset! (.-cells-holder world) (new-cells 0))
+            (swap! r assoc :retained {}))))))
   nil)
 
 (defn- fork-cleanup-failure [error cleanup-error target previous]

@@ -34,17 +34,21 @@ SCI is used in [babashka](https://github.com/babashka/babashka),
   not part of the consistent cut: each is classified when the copy reads it.
   The parent's task is never waited for, re-run or changed.
 - `retire!` closes a world at once: new evaluations and forks are refused,
-  running evaluations (also the caller's own) finish against it, and memory
-  is reclaimed by GC.
+  running evaluations (also the caller's own) finish against it. A per-world
+  in-flight count clears the retired world's cells and caches when the last
+  evaluation leaves (at once if none is running); the small closed world
+  stays for Vars whose home it is, so their access is refused, never answered
+  from a fallback. A Var interned in a forked world keeps its value only in
+  that world's slots.
 - No user code runs under a world lock: `alter-meta!`, `alter-var-root`,
   validators and swap functions run before the slot commit (q7).
   Watches and a validator on the context's `:env` atom never run inside a
   publication either.
 - A still-mutable primary's volatile writes are slot sections, so the first
   fork's realization reads a consistent set of roots.
-- Retirement waits for a fork copy in progress before releasing caches, and
-  Vars whose home world is retired hold it only weakly, so GC reclaims
-  retired worlds that defined Vars.
+- Retirement waits for a fork copy in progress before releasing caches.
+- Concurrent definitions of one Var never mix one's value with the other's
+  metadata.
 - SCI-owned fork state (loaded libs, type data) is snapshotted with the cut.
 - Slots are written before a namespace mapping publishes their handle
   (`deftype` at analysis, `intern` of a new Var, `create-ns`,

@@ -687,9 +687,16 @@
             (sci.impl.vars/bindRoot v val)
             v)
           (let [_ (sci.impl.utils/check-namespace-writable! ctx @env ns-name)
-                new-var (sci.impl.utils/new-var var-sym val (assoc (meta var-sym) :ns ns))]
+                ;; A forked world's value lives in its slots only: the shared
+                ;; lineage registry keeps this Var (and its raw root) for the
+                ;; lineage's lifetime, which must not retain the child's value.
+                child? (and (:sci.impl/world ctx) (not (world/primary-world?)))
+                new-var (sci.impl.utils/new-var var-sym (when-not child? val)
+                                                (assoc (meta var-sym) :ns ns))]
             ;; Slots first: the mapping makes the Var reachable.
-            (register-interned-var! ctx new-var)
+            (if child?
+              (world/register-var! new-var val (meta new-var))
+              (register-interned-var! ctx new-var))
             (swap! env assoc-in [:namespaces ns-name var-sym] new-var)
             new-var))))))
 

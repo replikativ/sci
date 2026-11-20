@@ -457,10 +457,10 @@
 (defn retire!
   "Retire a forkable context now and release its managed realization caches.
    Future evaluation or forking through this context is refused; evaluations
-   already running in it (also the caller's own) finish against it, and its
-   memory is reclaimed by GC. Related worlds remain usable. This does not
-   close arbitrary host resources. Standard contexts have no managed world
-   and are unaffected."
+   already running in it (also the caller's own) finish against it. Once none
+   is left its state is cleared; Vars it defined then refuse access. Related
+   worlds remain usable. This does not close arbitrary host resources.
+   Standard contexts have no managed world and are unaffected."
   [ctx]
   (when-let [runtime-world (:sci.impl/world ctx)]
     (world/retire-world! runtime-world))
