@@ -239,6 +239,9 @@
         ns-obj (or (:obj ns-map)
                    (when (or ns-map create?)
                      (let [ns-obj (lang/->Namespace ns-sym attr-map)]
+                       ;; Slot first: the mapping makes the namespace
+                       ;; reachable (also to a fork).
+                       (world/register-namespace! ns-obj attr-map)
                        (swap! env assoc-in [:namespaces ns-sym :obj] ns-obj)
                        ns-obj)))]
     (when ns-obj

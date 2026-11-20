@@ -7,18 +7,33 @@
 
 #?(:cljd nil :clj (set! *warn-on-reflection* true))
 
+(defprotocol IWorldMirror
+  "Raw writes of the host object a primary world reads directly. Only called
+   inside a world slot section (`sci.impl.world/mirror!`): no user code, no
+   locks."
+  (-mirror-root! [this v])
+  (-mirror-meta! [this m]))
+
+(defn- primary-mirror-root [x]
+  (when (world/primary-world?) #(-mirror-root! x %)))
+
+(defn- primary-mirror-meta [x]
+  (when (world/primary-world?) #(-mirror-meta! x %)))
+
 ;; marker interface for vars, clj only for now
 #?(:cljd nil :clj (definterface ^{:doc "Marker interface for SCI vars."} IVar))
 
 (deftype ^{:doc "Representation of a SCI custom type, created e.g. with `(defrecord Foo [])`. The fields of this type are implementation detail and should not be accessed directly."}
     Type [#?(:cljd ^:mutable data :clj ^:volatile-mutable data :cljs ^:volatile-mutable data)]
+  IWorldMirror
+  (-mirror-root! [_ v] (set! data v))
+  (-mirror-meta! [_ m] (set! data m))
   sci.impl.types/IBox
   (getVal [this] (world/type-data this data))
   (setVal [this v]
     (if (world/current-world)
       (do
-        (world/reset-type-data! this v)
-        (when (world/primary-world?) (set! data v))
+        (world/reset-type-data! this v (primary-mirror-root this))
         v)
       (set! data v)))
   Object
@@ -44,28 +59,27 @@
        (-reset-meta! [this m]
          (if (world/current-world)
            (do
-             (world/reset-type-data! this m)
-             (when (world/primary-world?) (set! data m))
+             (world/reset-type-data! this m (primary-mirror-root this))
              m)
            (set! data m)))]
       :clj
       [clojure.lang.IReference
+       ;; In a world `f` runs outside every world lock (the monitor only
+       ;; orders alterMeta callers); resetMeta takes no monitor there, as it
+       ;; may run inside a publication.
        (alterMeta [this f args]
                   (locking this
                     (if (world/current-world)
-                      (let [m (world/alter-type-data!
-                               this (world/type-data this data) f args)]
-                        (when (world/primary-world?) (set! data m))
-                        m)
+                      (world/alter-type-data!
+                       this (world/type-data this data) f args
+                       (primary-mirror-root this))
                       (set! data (apply f data args)))))
        (resetMeta [this m]
-                  (locking this
-                    (if (world/current-world)
-                      (do
-                        (world/reset-type-data! this m)
-                        (when (world/primary-world?) (set! data m))
-                        m)
-                      (set! data m))))])
+                  (if (world/current-world)
+                    (do
+                      (world/reset-type-data! this m (primary-mirror-root this))
+                      m)
+                    (locking this (set! data m))))])
 
   types/HasName
   (getName [this] (str this)))
@@ -84,11 +98,13 @@
 (defn notify-watches [ref watches old-val new-val]
   (when watches
     (when (pos? (count watches))
-      (reduce-kv (fn [_ k f]
-                   (f k ref old-val new-val)
-                   nil)
-                 nil
-                 watches)))
+      ;; Watches are user code: inside a publication (a def) they run after it.
+      (world/run-after-publication!
+       #(reduce-kv (fn [_ k f]
+                     (f k ref old-val new-val)
+                     nil)
+                   nil
+                   watches))))
   ref)
 
 (deftype ^{:doc "Representation of a SCI var, created e.g. with `(defn foo [])`
@@ -116,6 +132,9 @@
             :cljs ^:mutable world-tracked)]
   ;; marker interface, clj only for now
   #?@(:cljd [] :clj [sci.lang.IVar])
+  IWorldMirror
+  (-mirror-root! [_ v] (vars/bumping-set! root v))
+  (-mirror-meta! [_ m] (set! meta m))
   world/IWorldTracked
   (-world-tracked? [_] (boolean world-tracked))
   (-world-home-ctx [_] (when (map? world-tracked) world-tracked))
@@ -143,9 +162,7 @@
           current-meta (if world-tracked (world/var-meta this meta) meta)]
       (vars/with-writeable-var this current-meta
         (if (world/current-world)
-          (do (world/register-var! this v current-meta)
-              (when (world/primary-world?)
-                (vars/bumping-set! root v)))
+          (world/register-var! this v current-meta nil (primary-mirror-root this))
           (vars/bumping-set! root v)))
       (notify-watches this (world/var-watches this watches) old-root v))
     ;; this is the return value for alter-var-root which should be the only place calling bindRoot directly
@@ -198,9 +215,8 @@
             ;; A newly interned Var has no slot yet, especially in a child
             ;; world. Registering here preserves unboundness without mutating
             ;; the shared direct root.
-            (world/register-var! this unbound current-meta)
-            (when (world/primary-world?)
-              (vars/bumping-set! (.-root this) unbound)))
+            (world/register-var! this unbound current-meta nil
+                                 (primary-mirror-root this)))
           (vars/bumping-set! (.-root this) (vars/->SciUnbound this))))))
   (hasRoot [this]
     (not (instance? #?(:cljd vars/SciUnbound
@@ -223,17 +239,13 @@
          :cljs (types/setVal b v))
       #?(:cljd (if (:unrestricted sci.ctx-store/*ctx*)
                  (if (world/current-world)
-                   (do (world/reset-value! this v)
-                       (when (world/primary-world?)
-                         (set! (.-root this) v)))
+                   (world/reset-value! this v (primary-mirror-root this))
                    (set! (.-root this) v))
                  (throw-root-binding this))
          :clj (throw-root-binding this)
          :cljs (if (:unrestricted sci.ctx-store/*ctx*)
                  (if (world/current-world)
-                   (do (world/reset-value! this v)
-                       (when (world/primary-world?)
-                         (vars/bumping-set! (.-root this) v)))
+                   (world/reset-value! this v (primary-mirror-root this))
                    (vars/bumping-set! (.-root this) v))
                  (throw-root-binding this)))))
   (getVal [this] (if world-tracked (world/var-value this root) root))
@@ -272,12 +284,13 @@
                                  (fn []
                                    (let [current-meta (world/var-meta this meta)]
                                      (vars/with-writeable-var this current-meta
+                                       ;; In a world `f` runs outside every
+                                       ;; world lock; the monitor only orders
+                                       ;; alterMeta callers.
                                        (locking this
                                          (if (world/current-world)
-                                           (let [m (world/alter-var-meta! this current-meta f args)]
-                                             (when (world/primary-world?)
-                                               (set! (.-meta this) m))
-                                             m)
+                                           (world/alter-var-meta! this current-meta f args
+                                                                  (primary-mirror-meta this))
                                            (set! (.-meta this) (apply f meta args)))))))))
                      (resetMeta [this m]
                                 (world/call-with-var-context
@@ -285,13 +298,12 @@
                                  (fn []
                                    (let [current-meta (world/var-meta this meta)]
                                      (vars/with-writeable-var this current-meta
-                                       (locking this
-                                         (if (world/current-world)
-                                           (do (world/reset-var-meta! this m)
-                                               (when (world/primary-world?)
-                                                 (set! (.-meta this) m))
-                                               m)
-                                           (set! (.-meta this) m))))))))])
+                                       ;; No monitor in a world: this may run
+                                       ;; inside a publication (def).
+                                       (if (world/current-world)
+                                         (do (world/reset-var-meta! this m (primary-mirror-meta this))
+                                             m)
+                                         (locking this (set! (.-meta this) m))))))))])
   #?@(:cljd [types/IResetMeta
              (-reset-meta! [this m]
                (world/call-with-var-context
@@ -300,9 +312,7 @@
                   (let [current-meta (world/var-meta this meta)]
                     (vars/with-writeable-var this current-meta
                       (if (world/current-world)
-                        (do (world/reset-var-meta! this m)
-                            (when (world/primary-world?)
-                              (set! (.-meta this) m))
+                        (do (world/reset-var-meta! this m (primary-mirror-meta this))
                             m)
                         (set! (.-meta this) m)))))))
              IWatchable
@@ -498,6 +508,9 @@
     (str name))
   types/HasName
   (getName [_] name)
+  IWorldMirror
+  (-mirror-root! [_ m] (set! meta m))
+  (-mirror-meta! [_ m] (set! meta m))
   #?(:cljd IMeta :clj clojure.lang.IMeta :cljs IMeta)
   #?(:cljd (-meta [this] (world/namespace-meta this meta))
      :clj (clojure.core/meta [this] (world/namespace-meta this meta))
@@ -507,8 +520,7 @@
                (let [current-meta (world/namespace-meta this meta)]
                  (vars/with-writeable-namespace this current-meta
                    (if (world/current-world)
-                     (do (world/reset-namespace-meta! this m)
-                         (when (world/primary-world?) (set! meta m))
+                     (do (world/reset-namespace-meta! this m (primary-mirror-meta this))
                          m)
                      (set! meta m)))))]
       :clj [clojure.lang.IReference
@@ -517,17 +529,13 @@
                          (vars/with-writeable-namespace this current-meta
                            (locking this
                              (if (world/current-world)
-                               (let [m (world/alter-namespace-meta!
-                                        this current-meta f args)]
-                                 (when (world/primary-world?) (set! meta m))
-                                 m)
+                               (world/alter-namespace-meta!
+                                this current-meta f args (primary-mirror-meta this))
                                (set! meta (apply f meta args)))))))
             (resetMeta [this m]
                        (let [current-meta (world/namespace-meta this meta)]
                          (vars/with-writeable-namespace this current-meta
-                           (locking this
-                             (if (world/current-world)
-                               (do (world/reset-namespace-meta! this m)
-                                   (when (world/primary-world?) (set! meta m))
-                                   m)
-                               (set! meta m))))))]))
+                           (if (world/current-world)
+                             (do (world/reset-namespace-meta! this m (primary-mirror-meta this))
+                                 m)
+                             (locking this (set! meta m))))))]))

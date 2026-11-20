@@ -322,10 +322,9 @@
      (let [current (meta v)]
        (vars/with-writeable-var v current
          (if (world/current-world)
-           (let [m (world/alter-var-meta! v current f args)]
-             (when (world/primary-world?)
-               (utils/reset-meta!* v m))
-             m)
+           (world/alter-var-meta! v current f args
+                                  (when (world/primary-world?)
+                                    #(sci.lang/-mirror-meta! v %)))
            (apply #?(:cljd utils/alter-meta!* :default c/alter-meta!)
                   v f args)))))))
 
@@ -338,9 +337,9 @@
      (let [current (meta v)]
        (vars/with-writeable-var v current
          (if (world/current-world)
-           (do (world/reset-var-meta! v m)
-               (when (world/primary-world?)
-                 (utils/reset-meta!* v m))
+           (do (world/reset-var-meta! v m
+                                      (when (world/primary-world?)
+                                        #(sci.lang/-mirror-meta! v %)))
                m)
            (utils/reset-meta!* v m)))))))
 
@@ -814,7 +813,7 @@
   "Adds namespace map `ns-map` named by the symbol `ns-name` to
   `ctx`. Returns mutated context."
   [ctx ns-name ns-map]
-  (swap! (:env ctx) update-in [:namespaces ns-name] merge ns-map)
+  ;; Slots first: the mapping makes the Vars reachable (also to a fork).
   (when (:sci.impl/world ctx)
     (store/with-ctx ctx
       (world/with-active-world
@@ -824,6 +823,7 @@
                             (not (world/registered? (:sci.impl/world ctx) v)))]
            (world/register-var! v (vars/getRawRoot v) (meta v)
                                 (vars/getRawWatches v))))))
+  (swap! (:env ctx) update-in [:namespaces ns-name] merge ns-map)
   ctx)
 
 (defn find-ns

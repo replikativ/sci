@@ -111,22 +111,28 @@
     (world/register! v x)
     v))
 
+(defn- primary-root-write!
+  "A root-only write of a still-mutable primary world, then the fork race
+   check (`world/sync-primary-root!`)."
+  [ref result]
+  (world/sync-primary-root! ref #(clojure.core/deref ref))
+  result)
+
 (defn forkable-vreset!*
   [v x]
   (if (world/mutable-primary-world?)
-    (clojure.core/vreset! v x)
+    (primary-root-write! v (clojure.core/vreset! v x))
     (if (world/tracked? v)
       (if (world/primary-world?)
-        (let [new (clojure.core/vreset! v x)]
-          (world/reset-value! v new)
-          new)
+        ;; slot and volatile in one slot section
+        (world/reset-value! v x #(clojure.core/vreset! v %))
         (world/reset-value! v x))
       (clojure.core/vreset! v x))))
 
 (defn forkable-vswap!*
   [v f & args]
   (if (world/mutable-primary-world?)
-    (clojure.core/vreset! v (apply f (clojure.core/deref v) args))
+    (primary-root-write! v (clojure.core/vreset! v (apply f (clojure.core/deref v) args)))
     (if (world/tracked? v)
       (forkable-vreset!* v (apply f (tracked-value v) args))
       (clojure.core/vreset! v (apply f (clojure.core/deref v) args)))))
@@ -145,11 +151,14 @@
   nil)
 
 (defn- swap-tracked! [ref f args]
+  ;; A realized primary: the host atom's swap runs user code, so its root is
+  ;; written first and published to the slot after it (not atomically with
+  ;; it). No JVM/CLJS path tracks a host atom; ClojureDart has no threads.
   (if (world/primary-world?)
     (let [new (if args
                 (apply clojure.core/swap! ref f args)
                 (clojure.core/swap! ref f))]
-      (world/reset-value! ref new)
+      (world/sync-primary-root! ref #(clojure.core/deref ref))
       new)
     (world/swap-value! ref f args
                        #(validate-ref! ref %)
@@ -158,7 +167,7 @@
 (defn- reset-tracked! [ref v]
   (if (world/primary-world?)
     (let [new (clojure.core/reset! ref v)]
-      (world/reset-value! ref new)
+      (world/sync-primary-root! ref #(clojure.core/deref ref))
       new)
     (world/reset-tracked! ref v
                           #(validate-ref! ref %)
@@ -168,7 +177,7 @@
   (if (world/primary-world?)
     (let [changed? (clojure.core/compare-and-set! ref old new)]
       (when changed?
-        (world/reset-value! ref new))
+        (world/sync-primary-root! ref #(clojure.core/deref ref)))
       changed?)
     (world/compare-and-set-tracked! ref old new
                                     #(validate-ref! ref %)
@@ -321,7 +330,7 @@
 
        (and (world/mutable-primary-world?)
             (instance? clojure.lang.IAtom ref))
-       (apply clojure.core/swap! ref f args)
+       (primary-root-write! ref (apply clojure.core/swap! ref f args))
 
        (world/tracked? ref)
        (swap-tracked! ref f args)
@@ -354,7 +363,7 @@
 
        (and (world/mutable-primary-world?)
             (instance? cljd.core/Atom ref))
-       (apply clojure.core/swap! ref f args)
+       (primary-root-write! ref (apply clojure.core/swap! ref f args))
 
        (world/tracked? ref)
        (swap-tracked! ref f args)
@@ -374,7 +383,7 @@
 
        (and (world/mutable-primary-world?)
             (instance? cljd.core/Atom ref))
-       (clojure.core/reset! ref v)
+       (primary-root-write! ref (clojure.core/reset! ref v))
 
        (world/tracked? ref)
        (reset-tracked! ref v)
@@ -393,7 +402,7 @@
 
        (and (world/mutable-primary-world?)
             (instance? clojure.lang.IAtom ref))
-       (clojure.core/reset! ref v)
+       (primary-root-write! ref (clojure.core/reset! ref v))
 
        (world/tracked? ref)
        (reset-tracked! ref v)
@@ -426,7 +435,7 @@
 
        (and (world/mutable-primary-world?)
             (instance? cljd.core/Atom ref))
-       (clojure.core/compare-and-set! ref old new)
+       (primary-root-write! ref (clojure.core/compare-and-set! ref old new))
 
        (world/tracked? ref)
        (compare-and-set-tracked!* ref old new)
@@ -441,7 +450,7 @@
 
        (and (world/mutable-primary-world?)
             (instance? clojure.lang.IAtom ref))
-       (clojure.core/compare-and-set! ref old new)
+       (primary-root-write! ref (clojure.core/compare-and-set! ref old new))
 
        (world/tracked? ref)
        (compare-and-set-tracked!* ref old new)
@@ -474,12 +483,12 @@
 
        (and (world/mutable-primary-world?)
             (instance? clojure.lang.IAtom ref))
-       (apply clojure.core/swap-vals! ref f args)
+       (primary-root-write! ref (apply clojure.core/swap-vals! ref f args))
 
        (world/tracked? ref)
        (if (world/primary-world?)
          (let [ret (apply clojure.core/swap-vals! ref f args)]
-           (world/reset-value! ref (nth ret 1))
+           (world/sync-primary-root! ref #(clojure.core/deref ref))
            ret)
          (let [old (world/value ref nil)
                new (swap-tracked! ref f args)]
@@ -499,12 +508,12 @@
 
        (and (world/mutable-primary-world?)
             (instance? clojure.lang.IAtom ref))
-       (clojure.core/reset-vals! ref v)
+       (primary-root-write! ref (clojure.core/reset-vals! ref v))
 
        (world/tracked? ref)
        (if (world/primary-world?)
          (let [ret (clojure.core/reset-vals! ref v)]
-           (world/reset-value! ref (nth ret 1))
+           (world/sync-primary-root! ref #(clojure.core/deref ref))
            ret)
          (let [old (world/value ref nil)
                new (reset-tracked! ref v)]

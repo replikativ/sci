@@ -684,6 +684,8 @@
             (sci.impl.vars/bindRoot v val)
             v)
           (let [new-var (sci.impl.utils/new-var var-sym val (assoc (meta var-sym) :ns ns))]
+            ;; Slots first: the mapping makes the Var reachable.
+            (register-interned-var! ctx new-var)
             (swap! env assoc-in [:namespaces ns-name var-sym] new-var)
             new-var))))))
 
@@ -974,17 +976,18 @@
                       (:sci.impl/js-prototype data) fields
                       (boolean (:sci.impl/record data))))
              :default nil)
-        t (if existing
-            (do (types/setVal existing data)
-                existing)
-            (sci.lang/->Type data))]
-    (world/register-type!
-     t data #?(:cljs sci.impl.deftype/fork-type-data :default nil))
-    (swap! env (fn [env]
-                 (-> env
-                     (update-in [:namespaces cnn :types] assoc type-name t)
-                     ;; Remove any var that might have been created by (declare)
-                     (update-in [:namespaces cnn] dissoc type-name))))
+        t (if existing existing (sci.lang/->Type data))]
+    ;; One publication: the type's data and its namespace mapping.
+    (world/publishing
+     (fn []
+       (when existing (types/setVal existing data))
+       (world/register-type!
+        t data #?(:cljs sci.impl.deftype/fork-type-data :default nil))
+       (swap! env (fn [env]
+                    (-> env
+                        (update-in [:namespaces cnn :types] assoc type-name t)
+                        ;; Remove any var that might have been created by (declare)
+                        (update-in [:namespaces cnn] dissoc type-name))))))
     t))
 
 (def sci-impl-records
@@ -1166,21 +1169,18 @@
          (let [current-meta (meta iref)]
            (vars/with-writeable-namespace iref current-meta
              (if (world/current-world)
-               (let [m (world/alter-namespace-meta!
-                        iref current-meta f args)]
-                 (when (world/primary-world?)
-                   (cljs.core/reset-meta! iref m))
-                 m)
+               (world/alter-namespace-meta!
+                iref current-meta f args
+                (when (world/primary-world?) #(sci.lang/-mirror-meta! iref %)))
                (apply cljs.core/alter-meta! iref f args))))
 
          (utils/var? iref)
          (let [current-meta (meta iref)]
            (vars/with-writeable-var iref current-meta
              (if (world/current-world)
-               (let [m (world/alter-var-meta! iref current-meta f args)]
-                 (when (world/primary-world?)
-                   (cljs.core/reset-meta! iref m))
-                 m)
+               (world/alter-var-meta!
+                iref current-meta f args
+                (when (world/primary-world?) #(sci.lang/-mirror-meta! iref %)))
                (apply cljs.core/alter-meta! iref f args))))
 
          (utils/sci-type? iref)
@@ -1202,9 +1202,8 @@
          (let [current-meta (meta iref)]
            (vars/with-writeable-namespace iref current-meta
              (if (world/current-world)
-               (do (world/reset-namespace-meta! iref m)
-                   (when (world/primary-world?)
-                     (cljs.core/reset-meta! iref m))
+               (do (world/reset-namespace-meta!
+                    iref m (when (world/primary-world?) #(sci.lang/-mirror-meta! iref %)))
                    m)
                (cljs.core/reset-meta! iref m))))
 
@@ -1212,9 +1211,8 @@
          (let [current-meta (meta iref)]
            (vars/with-writeable-var iref current-meta
              (if (world/current-world)
-               (do (world/reset-var-meta! iref m)
-                   (when (world/primary-world?)
-                     (cljs.core/reset-meta! iref m))
+               (do (world/reset-var-meta!
+                    iref m (when (world/primary-world?) #(sci.lang/-mirror-meta! iref %)))
                    m)
                (cljs.core/reset-meta! iref m))))
 

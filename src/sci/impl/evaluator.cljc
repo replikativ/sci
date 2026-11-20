@@ -11,6 +11,7 @@
    [sci.impl.utils :as utils :refer [rethrow-with-location-of-node
                                      throw-error-with-location]]
    [sci.impl.vars :as vars]
+   [sci.impl.world :as world]
    [sci.lang :as lang])
   #?(:cljs (:require-macros [sci.impl.evaluator :refer [def-fn-call resolve-symbol]])))
 
@@ -42,7 +43,9 @@
                       prev)
                 the-current-ns (assoc the-current-ns var-name v)]
             (assoc-in env [:namespaces cnn] the-current-ns)))
-        env (swap! (:env ctx) assoc-in-env)]
+        ;; One publication: value, metadata and mapping (watches run after).
+        env (world/publishing-in (:sci.impl/world ctx)
+                                 #(swap! (:env ctx) assoc-in-env))]
     ;; return var
     (get (get (get env :namespaces) cnn) var-name)))
 

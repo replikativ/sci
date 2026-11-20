@@ -547,9 +547,14 @@
         ;; resolve to the same object instances carry. -create-type adopts it
         ;; at eval time, adding the constructor var and (on CLJS) the JS
         ;; prototype.
-        _ (swap! (:env ctx) update-in
-                 [:namespaces (symbol (namespace tagged-name)) :types]
-                 assoc record-name (lang/->Type {:sci.impl/type-name rec-type}))
+        _ (let [t (lang/->Type {:sci.impl/type-name rec-type})]
+            ;; Slot first: the mapping makes the type reachable (also to a
+            ;; fork, which would otherwise read its shared host field).
+            (world/register-type!
+             t (types/getVal t) #?(:cljs fork-type-data :default nil))
+            (swap! (:env ctx) update-in
+                   [:namespaces (symbol (namespace tagged-name)) :types]
+                   assoc record-name t))
         result
         (if record?
           ;; Record-specific: only type creation + protocol impls
