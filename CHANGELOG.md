@@ -38,8 +38,9 @@ SCI is used in [babashka](https://github.com/babashka/babashka),
   in-flight count clears the retired world's cells and caches when the last
   evaluation leaves (at once if none is running); the small closed world
   stays for Vars whose home it is, so their access is refused, never answered
-  from a fallback. A Var interned in a forked world keeps its value only in
-  that world's slots.
+  from a fallback. A Var interned, or a volatile created, in a forked world
+  keeps its value only in that world's slots (a host deref of such a
+  volatile outside any world reads nil).
 - No user code runs under a world lock: `alter-meta!`, `alter-var-root`,
   validators and swap functions run before the slot commit (q7).
   Watches and a validator on the context's `:env` atom never run inside a

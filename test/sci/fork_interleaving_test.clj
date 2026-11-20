@@ -261,3 +261,20 @@
             _ (sci/eval-string* ctx "(def cf host/cf)")]
         (is (identical? cf (sci/eval-string* (sci/fork ctx) "cf")))))))
 
+
+(deftest a-child-volatile-keeps-no-value-in-its-shared-root
+  ;; The registry keeps a volatile created in a fork for the lineage's
+  ;; lifetime; its value lives only in the child's slots.
+  (let [captured (atom nil)
+        parent (forkable {:namespaces {'host {'make #(let [o (Object.)]
+                                                        (reset! captured (WeakReference. o))
+                                                        o)}}})
+        child (sci/fork parent)
+        v (sci/eval-string* child "(let [big (host/make)]
+                                     (def v (volatile! (fn [] big)))
+                                     v)")]
+    (is (some? (sci/eval-string* child "(@v)")))
+    (is (nil? @v) "host deref outside any world reads the empty shared root")
+    (sci/retire! child)
+    (is (collected? [@captured]) "the initial value and what it captures are collected")
+    (is (= :parent-live (sci/eval-string* parent ":parent-live")))))

@@ -105,9 +105,13 @@
   (apply refs/atom x options))
 
 (defn forkable-volatile!*
-  "Creates a volatile whose value is owned by the active SCI world."
+  "Creates a volatile whose value is owned by the active SCI world. In a
+  forked world the value lives only in that world's slots: the lineage
+  registry keeps the volatile for the lineage's lifetime, so its host field
+  stays nil (a host deref outside any world reads nil)."
   [x]
-  (let [v (clojure.core/volatile! x)]
+  (let [child? (and (world/current-world) (not (world/primary-world?)))
+        v (clojure.core/volatile! (when-not child? x))]
     (world/register! v x)
     v))
 
