@@ -35,6 +35,14 @@ SCI is used in [babashka](https://github.com/babashka/babashka),
   is reclaimed by GC.
 - No user code runs under a world lock: `alter-meta!`, `alter-var-root`,
   validators and swap functions run before the slot commit (q7).
+  Watches and a validator on the context's `:env` atom never run inside a
+  publication either.
+- A still-mutable primary's volatile writes are slot sections, so the first
+  fork's realization reads a consistent set of roots.
+- Retirement waits for a fork copy in progress before releasing caches, and
+  Vars whose home world is retired hold it only weakly, so GC reclaims
+  retired worlds that defined Vars.
+- SCI-owned fork state (loaded libs, type data) is snapshotted with the cut.
 - Slots are written before a namespace mapping publishes their handle
   (`deftype` at analysis, `intern` of a new Var, `create-ns`,
   `add-namespace!`), and `def` analysis no longer overwrites a concurrent
