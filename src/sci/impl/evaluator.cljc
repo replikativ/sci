@@ -34,7 +34,8 @@
           (let [the-current-ns (get (get env :namespaces) cnn)
                 prev (get the-current-ns var-name)
                 prev (if-not (utils/var? prev)
-                       (let [m (meta prev)]
+                       (let [_ (utils/check-namespace-writable! ctx env cnn)
+                             m (meta prev)]
                          (lang/->Var prev var-name m false false nil (:ns m) false))
                        prev)
                 v (do (when-not (identical? utils/var-unbound init)

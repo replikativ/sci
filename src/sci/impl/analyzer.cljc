@@ -865,6 +865,9 @@
     (when-not #?(:cljd (get the-current-ns name)
                  :clj (.get ^java.util.Map the-current-ns name)
                  :cljs (.get the-current-ns name))
+      (try (utils/check-namespace-writable! ctx @env cnn)
+           (catch #?(:cljd Object :clj Exception :cljs :default) e
+             (throw-error-with-location (ex-message e) expr)))
       ;; The unbound Var's slots are written before the mapping publishes
       ;; it. Only this name is added: concurrent publications to the same
       ;; namespace (another def, a deftype) are kept.

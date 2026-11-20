@@ -12,6 +12,13 @@ SCI is used in [babashka](https://github.com/babashka/babashka),
 
 ## Unreleased
 
+- Read-only host namespaces (off by default): a namespace whose object
+  carries `:sci/built-in` metadata, e.g. `(sci/create-ns 'lib {:sci/built-in
+  true})` as the `:obj` of its `:namespaces` or `add-namespace!` map, refuses
+  new names from `def`/`declare`/`intern`, `deftype`/`defrecord`, and refuses
+  `ns-unmap`, `remove-ns` and `require` with `:reload`/`:reload-all`.
+  Unrestricted contexts and the host (`add-namespace!`) may still extend it.
+
 - Forks and retirement never wait for an evaluation. Evaluation takes no
   world lock; a fork excludes only slot writers for the length of its copy
   (primary realization, cells, lazy caches and the namespace environment,

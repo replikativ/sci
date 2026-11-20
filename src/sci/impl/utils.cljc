@@ -229,6 +229,19 @@
                     :clj (Object.)
                     :cljs (js/Object.)))
 
+(defn check-namespace-writable!
+  "Refuse adding, removing or reloading names of namespace `ns-sym` when the
+  host marked it read-only: `:sci/built-in` in the metadata of its namespace
+  object (e.g. `(sci/create-ns 'lib {:sci/built-in true})` as the `:obj` of
+  its `:namespaces` / `add-namespace!` map). Unrestricted contexts may."
+  [ctx env ns-sym]
+  (when-not (:unrestricted ctx)
+    (when-let [ns-obj (get-in env [:namespaces ns-sym :obj])]
+      (when (:sci/built-in (meta ns-obj))
+        (throw (ex-info (str "Built-in namespace " ns-sym " is read-only.")
+                        {:type :sci/error :namespace ns-sym})))))
+  nil)
+
 (defn namespace-object
   "Fetches namespaces from env if it exists. Else, if `create?`,
   produces one regardless of the existince of the namespace in env and

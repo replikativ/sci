@@ -177,7 +177,9 @@
           (reset! env* (handle-require-libspec-env ctx env cnn nil lib {:as as-alias}))
           (let [{:keys [:reload :reload-all]} opts
                 namespaces (get env :namespaces)
-                reload* (or reload reload-all (:reload-all ctx))]
+                reload* (or reload reload-all (:reload-all ctx))
+                _ (when (and reload* (get namespaces lib))
+                    (utils/check-namespace-writable! ctx env lib))]
             (if-let [the-loaded-ns (when-not reload* (get namespaces lib))]
               (let [loading (:loading ctx)]
                 (if (and loading

@@ -609,6 +609,7 @@
 (defn sci-ns-unmap [sci-ns sym]
   (let [ctx (store/get-ctx)]
     (assert (symbol? sym)) ; protects :aliases, :imports, :obj, etc.
+    (sci.impl.utils/check-namespace-writable! ctx @(:env ctx) (sci-ns-name* ctx sci-ns))
     (swap! (:env ctx)
            (fn [env]
              (let [name (sci-ns-name* ctx sci-ns)]
@@ -646,6 +647,7 @@
 (defn sci-remove-ns [sym]
   (let [ctx (store/get-ctx)
         env (:env ctx)]
+    (sci.impl.utils/check-namespace-writable! ctx @env sym)
     (swap! env update :namespaces dissoc sym)
     nil))
 
@@ -669,7 +671,8 @@
      (register-interned-var!
       ctx
       (or (get-in @env [:namespaces ns-name var-sym])
-          (let [new-var (sci.impl.utils/new-var var-sym nil (assoc (meta var-sym) :ns ns))]
+          (let [_ (sci.impl.utils/check-namespace-writable! ctx @env ns-name)
+                new-var (sci.impl.utils/new-var var-sym nil (assoc (meta var-sym) :ns ns))]
             (sci.impl.vars/unbind new-var)
             (swap! env assoc-in [:namespaces ns-name var-sym] new-var)
             new-var)))))
@@ -683,7 +686,8 @@
       (or (when-let [v (get-in @env [:namespaces ns-name var-sym])]
             (sci.impl.vars/bindRoot v val)
             v)
-          (let [new-var (sci.impl.utils/new-var var-sym val (assoc (meta var-sym) :ns ns))]
+          (let [_ (sci.impl.utils/check-namespace-writable! ctx @env ns-name)
+                new-var (sci.impl.utils/new-var var-sym val (assoc (meta var-sym) :ns ns))]
             ;; Slots first: the mapping makes the Var reachable.
             (register-interned-var! ctx new-var)
             (swap! env assoc-in [:namespaces ns-name var-sym] new-var)
@@ -976,6 +980,7 @@
                       (:sci.impl/js-prototype data) fields
                       (boolean (:sci.impl/record data))))
              :default nil)
+        _ (utils/check-namespace-writable! ctx @env cnn)
         t (if existing existing (sci.lang/->Type data))]
     ;; One publication: the type's data and its namespace mapping.
     (world/publishing
