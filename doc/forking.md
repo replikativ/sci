@@ -60,8 +60,12 @@ This shape combines four useful precedents:
   (no user code runs inside that section), and may also be called from
   inside an evaluation of the same world. The child gets a cut between
   individual publications: `(do (def a 1) (def b 2))` can fork as "a only",
-  but a single def, namespace, type or method publication is never torn,
-  and every handle reachable in the child has its own slots. A delay or lazy
+  but a single def, namespace, type data or method publication is never
+  torn, and every handle reachable in the child has its own slots. A
+  `deftype`/`defrecord` is several publications (its type data, its factory
+  Vars, each built-in method), so a fork while one is being evaluated can
+  see the type defined with its factory still unbound or some of its
+  methods not yet installed. A delay or lazy
   sequence still being realized forks as pending. A JVM Future held in the
   world forks by its state when the copy reads it: a trusted Future
   (exactly `FutureTask` or `CompletableFuture`, or one from
@@ -136,7 +140,27 @@ closures, including mutable SCI deftype instances. Arbitrary mutable host
 values hidden in a host closure or container are not reflectively discovered;
 wrap them in a `Forkable` handle before capture. On CLJS, an instance visible
 only through an opaque closure also retains its creation native-protocol
-prototype, although its managed mutable fields remain fork-local.
+prototype, although its managed mutable fields remain fork-local. Its native
+protocol methods (and those of `assoc`/`merge` copies of a record) are
+therefore those of the world that constructed it, even in a world that
+overrides them; a fork re-points instances held directly in world cells to
+the child's prototype. The retirement rule still applies to what runs: a
+method made in a retired world runs in an open related world, as any
+interpreted fn does, and is refused on host calls once the type's home is
+retired.
+
+Keys shared across worlds (host maps, persistent maps held in several
+worlds) need equality and hashes that stay the same in those worlds,
+including any state their `hashCode`/`equals` read: a map keeps the hash it
+computed at insertion, so a child that changes a Var a key's `hashCode` reads
+no longer finds the entry.
+
+An embedding that replaces a world by a promoted fork (staged replacement)
+routes its host operations on inherited Vars and SCI type instances through
+`sci/call-with-context` with the context it currently selects, switches that
+selection to the promoted fork, then retires the old world. Host calls that
+bypass the selected context follow the type's or Var's home and are refused
+once it is retired.
 
 ## Current boundary
 

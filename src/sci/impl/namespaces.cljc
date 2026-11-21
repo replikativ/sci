@@ -979,64 +979,75 @@
 
 ;;;; Record impl
 
-(defn -create-type [data]
-  (let [ctx (store/get-ctx)
-        env (:env ctx)
-        cnn (sci.impl.utils/current-ns-name)
-        type-name (symbol (let [s (clojure.core/str (:sci.impl/type-name data))
-                                i (str/last-index-of s ".")]
-                            (if i (subs s (inc i)) s)))
-        ;; adopt the Type that analyze-deftype* registered at analysis time:
-        ;; analyzed method bodies and factories reference that object, so
-        ;; creating a fresh one here would make (instance? Foo x) and native
-        ;; protocol installs miss
-        ;; (str t) is the type's name from its host field: no world read
-        existing (let [t (get-in @env [:namespaces cnn :types type-name])]
-                   (when (and (sci.impl.utils/sci-type? t)
-                              (= (clojure.core/str t) (clojure.core/str (:sci.impl/type-name data))))
-                     t))
-        ;; The definition starts from this world's own data (a world without
-        ;; it from a copy of the host field): never from another world's,
-        ;; whose CLJS prototype it would then mutate.
-        fork-fn #?(:cljs sci.impl.deftype/fork-type-data :default nil)
-        data (if existing
-               (dissoc (merge (world/-own-data existing fork-fn) data)
-                       :sci.impl/declared)
-               data)
-        ;; on CLJS every sci deftype and defrecord gets its own JS prototype
-        ;; so that native protocols can be implemented/extended per type (see
-        ;; sci.impl.deftype/-install-native-protocol!)
-        data #?(:cljs (if (:sci.impl/js-prototype data)
-                        data
-                        (assoc data :sci.impl/js-prototype
-                               (sci.impl.deftype/new-js-prototype
-                                (if (:sci.impl/record data)
-                                  sci.impl.records/SciRecord
-                                  sci.impl.deftype/SciType))))
-                :default data)
-        ;; fields become JS accessors on the prototype so host-style
-        ;; interop ((.-field x), set!) matches compiled CLJS semantics
-        _ #?(:cljs (when-let [fields (:sci.impl/fields data)]
-                     (sci.impl.deftype/-install-field-accessors!
-                      (:sci.impl/js-prototype data) fields
-                      (boolean (:sci.impl/record data))))
-             :default nil)
-        _ (utils/check-namespace-writable! ctx @env cnn)
-        t (if existing existing (sci.lang/->Type data nil))]
-    ;; One publication: the type's data and its namespace mapping.
-    ;; The type's slot is written before the mapping publishes it. The env
-    ;; swap is outside any section: env watches are user code. The
-    ;; evaluating world defines the type: register-type! makes it the home
-    ;; (the first one) and gives forks the clone fn; setVal then writes
-    ;; this world's data (and a primary's host field).
-    (world/register-type! t data fork-fn)
-    (when existing (types/setVal existing data))
-    (swap! env (fn [env]
-                 (-> env
-                     (update-in [:namespaces cnn :types] assoc type-name t)
-                     ;; Remove any var that might have been created by (declare)
-                     (update-in [:namespaces cnn] dissoc type-name))))
-    t))
+(defn -create-type
+  "Define a SCI type in the current world. `t` is the exact Type analysis
+   created (instances, factories and methods reference it) and `ns-sym` its
+   namespace; without them (older expansions) it is looked up by name in the
+   current namespace."
+  ([data] (-create-type data nil nil))
+  ([data t ns-sym]
+   (let [ctx (store/get-ctx)
+         env (:env ctx)
+         cnn (or ns-sym (sci.impl.utils/current-ns-name))
+         type-name (symbol (let [s (clojure.core/str (:sci.impl/type-name data))
+                                 i (str/last-index-of s ".")]
+                             (if i (subs s (inc i)) s)))
+         ;; (str t) is the type's name from its host field: no world read
+         existing (if (sci.impl.utils/sci-type? t)
+                    t
+                    (let [t (get-in @env [:namespaces cnn :types type-name])]
+                      (when (and (sci.impl.utils/sci-type? t)
+                                 (= (clojure.core/str t) (clojure.core/str (:sci.impl/type-name data))))
+                        t)))
+         ;; The definition starts from this world's own data (a world without
+         ;; it from a copy of the host field): never from another world's,
+         ;; whose CLJS prototype it would then mutate.
+         fork-fn #?(:cljs sci.impl.deftype/fork-type-data :default nil)
+         data (if existing
+                (dissoc (merge (world/-own-data existing fork-fn) data)
+                        :sci.impl/declared)
+                data)
+         ;; on CLJS every sci deftype and defrecord gets its own JS prototype
+         ;; so that native protocols can be implemented/extended per type (see
+         ;; sci.impl.deftype/-install-native-protocol!). A record extended
+         ;; before its definition got a deftype prototype: rebase it.
+         data #?(:cljs (let [base (if (:sci.impl/record data)
+                                    sci.impl.records/SciRecord
+                                    sci.impl.deftype/SciType)
+                             proto (:sci.impl/js-prototype data)]
+                         (cond
+                           (nil? proto)
+                           (assoc data :sci.impl/js-prototype
+                                  (sci.impl.deftype/new-js-prototype base))
+                           (identical? (js/Object.getPrototypeOf proto) (.-prototype base))
+                           data
+                           :else
+                           (let [rebased (sci.impl.deftype/new-js-prototype base)]
+                             (js/Object.defineProperties
+                              rebased (js/Object.getOwnPropertyDescriptors proto))
+                             (assoc data :sci.impl/js-prototype rebased))))
+                 :default data)
+         ;; fields become JS accessors on the prototype so host-style
+         ;; interop ((.-field x), set!) matches compiled CLJS semantics
+         _ #?(:cljs (when-let [fields (:sci.impl/fields data)]
+                      (sci.impl.deftype/-install-field-accessors!
+                       (:sci.impl/js-prototype data) fields
+                       (boolean (:sci.impl/record data))))
+              :default nil)
+         _ (utils/check-namespace-writable! ctx @env cnn)
+         t (if existing existing (sci.lang/new-type data))]
+     ;; The type's slot is written before the mapping publishes it. The env
+     ;; swap is outside any section: env watches are user code. Only this
+     ;; successful definition elects the home (the first definer wins).
+     (world/register-type! t data fork-fn false)
+     (when existing (types/setVal existing data))
+     (world/elect-type-home! t)
+     (swap! env (fn [env]
+                  (-> env
+                      (update-in [:namespaces cnn :types] assoc type-name t)
+                      ;; Remove any var that might have been created by (declare)
+                      (update-in [:namespaces cnn] dissoc type-name))))
+     t)))
 
 (def sci-impl-records
   {:obj (sci.lang/->Namespace 'sci.impl.records nil)

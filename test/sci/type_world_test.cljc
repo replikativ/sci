@@ -137,3 +137,46 @@
        (is (re-find #"retired SCI world" (pr-str d)))
        (is (= "#user.Q{:a 1}" (pr-str r)))
        (is (re-find #"retired SCI world" (pr-str {:d d}))))))
+
+(deftest a-delayed-deftype-defines-the-type-it-was-analysed-with
+  (testing "redefined with another shape before the delayed definition runs"
+    (let [p (forkable)
+          _ (sci/eval-string* p (str "(defn mk [] " deftype-src " (->D 42))"))
+          _ (sci/eval-string* p "(deftype D [x y])")
+          c (sci/fork p)]
+      (is (= [42 43 "D:42"] (sci/eval-string* c (str "(" use-src " (mk))"))))))
+  (testing "called from another namespace"
+    (let [p (forkable)
+          _ (sci/eval-string* p (str "(ns foo) (defn mk [] " deftype-src " (->D 42)) (ns user)"))
+          c (sci/fork p)]
+      (is (= [42 43 "D:42"]
+             (sci/eval-string* c (str "(ns bar) (" use-src " (foo/mk))"))))
+      (is (sci/eval-string* c "(some? (get (ns-map 'foo) 'D))") "published in its own namespace"))))
+
+(deftest a-declaration-does-not-claim-the-home
+  ;; merge-opts registers the parent's declared type: it must not become the
+  ;; home, so the host uses the child's definition
+  (let [p (forkable)
+        _ (sci/eval-string* p (str "(defn mk [] " deftype-src " (->D 42))"))
+        _ (sci/merge-opts p {})
+        c (sci/fork p)
+        d (sci/eval-string* c "(mk)")]
+    (is (= "D:42" (str d)))))
+
+#?(:cljs
+   (deftest cljs-prototypes-of-declared-types
+     (testing "a fork of a world that holds a foreign instance of a type it only declared"
+       (let [p (forkable)
+             _ (sci/eval-string* p (str "(defn mk [] " deftype-src " (->D 42))"))
+             c (sci/fork p)
+             d (sci/eval-string* c "(mk)")
+             _ ((sci/eval-string* p "(fn [x] (def held x) nil)") d)
+             g (sci/fork p)]
+         (is (= [42 43 "D:42"] (sci/eval-string* g (str "(" use-src " held)"))))))
+     (testing "a record extended before its definition keeps record behaviour"
+       (let [p (forkable)]
+         (is (= [1 true :ext]
+                (sci/eval-string*
+                 p "(defn mk [] (defrecord R [a]) (->R 1))
+                    (extend-type R IDeref (-deref [_] :ext))
+                    (let [r (mk)] [(:a r) (record? r) @r])")))))))

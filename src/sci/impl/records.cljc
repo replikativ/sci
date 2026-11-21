@@ -243,9 +243,13 @@
 
      SciPrintMethod
      (-sci-print-method [this w]
-       (if-let [pm (world/instance-print-method type-meta)]
-         (pm this w)
-         (.write ^java.io.Writer w ^String (clojure-str this))))
+       ;; admitted through rendering; a retired home prints the fields
+       (world/call-with-type-admitted
+        type
+        #(if-let [pm (world/instance-print-method type-meta)]
+           (pm this w)
+           (.write ^java.io.Writer w ^String (clojure-str this)))
+        #(.write ^java.io.Writer w ^String (clojure-str this))))
 
      sci.impl.types/SciTypeInstance
      (-get-type [_]
@@ -417,9 +421,11 @@
 #?(:cljs
    (defn fork-record* [^SciRecord this]
      (let [type (.-type this)
-           proto (if (instance? lang/Type type)
-                   (:sci.impl/js-prototype (types/getVal type))
-                   (js/Object.getPrototypeOf this))
+           ;; the child's own prototype of the type; a world that only has
+           ;; the declaration has none: keep the construction prototype
+           proto (or (when (instance? lang/Type type)
+                       (:sci.impl/js-prototype (types/getVal type)))
+                     (js/Object.getPrototypeOf this))
            obj (js/Object.create proto)]
        (.call SciRecord obj
               (.-rec-name this) type (.-basis-fields this)
@@ -432,7 +438,8 @@
            (SciRecord. rec-name type basis-fields type-meta m 0 0))
    :cljs (defn ->record-impl [rec-name type basis-fields type-meta m]
            (if-let [proto (when (instance? lang/Type type)
-                            (:sci.impl/js-prototype (types/getVal type)))]
+                            ;; the definition (a declaration has no prototype)
+                            (:sci.impl/js-prototype (world/-data-for type)))]
              (let [obj (js/Object.create proto)]
                (.call SciRecord obj rec-name type basis-fields type-meta m nil)
                obj)

@@ -32,8 +32,11 @@ SCI is used in [babashka](https://github.com/babashka/babashka),
     are refused with the retired error, also for a key in a host
     collection; printing (also `sci.pprint`) falls back to the default form
     (`#object[user.D 0x… "retired SCI world"]`, `#user.R{…}`) without
-    calling user code; record `hash`/`=` stay field-based. An instance does
-    not retain the world that constructed it.
+    calling user code, also when the home is retired while printing; record
+    `hash`/`=` stay field-based. An instance does not retain the world that
+    constructed it. A delayed `deftype` (inside a fn) defines exactly the
+    type it was analysed with, in its own namespace, and only a definition
+    (never a declaration, e.g. on `merge-opts`) elects the home, atomically.
   - The `:unrestricted` requirement for built-in multimethods and the
     `:deny` checks on namespace introspection (`ns-publics`, `ns-interns`,
     `ns-refers`, `ns-map`, `find-var`, `intern`, `alias`, `require :as`,

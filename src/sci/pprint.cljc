@@ -11,11 +11,14 @@
 #?(:clj (set! *warn-on-reflection* true))
 
 (defmethod pprint/simple-dispatch sci.impl.records.SciRecord [obj]
-  ;; nil also when the type's home is retired: print the fields
-  (if-let [pm (world/printing-entry (.-type-meta ^sci.impl.records.SciRecord obj)
-                                    :sci.impl/pprint-simple-dispatch)]
-    (pm obj)
-    (pprint/simple-dispatch (into {} obj))))
+  ;; admitted through rendering; a retired home prints the fields
+  (world/call-with-type-admitted
+   (.-type ^sci.impl.records.SciRecord obj)
+   #(if-let [pm (world/printing-entry (.-type-meta ^sci.impl.records.SciRecord obj)
+                                      :sci.impl/pprint-simple-dispatch)]
+      (pm obj)
+      (pprint/simple-dispatch (into {} obj)))
+   #(pprint/simple-dispatch (into {} obj))))
 
 (defmethod pprint/simple-dispatch sci.lang.Var [obj]
   (pr obj))

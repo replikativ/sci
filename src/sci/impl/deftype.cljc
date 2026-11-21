@@ -95,11 +95,11 @@
 (defn clojure-str [v]
   ;; #object[user.Foo 0x743e63ce "user.Foo@743e63ce"]
   (let [n (types/type-impl v)]
-    (if (world/type-usable? n)
-      (str "#object[" n " 0x" (hex-hash v) " \"" (to-string v) "\"]")
-      ;; the type's home is retired: printing never fails and calls no
-      ;; user code
-      (retired-str v))))
+    ;; admitted through rendering; a retired home prints without user code
+    (world/call-with-type-admitted
+     n
+     #(str "#object[" n " 0x" (hex-hash v) " \"" (to-string v) "\"]")
+     #(retired-str v))))
 
 (defprotocol SciPrintMethod
   (-sci-print-method [x w]))
@@ -158,9 +158,12 @@
                (apply types/sci-invoke this args))]
       :clj [SciPrintMethod
             (-sci-print-method [this w]
-                               (if-let [pm (world/instance-print-method type-meta)]
-                                 (pm this w)
-                                 (.write ^java.io.Writer w ^String (clojure-str this))))
+                               (world/call-with-type-admitted
+                                type
+                                #(if-let [pm (world/instance-print-method type-meta)]
+                                   (pm this w)
+                                   (.write ^java.io.Writer w ^String (clojure-str this)))
+                                #(.write ^java.io.Writer w ^String (retired-str this))))
             clojure.lang.IFn
             (invoke [this] (types/type-call types/sci-invoke :clojure.lang/invoke type this))
             (invoke [this a] (types/type-call types/sci-invoke :clojure.lang/invoke type this a))
@@ -248,9 +251,11 @@
 #?(:cljs
    (defn fork-sci-type [^SciType this]
      (let [type (.-type this)
-           proto (if (instance? lang/Type type)
-                   (:sci.impl/js-prototype (types/getVal type))
-                   (js/Object.getPrototypeOf this))
+           ;; the child's own prototype of the type; a world that only has
+           ;; the declaration has none: keep the construction prototype
+           proto (or (when (instance? lang/Type type)
+                       (:sci.impl/js-prototype (types/getVal type)))
+                     (js/Object.getPrototypeOf this))
            obj (js/Object.create proto)]
        (.call SciType obj
               (.-rec-name this) type (.-type-meta this)
@@ -336,10 +341,12 @@
      [impl]
      (fn [_ w opts]
        (this-as self
-         (if (or (not (implements? types/SciTypeInstance self))
-                 (world/type-usable? (types/-get-type self)))
-           (impl self w opts)
-           (-write w (retired-str self)))))))
+         (if (implements? types/SciTypeInstance self)
+           (world/call-with-type-admitted
+            (types/-get-type self)
+            #(impl self w opts)
+            #(-write w (retired-str self)))
+           (impl self w opts))))))
 
 #?(:cljs
    (defn -install-native-protocol-on!
@@ -384,8 +391,10 @@
         registry (:registry desc)
         value-slot (some-> desc :slots first)
         obj #?(:cljs (if-let [proto (when (instance? lang/Type type)
+                                      ;; the definition (a declaration
+                                      ;; has no prototype)
                                       (:sci.impl/js-prototype
-                                       (types/getVal type)))]
+                                       (world/-data-for type)))]
                        (let [obj (js/Object.create proto)]
                          (.call SciType obj rec-name type type-meta m
                                 home registry value-slot)
@@ -417,10 +426,13 @@
   [rec-type record-name factory-fn-sym fields factory-fn-body & [protocol-impls]]
   `(do
      (declare ~factory-fn-sym)
+     ;; the exact Type analysis created (record-name resolves to it) and
+     ;; its namespace, not a lookup by name in the caller's namespace
      (sci.impl.deftype/-create-type
       ~{:sci.impl/type-name (list 'quote rec-type)
         :sci.impl/constructor (list 'var factory-fn-sym)
-        :sci.impl/fields (list 'quote fields)})
+        :sci.impl/fields (list 'quote fields)}
+      ~record-name '~(utils/current-ns-name))
      ~factory-fn-body
      ~@protocol-impls
      ~record-name))
@@ -434,7 +446,8 @@
         :sci.impl/record true
         :sci.impl/constructor (list 'var constructor-fn-sym)
         :sci.impl.record/map-constructor (list 'var map-factory-sym)
-        :sci.impl/fields (list 'quote fields)})
+        :sci.impl/fields (list 'quote fields)}
+      ~record-name '~(utils/current-ns-name))
      ~@protocol-impls
      ~record-name))
 
@@ -614,12 +627,11 @@
         ;; at eval time, adding the constructor var and (on CLJS) the JS
         ;; prototype.
         _ (utils/check-namespace-writable! ctx @(:env ctx) (symbol (namespace tagged-name)))
-        _ (let [t (lang/->Type (cond-> {:sci.impl/type-name rec-type}
+        _ (let [t (lang/new-type (cond-> {:sci.impl/type-name rec-type}
                                  ;; also in the host field: a primary's
                                  ;; first fork realizes its slots from it
                                  (world/current-world)
-                                 (assoc :sci.impl/declared true))
-                               nil)]
+                                 (assoc :sci.impl/declared true)))]
             ;; Analysis only declares the type (slot first: the mapping
             ;; makes it reachable, also to a fork). -create-type defines it
             ;; in the evaluating world, which becomes its home.

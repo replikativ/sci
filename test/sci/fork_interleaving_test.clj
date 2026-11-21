@@ -518,6 +518,26 @@
     (is (collected? [wr wt wv]) "the child worlds are collected")
     (is (every? some? [r t v]) "while their instances are kept")))
 
+(deftest printing-racing-the-retirement-of-the-home-does-not-throw
+  ;; The printer is admitted to the type's home before any method runs and
+  ;; holds that admission through rendering.
+  (let [entered (promise)
+        release (promise)
+        p (sci/init {:runtime-mode :forkable
+                     :namespaces {'host {'entered #(deliver entered true)
+                                         'wait #(deref release 5000 :timeout)}}})
+        c (sci/fork p)
+        d (sci/eval-string*
+           c "(deftype D [x] Object (hashCode [_] (host/entered) (host/wait) 7)
+                                    (toString [_] \"d\"))
+              (->D 1)")
+        printed (future (try (pr-str d) (catch Exception e (str "EX " (ex-message e)))))]
+    (is (true? (deref entered 5000 :timeout)))
+    (sci/retire! c)
+    (deliver release true)
+    (is (= "#object[user.D 0x7 \"d\"]" (deref printed 5000 :timeout)))
+    (is (re-find #"retired SCI world" (pr-str d)) "afterwards the default form")))
+
 (deftest a-host-read-racing-retirement-never-sees-a-cleared-array
   (let [p (forkable {})
         c (sci/fork p)

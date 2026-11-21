@@ -25,22 +25,24 @@
 
 (deftype ^{:doc "Representation of a SCI custom type, created e.g. with `(defrecord Foo [])`. The fields of this type are implementation detail and should not be accessed directly."}
     Type [#?(:cljd ^:mutable data :clj ^:volatile-mutable data :cljs ^:volatile-mutable data)
-          ;; the context of the world that registered the type (its home),
-          ;; true when registered in unrelated lineages, nil if never
-          #?(:cljd ^:mutable home :clj ^:volatile-mutable home :cljs ^:volatile-mutable home)]
+          ;; an atom of the context of the world that defined the type (its
+          ;; home), true when defined in unrelated lineages, nil if never
+          home]
   world/IWorldTracked
-  (-world-tracked? [_] (boolean home))
-  (-world-home-ctx [_] (when (map? home) home))
+  (-world-tracked? [_] (boolean @home))
+  (-world-home-ctx [_] (let [h @home] (when (map? h) h)))
   (-mark-world-tracked! [_ home-ctx]
-    (let [current home]
-      (when (and (map? current)
-                 home-ctx
-                 (not (identical? (:sci.impl/lineage current)
-                                  (:sci.impl/lineage home-ctx))))
-        ;; no unambiguous home: reads fall back to the host field
-        (set! home true))
-      (when-not current
-        (set! home (or home-ctx true))))
+    ;; Elected by CAS: the first definer wins; a definition in an unrelated
+    ;; lineage leaves no unambiguous home (reads fall back to the host field).
+    (loop []
+      (let [current @home]
+        (cond
+          (nil? current)
+          (when-not (compare-and-set! home nil (or home-ctx true)) (recur))
+          (and (map? current) home-ctx
+               (not (identical? (:sci.impl/lineage current)
+                                (:sci.impl/lineage home-ctx))))
+          (when-not (compare-and-set! home current true) (recur)))))
     true)
   world/ITypeData
   (-data-for [this]
@@ -573,3 +575,8 @@
                              (do (world/reset-namespace-meta! this m (primary-mirror-meta this))
                                  m)
                              (locking this (set! meta m))))))]))
+
+(defn new-type
+  "A SCI type with type data `data` and no home yet."
+  [data]
+  (->Type data (atom nil)))

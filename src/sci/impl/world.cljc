@@ -811,6 +811,25 @@
                    (catch #?(:cljd Object :clj Exception :cljs :default) e
                      (if (retired-error? e) false (throw e))))))))))
 
+(defn call-with-type-admitted
+  "Printing an instance of SCI type `t`: admit `t`'s home on this thread
+   before any method runs and hold the admission through `(render)`, so a
+   retirement meanwhile cannot make printing throw. When the home is already
+   retired (and the active world has no definition of its own), `(fallback)`
+   prints without user code."
+  [t render fallback]
+  (let [home-ctx (when (and (some? t) (-world-tracked? t)) (-world-home-ctx t))
+        active (when home-ctx (active-world-state))]
+    (if (or (nil? home-ctx)
+            (and active (not (identical? absent (own-definition active t true)))))
+      (render)
+      (let [started (volatile! false)]
+        (try (call-admitted home-ctx #(do (vreset! started true) (render)))
+             (catch #?(:cljd Object :clj Exception :cljs :default) e
+               (if (and (not @started) (retired-error? e))
+                 (fallback)
+                 (throw e))))))))
+
 (defn assert-type-usable!
   "Refuse with the retired error unless `(type-usable? t)`."
   [t]
@@ -1406,14 +1425,25 @@
              (cells-set! cells value-slot data))))))
   handle)
 
+(defn elect-type-home!
+  "After a successful definition of type `handle` in the current world: make
+   that world its home unless one was elected before (a CAS on the Type)."
+  [handle]
+  (when (current-world)
+    (-mark-world-tracked! handle store/*ctx*))
+  handle)
+
 (defn register-type!
+  "Register type `handle` with `data` in the current world (written if the
+   world has no realization). Host-provided (defined) data elects the home;
+   a declaration (`:sci.impl/declared`) never does. `-create-type` passes
+   `elect? false` and elects after its definition is written."
   ([handle data]
    (register-type! handle data nil))
   ([handle data value-fork-fn]
+   (register-type! handle data value-fork-fn true))
+  ([handle data value-fork-fn elect?]
    (when-let [^DenseWorld world (current-world)]
-     ;; The registering world is the type's home: worlds without its data
-     ;; (and host calls) read it there.
-     (-mark-world-tracked! handle store/*ctx*)
      (let [{:keys [value-slot]}
            (allocate-descriptor! world handle :type false value-fork-fn)]
        (ensure-capacity! world (inc value-slot))
@@ -1421,7 +1451,10 @@
          world
          #(let [cells (current-cells world)]
             (when (identical? absent (cells-get cells value-slot))
-              (cells-set! cells value-slot data))))))
+              (cells-set! cells value-slot data)))))
+     ;; worlds without the type's definition (and host calls) read it there
+     (when (and elect? (not (declared? data)))
+       (elect-type-home! handle)))
    handle))
 
 (defn- reset-slot! [^DenseWorld world slot value mirror]
