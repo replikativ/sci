@@ -553,9 +553,11 @@
   (:value-slot (descriptor world handle)))
 
 (defn- present-slot? [^DenseWorld world slot]
-  (and (some? slot)
-       (< slot (cells-length (current-cells world)))
-       (not (identical? absent (cells-get (current-cells world) slot)))))
+  ;; one snapshot: a retirement may replace the array between two reads
+  (let [cells (current-cells world)]
+    (and (some? slot)
+         (< slot (cells-length cells))
+         (not (identical? absent (cells-get cells slot))))))
 
 (defn registered? [world handle]
   (when-let [desc (descriptor world handle)]
@@ -620,32 +622,46 @@
           (if (identical? absent v) fallback v))))
     fallback))
 
+(declare read-through-home)
+
 (defn- var-slot-read
   "Read a Var's value or meta slot in its selected world. When that world
    (a related one: parent, sibling) has no realization of the Var, its home
    world answers: its value while open, the retired error once retired,
-   never the Var's raw root."
+   never the Var's raw root. The presence check runs inside the counted
+   access, on one cells snapshot."
   [handle fallback slot-key]
   (let [ctx (selected-var-ctx handle)
         ^ReadWorld active (:sci.impl/read-world ctx)]
     (if (nil? active)
       fallback
       (let [^DenseWorld world (.-world active)
-            slot (slot-key (descriptor world handle))
-            home (when-not (present-slot? world slot) (-world-home-ctx handle))
-            ^ReadWorld home-read (:sci.impl/read-world home)]
-        (if (and home-read (not (identical? world (.-world home-read))))
-          (let [^DenseWorld home-world (.-world home-read)]
-            (with-world-access
-             home-world
-             #(if (.-primary? home-read)
-                fallback
-                (slot-value home-world slot fallback))))
-          (with-world-access
-           world
-           #(if (.-primary? active)
-              fallback
-              (slot-value world slot fallback))))))))
+            slot (slot-key (descriptor world handle))]
+        (with-world-access
+         world
+         (fn []
+           (let [cells (current-cells world)
+                 v (if (and (some? slot) (< slot (cells-length cells)))
+                     (cells-get cells slot)
+                     absent)]
+             (cond
+               (not (identical? absent v)) (if (.-primary? active) fallback v)
+               :else (read-through-home handle world slot fallback)))))))))
+
+(defn- read-through-home
+  "The selected `world` has no realization of `handle`'s `slot`: read it in
+   the handle's home world if that is another one (refused once retired),
+   else `fallback`."
+  [handle ^DenseWorld world slot fallback]
+  (let [^ReadWorld home-read (:sci.impl/read-world (-world-home-ctx handle))]
+    (if (and home-read (not (identical? world (.-world home-read))))
+      (let [^DenseWorld home-world (.-world home-read)]
+        (with-world-access
+         home-world
+         #(if (.-primary? home-read)
+            fallback
+            (slot-value home-world slot fallback))))
+      fallback)))
 
 (defn var-value
   "Primary contexts retain their direct Var realization. Descendants resolve

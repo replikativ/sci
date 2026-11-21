@@ -361,3 +361,28 @@
     (let [sibling (sci/fork p)]
       (is (re-find #"retired" (str (try (sci/call-with-context sibling #(deref v))
                                         (catch Exception e (ex-message e)))))))))
+
+(deftest a-host-read-racing-retirement-never-sees-a-cleared-array
+  (let [p (forkable {})
+        c (sci/fork p)
+        v (sci/eval-string* c "(def x 123) #'x")
+        cw (:sci.impl/world c)
+        current-cells @#'world/current-cells
+        reader (promise)
+        retired (promise)]
+    (with-redefs [world/current-cells
+                  (fn [w]
+                    (let [cells (current-cells w)]
+                      (when (and (identical? w cw)
+                                 (identical? (Thread/currentThread) @reader)
+                                 (not (realized? retired)))
+                        ;; the reader holds this array: retire c now
+                        (deliver retired (deref (future (sci/retire! c) :retired) 1000 ::waiting)))
+                      cells))]
+      (let [result (deref (future (deliver reader (Thread/currentThread))
+                                  (try @v (catch Exception e (if (re-find #"retired" (str (ex-message e)))
+                                                               :retired
+                                                               (str (class e))))))
+                          5000 ::timeout)]
+        (is (= :retired @retired))
+        (is (contains? #{123 :retired} result) (str result))))))
