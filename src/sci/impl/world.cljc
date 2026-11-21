@@ -745,11 +745,13 @@
   (let [^DenseWorld w (.-world rw)]
     (with-world-access
      w
-     #(let [v (cell-value w (:value-slot (descriptor w handle)))]
-        (cond (identical? absent v) absent
-              (and instance-call? (declared? v)) absent
-              (.-primary? rw) fallback
-              :else v)))))
+     ;; a primary home defined the type and mirrors it in the host field
+     #(if (.-primary? rw)
+        fallback
+        (let [v (cell-value w (:value-slot (descriptor w handle)))]
+          (cond (identical? absent v) absent
+                (and instance-call? (declared? v)) absent
+                :else v))))))
 
 (defn- own-definition
   "The active world's own realization of `handle`, `absent` if it has none
