@@ -151,22 +151,8 @@
                        type-meta
                        ext-map
                        ^:unsynchronized-mutable my_hash
-                       ^:unsynchronized-mutable my_hasheq
-                       ;; the ReadWorld this record was constructed in: calls
-                       ;; from a world without the type's data and host calls
-                       ;; read it there
-                       iworld]
+                       ^:unsynchronized-mutable my_hasheq]
      clojure.lang.IRecord ;; marker interface
-
-     world/IInstanceWorld
-     (-instance-world [_] iworld)
-     (-instance-type [_] type)
-
-     fork/Forkable
-     ;; runs with the child selected: the copy is the child's record
-     (fork-value [_]
-       (SciRecord. rec-name type basis-fields type-meta ext-map 0 0
-                   (world/active-world-state)))
 
      clojure.lang.IHashEq
      (hasheq [_]
@@ -191,8 +177,7 @@
      (meta [_]
        (meta ext-map))
      (withMeta [_ m]
-       (SciRecord. rec-name type basis-fields type-meta (with-meta ext-map m) 0 0
-                   (or (world/active-world-state) iworld)))
+       (SciRecord. rec-name type basis-fields type-meta (with-meta ext-map m) 0 0))
 
      clojure.lang.ILookup
      (valAt [_this k]
@@ -221,13 +206,11 @@
      (iterator [_this]
        (clojure.lang.RT/iter ext-map))
      (assoc [_this k v]
-       (SciRecord. rec-name type basis-fields type-meta (assoc ext-map k v) 0 0
-                   (or (world/active-world-state) iworld)))
+       (SciRecord. rec-name type basis-fields type-meta (assoc ext-map k v) 0 0))
      (without [_this k]
        (if (contains? basis-fields k)
          (dissoc ext-map k)
-         (SciRecord. rec-name type basis-fields type-meta (dissoc ext-map k) 0 0
-                     (or (world/active-world-state) iworld))))
+         (SciRecord. rec-name type basis-fields type-meta (dissoc ext-map k) 0 0)))
 
      java.util.Map
      java.io.Serializable
@@ -260,7 +243,7 @@
 
      SciPrintMethod
      (-sci-print-method [this w]
-       (if-let [pm (world/instance-print-method type-meta this)]
+       (if-let [pm (world/instance-print-method type-meta)]
          (pm this w)
          (.write ^java.io.Writer w ^String (clojure-str this))))
 
@@ -300,14 +283,8 @@
                        type
                        basis-fields
                        type-meta ext-map
-                       ^:mutable my_hash
-                       ;; the ReadWorld this record was constructed in
-                       iworld]
+                       ^:mutable my_hash]
      IRecord ;; marker interface
-
-     world/IInstanceWorld
-     (-instance-world [_] iworld)
-     (-instance-type [_] type)
 
      ICloneable
      (-clone [this]
@@ -396,31 +373,31 @@
        type)
 
      IFn
-     (-invoke [this] (do (world/assert-instance-world! this) (types/sci-invoke this)))
-     (-invoke [this a] (do (world/assert-instance-world! this) (types/sci-invoke this a)))
-     (-invoke [this a b] (do (world/assert-instance-world! this) (types/sci-invoke this a b)))
-     (-invoke [this a b c] (do (world/assert-instance-world! this) (types/sci-invoke this a b c)))
-     (-invoke [this a b c d] (do (world/assert-instance-world! this) (types/sci-invoke this a b c d)))
-     (-invoke [this a b c d e] (do (world/assert-instance-world! this) (types/sci-invoke this a b c d e)))
-     (-invoke [this a b c d e f] (do (world/assert-instance-world! this) (types/sci-invoke this a b c d e f)))
-     (-invoke [this a b c d e f g] (do (world/assert-instance-world! this) (types/sci-invoke this a b c d e f g)))
-     (-invoke [this a b c d e f g h] (do (world/assert-instance-world! this) (types/sci-invoke this a b c d e f g h)))
-     (-invoke [this a b c d e f g h i] (do (world/assert-instance-world! this) (types/sci-invoke this a b c d e f g h i)))
-     (-invoke [this a b c d e f g h i j] (do (world/assert-instance-world! this) (types/sci-invoke this a b c d e f g h i j)))
-     (-invoke [this a b c d e f g h i j k] (do (world/assert-instance-world! this) (types/sci-invoke this a b c d e f g h i j k)))
-     (-invoke [this a b c d e f g h i j k l] (do (world/assert-instance-world! this) (types/sci-invoke this a b c d e f g h i j k l)))
-     (-invoke [this a b c d e f g h i j k l m] (do (world/assert-instance-world! this) (types/sci-invoke this a b c d e f g h i j k l m)))
-     (-invoke [this a b c d e f g h i j k l m n] (do (world/assert-instance-world! this) (types/sci-invoke this a b c d e f g h i j k l m n)))
-     (-invoke [this a b c d e f g h i j k l m n o] (do (world/assert-instance-world! this) (types/sci-invoke this a b c d e f g h i j k l m n o)))
-     (-invoke [this a b c d e f g h i j k l m n o p] (do (world/assert-instance-world! this) (types/sci-invoke this a b c d e f g h i j k l m n o p)))
-     (-invoke [this a b c d e f g h i j k l m n o p q] (do (world/assert-instance-world! this) (types/sci-invoke this a b c d e f g h i j k l m n o p q)))
-     (-invoke [this a b c d e f g h i j k l m n o p q r] (do (world/assert-instance-world! this) (types/sci-invoke this a b c d e f g h i j k l m n o p q r)))
-     (-invoke [this a b c d e f g h i j k l m n o p q r s] (do (world/assert-instance-world! this) (types/sci-invoke this a b c d e f g h i j k l m n o p q r s)))
-     (-invoke [this a b c d e f g h i j k l m n o p q r s t] (do (world/assert-instance-world! this) (types/sci-invoke this a b c d e f g h i j k l m n o p q r s t)))
+     (-invoke [this] (do (world/assert-type-usable! type) (types/sci-invoke this)))
+     (-invoke [this a] (do (world/assert-type-usable! type) (types/sci-invoke this a)))
+     (-invoke [this a b] (do (world/assert-type-usable! type) (types/sci-invoke this a b)))
+     (-invoke [this a b c] (do (world/assert-type-usable! type) (types/sci-invoke this a b c)))
+     (-invoke [this a b c d] (do (world/assert-type-usable! type) (types/sci-invoke this a b c d)))
+     (-invoke [this a b c d e] (do (world/assert-type-usable! type) (types/sci-invoke this a b c d e)))
+     (-invoke [this a b c d e f] (do (world/assert-type-usable! type) (types/sci-invoke this a b c d e f)))
+     (-invoke [this a b c d e f g] (do (world/assert-type-usable! type) (types/sci-invoke this a b c d e f g)))
+     (-invoke [this a b c d e f g h] (do (world/assert-type-usable! type) (types/sci-invoke this a b c d e f g h)))
+     (-invoke [this a b c d e f g h i] (do (world/assert-type-usable! type) (types/sci-invoke this a b c d e f g h i)))
+     (-invoke [this a b c d e f g h i j] (do (world/assert-type-usable! type) (types/sci-invoke this a b c d e f g h i j)))
+     (-invoke [this a b c d e f g h i j k] (do (world/assert-type-usable! type) (types/sci-invoke this a b c d e f g h i j k)))
+     (-invoke [this a b c d e f g h i j k l] (do (world/assert-type-usable! type) (types/sci-invoke this a b c d e f g h i j k l)))
+     (-invoke [this a b c d e f g h i j k l m] (do (world/assert-type-usable! type) (types/sci-invoke this a b c d e f g h i j k l m)))
+     (-invoke [this a b c d e f g h i j k l m n] (do (world/assert-type-usable! type) (types/sci-invoke this a b c d e f g h i j k l m n)))
+     (-invoke [this a b c d e f g h i j k l m n o] (do (world/assert-type-usable! type) (types/sci-invoke this a b c d e f g h i j k l m n o)))
+     (-invoke [this a b c d e f g h i j k l m n o p] (do (world/assert-type-usable! type) (types/sci-invoke this a b c d e f g h i j k l m n o p)))
+     (-invoke [this a b c d e f g h i j k l m n o p q] (do (world/assert-type-usable! type) (types/sci-invoke this a b c d e f g h i j k l m n o p q)))
+     (-invoke [this a b c d e f g h i j k l m n o p q r] (do (world/assert-type-usable! type) (types/sci-invoke this a b c d e f g h i j k l m n o p q r)))
+     (-invoke [this a b c d e f g h i j k l m n o p q r s] (do (world/assert-type-usable! type) (types/sci-invoke this a b c d e f g h i j k l m n o p q r s)))
+     (-invoke [this a b c d e f g h i j k l m n o p q r s t] (do (world/assert-type-usable! type) (types/sci-invoke this a b c d e f g h i j k l m n o p q r s t)))
 
      Object
      (toString [this]
-       (world/assert-instance-world! this)
+       (world/assert-type-usable! type)
        (to-string this))))
 
 #?(:clj
@@ -434,8 +411,7 @@
      [^SciRecord this ext-map my-hash]
      (let [obj (js/Object.create (js/Object.getPrototypeOf this))]
        (.call SciRecord obj (.-rec-name this) (.-type this) (.-basis-fields this)
-              (.-type-meta this) ext-map my-hash
-              (or (world/active-world-state) (.-iworld this)))
+              (.-type-meta this) ext-map my-hash)
        obj)))
 
 #?(:cljs
@@ -447,25 +423,20 @@
            obj (js/Object.create proto)]
        (.call SciRecord obj
               (.-rec-name this) type (.-basis-fields this)
-              (.-type-meta this) (.-ext-map this) (.-my_hash this)
-              ;; runs with the child selected: the copy is the child's
-              (world/active-world-state))
+              (.-type-meta this) (.-ext-map this) (.-my_hash this))
        obj)))
 
 #?(:cljd (defn ->record-impl [rec-name type basis-fields type-meta m]
            (SciRecord. rec-name type basis-fields type-meta m nil))
    :clj  (defn ->record-impl [rec-name type basis-fields type-meta m]
-           (SciRecord. rec-name type basis-fields type-meta m 0 0
-                       (world/active-world-state)))
+           (SciRecord. rec-name type basis-fields type-meta m 0 0))
    :cljs (defn ->record-impl [rec-name type basis-fields type-meta m]
            (if-let [proto (when (instance? lang/Type type)
                             (:sci.impl/js-prototype (types/getVal type)))]
              (let [obj (js/Object.create proto)]
-               (.call SciRecord obj rec-name type basis-fields type-meta m nil
-                      (world/active-world-state))
+               (.call SciRecord obj rec-name type basis-fields type-meta m nil)
                obj)
-             (SciRecord. rec-name type basis-fields type-meta m nil
-                         (world/active-world-state)))))
+             (SciRecord. rec-name type basis-fields type-meta m nil))))
 
 (defn defrecord-macro
   "Macro expansion for defrecord. Emits factory fns directly (like Clojure),

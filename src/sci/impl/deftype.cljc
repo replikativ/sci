@@ -78,20 +78,28 @@
      (defmethod hashCode :default [this]
        (System/identityHashCode this))))
 
+(defn retired-str
+  "The printed form of SCI type instance `v` whose type's home is retired:
+   built from the type's name (host field) and the identity, or a record's
+   fields, without calling user code."
+  [v]
+  (let [n (types/type-impl v)]
+    (if #?(:clj (instance? clojure.lang.IRecord v) :default (record? v))
+      (str "#" n (into {} v))
+      (str "#object[" n " 0x"
+           #?(:cljd "0"
+              :clj (Integer/toHexString (System/identityHashCode v))
+              :cljs (.toString (goog/getUid v) 16))
+           " \"retired SCI world\"]"))))
+
 (defn clojure-str [v]
   ;; #object[user.Foo 0x743e63ce "user.Foo@743e63ce"]
   (let [n (types/type-impl v)]
-    (or (try (world/assert-instance-world! v)
-             (str "#object[" n " 0x" (hex-hash v) " \"" (to-string v) "\"]")
-             (catch #?(:cljd Object :clj Exception :cljs :default) e
-               (when-not (world/retired-error? e) (throw e))))
-        ;; The world that has the type's toString/hashCode is retired:
-        ;; printing never fails and calls no user code.
-        (str "#object[" n " 0x"
-             #?(:cljd "0"
-                :clj (Integer/toHexString (System/identityHashCode v))
-                :cljs (.toString (goog/getUid v) 16))
-             " \"retired SCI world\"]"))))
+    (if (world/type-usable? n)
+      (str "#object[" n " 0x" (hex-hash v) " \"" (to-string v) "\"]")
+      ;; the type's home is retired: printing never fails and calls no
+      ;; user code
+      (retired-str v))))
 
 (defprotocol SciPrintMethod
   (-sci-print-method [x w]))
@@ -104,15 +112,12 @@
      type-meta #?(:cljd ^:mutable ext-map
                   :clj ^:volatile-mutable ext-map
                   :cljs ^:mutable ext-map)
-     home registry value-slot
-     ;; the ReadWorld this instance was constructed in (JVM): calls from a
-     ;; world without the type's data and host calls read it there
-     iworld]
+     home registry value-slot]
   Object
   (toString [this]
     #?(:cljd (to-string this)
        :clj (types/type-call to-string :sci.impl.deftype/toString type this)
-       :cljs (do (world/assert-instance-world! this)
+       :cljs (do (world/assert-type-usable! type)
                  (to-string this))))
   #?@(:cljd []
       :clj [(equals [this other]
@@ -129,18 +134,12 @@
       (set! ext-map (assoc ext-map k v)))
     v)
 
-  world/IInstanceWorld
-  (-instance-world [_] iworld)
-  (-instance-type [_] type)
-
   fork/Forkable
   (fork-value [this]
     #?(:cljs (fork-sci-type this)
-       ;; runs with the child selected: the copy is the child's instance
        :default (if home
                   this
-                  (SciType. rec-name type type-meta ext-map nil nil nil
-                            (world/active-world-state)))))
+                  (SciType. rec-name type type-meta ext-map nil nil nil))))
 
   #?@(:cljd [IFn
              (-invoke [this] (types/sci-invoke this))
@@ -159,7 +158,7 @@
                (apply types/sci-invoke this args))]
       :clj [SciPrintMethod
             (-sci-print-method [this w]
-                               (if-let [pm (world/instance-print-method type-meta this)]
+                               (if-let [pm (world/instance-print-method type-meta)]
                                  (pm this w)
                                  (.write ^java.io.Writer w ^String (clojure-str this))))
             clojure.lang.IFn
@@ -190,47 +189,47 @@
                          (types/sci-pr-writer this w opts))
              IFn
              (-invoke [this]
-                      (do (world/assert-instance-world! this) (types/sci-invoke this)))
+                      (do (world/assert-type-usable! type) (types/sci-invoke this)))
              (-invoke [this a]
-                      (do (world/assert-instance-world! this) (types/sci-invoke this a)))
+                      (do (world/assert-type-usable! type) (types/sci-invoke this a)))
              (-invoke [this a b]
-                      (do (world/assert-instance-world! this) (types/sci-invoke this a b)))
+                      (do (world/assert-type-usable! type) (types/sci-invoke this a b)))
              (-invoke [this a b c]
-                      (do (world/assert-instance-world! this) (types/sci-invoke this a b c)))
+                      (do (world/assert-type-usable! type) (types/sci-invoke this a b c)))
              (-invoke [this a b c d]
-                      (do (world/assert-instance-world! this) (types/sci-invoke this a b c d)))
+                      (do (world/assert-type-usable! type) (types/sci-invoke this a b c d)))
              (-invoke [this a b c d e]
-                      (do (world/assert-instance-world! this) (types/sci-invoke this a b c d e)))
+                      (do (world/assert-type-usable! type) (types/sci-invoke this a b c d e)))
              (-invoke [this a b c d e f]
-                      (do (world/assert-instance-world! this) (types/sci-invoke this a b c d e f)))
+                      (do (world/assert-type-usable! type) (types/sci-invoke this a b c d e f)))
              (-invoke [this a b c d e f g]
-                      (do (world/assert-instance-world! this) (types/sci-invoke this a b c d e f g)))
+                      (do (world/assert-type-usable! type) (types/sci-invoke this a b c d e f g)))
              (-invoke [this a b c d e f g h]
-                      (do (world/assert-instance-world! this) (types/sci-invoke this a b c d e f g h)))
+                      (do (world/assert-type-usable! type) (types/sci-invoke this a b c d e f g h)))
              (-invoke [this a b c d e f g h i]
-                      (do (world/assert-instance-world! this) (types/sci-invoke this a b c d e f g h i)))
+                      (do (world/assert-type-usable! type) (types/sci-invoke this a b c d e f g h i)))
              (-invoke [this a b c d e f g h i j]
-                      (do (world/assert-instance-world! this) (types/sci-invoke this a b c d e f g h i j)))
+                      (do (world/assert-type-usable! type) (types/sci-invoke this a b c d e f g h i j)))
              (-invoke [this a b c d e f g h i j k]
-                      (do (world/assert-instance-world! this) (types/sci-invoke this a b c d e f g h i j k)))
+                      (do (world/assert-type-usable! type) (types/sci-invoke this a b c d e f g h i j k)))
              (-invoke [this a b c d e f g h i j k l]
-                      (do (world/assert-instance-world! this) (types/sci-invoke this a b c d e f g h i j k l)))
+                      (do (world/assert-type-usable! type) (types/sci-invoke this a b c d e f g h i j k l)))
              (-invoke [this a b c d e f g h i j k l m]
-                      (do (world/assert-instance-world! this) (types/sci-invoke this a b c d e f g h i j k l m)))
+                      (do (world/assert-type-usable! type) (types/sci-invoke this a b c d e f g h i j k l m)))
              (-invoke [this a b c d e f g h i j k l m n]
-                      (do (world/assert-instance-world! this) (types/sci-invoke this a b c d e f g h i j k l m n)))
+                      (do (world/assert-type-usable! type) (types/sci-invoke this a b c d e f g h i j k l m n)))
              (-invoke [this a b c d e f g h i j k l m n o]
-                      (do (world/assert-instance-world! this) (types/sci-invoke this a b c d e f g h i j k l m n o)))
+                      (do (world/assert-type-usable! type) (types/sci-invoke this a b c d e f g h i j k l m n o)))
              (-invoke [this a b c d e f g h i j k l m n o p]
-                      (do (world/assert-instance-world! this) (types/sci-invoke this a b c d e f g h i j k l m n o p)))
+                      (do (world/assert-type-usable! type) (types/sci-invoke this a b c d e f g h i j k l m n o p)))
              (-invoke [this a b c d e f g h i j k l m n o p q]
-                      (do (world/assert-instance-world! this) (types/sci-invoke this a b c d e f g h i j k l m n o p q)))
+                      (do (world/assert-type-usable! type) (types/sci-invoke this a b c d e f g h i j k l m n o p q)))
              (-invoke [this a b c d e f g h i j k l m n o p q r]
-                      (do (world/assert-instance-world! this) (types/sci-invoke this a b c d e f g h i j k l m n o p q r)))
+                      (do (world/assert-type-usable! type) (types/sci-invoke this a b c d e f g h i j k l m n o p q r)))
              (-invoke [this a b c d e f g h i j k l m n o p q r s]
-                      (do (world/assert-instance-world! this) (types/sci-invoke this a b c d e f g h i j k l m n o p q r s)))
+                      (do (world/assert-type-usable! type) (types/sci-invoke this a b c d e f g h i j k l m n o p q r s)))
              (-invoke [this a b c d e f g h i j k l m n o p q r s t]
-                      (do (world/assert-instance-world! this) (types/sci-invoke this a b c d e f g h i j k l m n o p q r s t)))])
+                      (do (world/assert-type-usable! type) (types/sci-invoke this a b c d e f g h i j k l m n o p q r s t)))])
 
   types/IBox
   (getVal [_]
@@ -256,9 +255,7 @@
        (.call SciType obj
               (.-rec-name this) type (.-type-meta this)
               (.-ext-map this) (.-home this) (.-registry this)
-              (.-value-slot this)
-              ;; runs with the child selected: the copy is the child's
-              (world/active-world-state))
+              (.-value-slot this))
        obj)))
 
 #?(:cljs
@@ -312,20 +309,37 @@
              proto)))))
 
 #?(:cljs
+   (defn ^:private check-usable! [self]
+     (when (implements? types/SciTypeInstance self)
+       (world/assert-type-usable! (types/-get-type self)))))
+
+#?(:cljs
    (defn ^:private with-js-this
      "Adapts a sci fn to the CLJS protocol slot calling convention: the
   receiver comes in as JS `this` while the first positional argument may be
   null (`o.slot(null, k)` for ^not-native invokes)."
      [arity impl]
      (case arity
-       ;; the instance's world is checked first: a retired one refuses
-       ;; (world/assert-instance-world!), as a JVM type-data read does
-       1 (fn [_] (this-as self (world/assert-instance-world! self) (impl self)))
-       2 (fn [_ a] (this-as self (world/assert-instance-world! self) (impl self a)))
-       3 (fn [_ a b] (this-as self (world/assert-instance-world! self) (impl self a b)))
-       4 (fn [_ a b c] (this-as self (world/assert-instance-world! self) (impl self a b c)))
-       5 (fn [_ a b c d] (this-as self (world/assert-instance-world! self) (impl self a b c d)))
-       (fn [& args] (this-as self (world/assert-instance-world! self) (apply impl self (rest args)))))))
+       ;; the type's home is checked first: a retired one refuses, as a JVM
+       ;; type-data read does
+       1 (fn [_] (this-as self (check-usable! self) (impl self)))
+       2 (fn [_ a] (this-as self (check-usable! self) (impl self a)))
+       3 (fn [_ a b] (this-as self (check-usable! self) (impl self a b)))
+       4 (fn [_ a b c] (this-as self (check-usable! self) (impl self a b c)))
+       5 (fn [_ a b c d] (this-as self (check-usable! self) (impl self a b c d)))
+       (fn [& args] (this-as self (check-usable! self) (apply impl self (rest args)))))))
+
+#?(:cljs
+   (defn ^:private pr-writer-with-fallback
+     "A native -pr-writer that prints the default form, without user code,
+  when the type's home is retired."
+     [impl]
+     (fn [_ w opts]
+       (this-as self
+         (if (or (not (implements? types/SciTypeInstance self))
+                 (world/type-usable? (types/-get-type self)))
+           (impl self w opts)
+           (-write w (retired-str self)))))))
 
 #?(:cljs
    (defn -install-native-protocol-on!
@@ -342,7 +356,9 @@
              (let [setter (or (get (:setters m) arity)
                               (throw (js/Error. (str "Invalid arity " arity " for method " msym
                                                      " of protocol " (:name proto-map)))))]
-               (setter obj (with-js-this arity impl))))))
+               (setter obj (if (and (= '-pr-writer msym) (= 3 arity))
+                             (pr-writer-with-fallback impl)
+                             (with-js-this arity impl)))))))
        nil)))
 
 #?(:cljs
@@ -372,15 +388,12 @@
                                        (types/getVal type)))]
                        (let [obj (js/Object.create proto)]
                          (.call SciType obj rec-name type type-meta m
-                                home registry value-slot
-                                (world/active-world-state))
+                                home registry value-slot)
                          obj)
                        (SciType. rec-name type type-meta m
-                                 home registry value-slot
-                                 (world/active-world-state)))
+                                 home registry value-slot))
                :default (SciType. rec-name type type-meta m
-                                  home registry value-slot
-                                  (world/active-world-state)))]
+                                  home registry value-slot))]
     #?(:clj (if desc
               (world/attach-managed-owner!
                registry (:managed-index desc) obj)

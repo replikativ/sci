@@ -428,12 +428,24 @@
     (is (= "user.D" (str (sci/eval-string* descendant "D")))
         "printing the type needs no world")))
 
-;; A deftype analysed in the parent (inside a fn) and evaluated in a child
-;; is defined in the child only: the parent and the host use the child's
-;; definition for its instances. An instance a fork copies (held in a Var)
-;; is the child's, so it survives the source's retirement. A retired primary
-;; refuses user methods of its instances but still prints them.
-(deftest type-definitions-follow-the-evaluating-and-the-constructing-world
+;; A type's methods come from the world's own definition, else from its home
+;; (the world that evaluated the deftype), as a Var's value does. A deftype
+;; analysed in the parent (inside a fn) and evaluated in a child has the
+;; child as home. Host calls follow the home: once it is retired they are
+;; refused, also on copies a fork made or instances nested in collections,
+;; while code in a world with its own definition keeps working.
+(defn- attempt [h]
+  (try (h)
+       (catch Exception e
+         (if (re-find #"retired" (str (ex-message e)))
+           :retired
+           (str (class e) ": " (ex-message e))))))
+
+(defn- host-use [x y]
+  [(.hashCode ^Object x) (.equals ^Object x y)
+   (.get (doto (java.util.HashMap.) (.put x :v)) y)])
+
+(deftest type-methods-follow-the-defining-world
   (let [p (forkable {})
         _ (sci/eval-string*
            p "(defn mk [] (deftype N [x] clojure.lang.IDeref (deref [_] x)
@@ -443,29 +455,68 @@
         c (sci/fork p)
         n (sci/eval-string* c "(def kept (mk)) kept")
         g (sci/fork c)
-        kept-in-g (sci/eval-string* g "kept")
-        attempt (fn [h] (try (h)
-                             (catch Exception e
-                               (if (re-find #"retired" (str (ex-message e)))
-                                 :retired
-                                 (str (class e) ": " (ex-message e))))))
-        host (fn [x y] [(.hashCode ^Object x) (.equals ^Object x y)
-                        (.get (doto (java.util.HashMap.) (.put x :v)) y)])]
+        kept-in-g (sci/eval-string* g "kept")]
     (is (= 5 ((sci/eval-string* p "(fn [x] @x)") n)) "the parent")
-    (is (= [5 true :v] (attempt #(host n (sci/eval-string* c "(mk)")))) "the host")
-    (is (not (identical? n kept-in-g)) "the fork copied the instance")
+    (is (= [5 true :v] (attempt #(host-use n (sci/eval-string* c "(mk)")))) "the host")
     (sci/retire! c)
-    (is (= :retired (attempt #(host n n))) "the host after retire")
-    (is (= [5 true :v] (attempt #(host kept-in-g kept-in-g)))
-        "the child's copy belongs to the child"))
+    (is (= :retired (attempt #(host-use n n))) "the host after the home is retired")
+    (is (= :retired (attempt #(host-use kept-in-g kept-in-g)))
+        "a fork's copy: host calls follow the home")
+    (is (= 5 (sci/eval-string* g "@kept")) "a world with its own definition"))
+  (testing "evaluated in both: the first definer is the home"
+    (let [p (forkable {})
+          _ (sci/eval-string*
+             p "(defn mk [] (deftype N [x] Object (hashCode [_] (int x))) (->N 5))")
+          c (sci/fork p)
+          from-p (sci/eval-string* p "(mk)")
+          from-c (sci/eval-string* c "(mk)")]
+      (sci/retire! c)
+      (is (= [5 5] [(.hashCode ^Object from-p) (.hashCode ^Object from-c)])
+          "the home (the parent) is open")
+      (sci/retire! p)
+      (is (= :retired (attempt #(.hashCode ^Object from-c))))))
+  (testing "a retired primary"
+    (let [p (forkable {})
+          d (sci/eval-string* p "(deftype D [x] Object (hashCode [_] 7) (toString [_] \"d\")) (->D 1)")
+          r (sci/eval-string* p "(defrecord R [a]) (->R 1)")
+          h (hash r)]
+      (sci/retire! p)
+      (is (= :retired (attempt #(.hashCode ^Object d))))
+      (is (re-find #"retired SCI world" (pr-str d)))
+      (is (= ["#user.R{:a 1}" h true] [(pr-str r) (hash r) (= r r)]))
+      (require 'sci.pprint)
+      (is (re-find #"\{:a 1\}" (with-out-str ((requiring-resolve 'clojure.pprint/pprint) r)))
+          "sci.pprint prints a retired record's fields"))))
+
+(deftest instances-nested-in-a-forks-values-follow-the-home
   (let [p (forkable {})
-        d (sci/eval-string* p "(deftype D [x] Object (hashCode [_] 7) (toString [_] \"d\")) (->D 1)")
-        r (sci/eval-string* p "(defrecord R [a]) (->R 1)")
-        h (hash r)]
+        _ (sci/eval-string*
+           p "(defrecord R [a] Object (toString [_] \"R!\"))
+              (deftype T [x] Object (toString [_] \"T!\"))
+              (def nested [(->R 1) (->T 1)]) (def a (atom {:r (->R 1)}))")
+        c (sci/fork p)
+        [[r t] av] (sci/eval-string* c "[nested @a]")]
     (sci/retire! p)
-    (is (re-find #"retired" (str (try (.hashCode ^Object d) (catch Exception e (ex-message e))))))
-    (is (re-find #"retired SCI world" (pr-str d)))
-    (is (= ["#user.R{:a 1}" h true] [(pr-str r) (hash r) (= r r)]))))
+    (is (= ["R!" "T!" "R!"]
+           (sci/eval-string* c "[(str (first nested)) (str (second nested)) (str (:r @a))]"))
+        "the child has its own definitions")
+    (is (= [:retired :retired :retired] [(attempt #(str r)) (attempt #(str t)) (attempt #(str (:r av)))])
+        "host calls follow the retired home")
+    (is (= "#user.R{:a 1}" (pr-str r)) "printing falls back")))
+
+(deftest an-instance-of-a-parents-type-does-not-retain-the-child
+  (let [p (forkable {})
+        _ (sci/eval-string* p "(defrecord R [a]) (deftype T [x])")
+        make (fn [src]
+               ;; (no def in the child: the lineage registry keeps the Vars
+               ;; it defines, and they pin their home)
+               (let [c (sci/fork p)]
+                 [(WeakReference. (:sci.impl/world c)) (sci/eval-string* c src)]))
+        [wr r] (make "(->R 1)")
+        [wt t] (make "(->T 1)")
+        [wv v] (make "[(->R 1) (->T 2)]")]
+    (is (collected? [wr wt wv]) "the child worlds are collected")
+    (is (every? some? [r t v]) "while their instances are kept")))
 
 (deftest a-host-read-racing-retirement-never-sees-a-cleared-array
   (let [p (forkable {})

@@ -382,7 +382,7 @@
   It calls the method stored under nm in the metadata of the SCI type of its first argument, or the :default method if absent."
        [^clojure.lang.MultiFn multifn nm]
        (let [lookup (fn [x]
-                      (or (world/type-method-fn (types/-get-type x) x nm)
+                      (or (world/type-method (types/-get-type x) nm)
                           (.getMethod multifn :default)))]
          (fn
            ([x] ((lookup x) x))
@@ -462,7 +462,9 @@
        (or (get mt dispatch-val) (get mt (.-default ^SciMultiFn multifn))))
      :clj
      (if-let [nm (internal-type-method? multifn dispatch-val)]
-       (or (get (meta dispatch-val) nm)
+       ;; the definition its instances use (also where the type is only
+       ;; declared), so satisfies?/get-method agree with a call
+       (or (world/type-method dispatch-val nm)
            (host-get-method multifn :default))
        (host-get-method
         (if (instance? SciMultiFn multifn)

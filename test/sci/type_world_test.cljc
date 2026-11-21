@@ -1,12 +1,11 @@
 (ns sci.type-world-test
   "Where a SCI type's data lives under forks (babashka/sci#1132 keeps the
    built-in interface methods of deftype/defrecord in it). A call on an
-   instance reads the active world's own data, else the world that
-   constructed the instance, else the world that defined the type. Analysis
-   only declares a type; evaluation defines it. A write from a world without
-   the data copies it first. Once the world that has it is retired, user
-   methods are refused, printing falls back to the default form, and record
-   hash/= stay field-based."
+   instance reads the active world's own definition, else that of the type's
+   home (the world that evaluated the deftype), as for a Var. Analysis only
+   declares a type. A write from a world without the data copies it first.
+   Once the home is retired, user methods are refused, printing falls back
+   to the default form, and record hash/= stay field-based."
   (:require [clojure.test :refer [deftest is testing]]
             [sci.core :as sci]))
 
@@ -87,8 +86,10 @@
         t (sci/eval-string* c "D")
         older-f (sci/eval-string* older "(fn [x] @x)")
         change (sci/eval-string*
-                p #?(:clj "(fn [t] (defmethod clojure.lang/deref t [_] :from-parent) nil)"
-                     :cljs "(fn [t] (extend-type t IDeref (-deref [_] :from-parent)) nil)"))]
+                p #?(:clj "(fn [t] (alter-meta! t assoc :foo 1)
+                                   (defmethod clojure.lang/deref t [_] :from-parent) nil)"
+                     :cljs "(fn [t] (alter-meta! t assoc :foo 1)
+                                    (extend-type t IDeref (-deref [_] :from-parent)) nil)"))]
     (change t)
     (is (= 42 (sci/eval-string* c "@(->D 42)")) "child")
     (is (= 42 (sci/eval-string* c "(deref (first [(->D 42)]))")) "child, new instance")
@@ -124,3 +125,15 @@
     (is (= [42 43 "D:42"] ((sci/eval-string* g use-src) d)))
     #?(:clj (is (nil? (sci/eval-string* g "(:clojure.lang/deref (meta D))"))
                 "g's own data is the declaration"))))
+
+#?(:cljs
+   (deftest a-user-printer-is-not-called-once-the-home-is-retired
+     (let [p (forkable)
+           c (sci/fork p)
+           d (sci/eval-string* c "(deftype P [x] IPrintWithWriter (-pr-writer [_ w _] (-write w \"<P>\"))) (->P 1)")
+           r (sci/eval-string* c "(defrecord Q [a] IPrintWithWriter (-pr-writer [_ w _] (-write w \"<Q>\"))) (->Q 1)")]
+       (is (= ["<P>" "<Q>"] [(pr-str d) (pr-str r)]))
+       (sci/retire! c)
+       (is (re-find #"retired SCI world" (pr-str d)))
+       (is (= "#user.Q{:a 1}" (pr-str r)))
+       (is (re-find #"retired SCI world" (pr-str {:d d}))))))

@@ -145,17 +145,16 @@ state; all logical SCI atom state; SCI-created volatile values and delays; SCI
 type descriptor data; and JVM/CLJS SCI multimethod tables, preferences, and
 dispatch caches are fork-local. On the JVM, the methods a SCI type implements
 for built-in interfaces (`IDeref`, `IFn`, `IAtom`, `Object`, `Inst`, ...) are
-part of its type data and therefore fork-local too. A call on an instance
-uses the data of the world it runs in when that world has its own; code in a
-world without it (a parent or sibling of the defining world) and host calls
-use the world that constructed the instance (a fork's copy of an instance held
-in a world cell is the child's), else the world that defined the type.
-Analysis only declares a type; the world evaluating the `deftype` defines it.
-A change from a world without the data copies it first (on CLJS including the
-JS prototype), so it never alters another world's type. Once the world that
-has the data is retired, user methods are refused with the retired error (an
-instance used as a host map key must not outlive it), printing falls back to
-the default form without calling user code, and record `hash`/`=` stay
+part of its type data and therefore fork-local too. As for a Var, a call on
+an instance uses the type's definition in the world it runs in when that
+world has one; code in a world without it (a parent or sibling of the
+defining world) and host calls use the definition of the type's home, the
+world that evaluated the `deftype` (analysis only declares a type). A change
+from a world without the definition copies it first (on CLJS including the JS
+prototype), so it never alters another world's type. Once the home is
+retired, user methods are refused with the retired error (an instance used as
+a host map key must not outlive its type's home), printing falls back to the
+default form without calling user code, and record `hash`/`=` stay
 field-based. ClojureDart's exact-dispatch SCI multimethod
 tables are fork-local as well. SCI deftypes that declare mutable fields route
 their persistent field map through a managed world slot, so state diverges

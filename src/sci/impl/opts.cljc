@@ -324,7 +324,6 @@
                    :sci.impl/lineage (when world-root (atom nil))
                    :sci.impl/primary? (when world-root true)
                    #?@(:clj [:main-thread-id (.getId (Thread/currentThread))]))]
-    (world/attach-ctx! ctx)
     (register-vars! ctx)
     ctx))
 

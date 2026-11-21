@@ -1249,7 +1249,10 @@
                (apply cljs.core/alter-meta! iref f args))))
 
          (utils/sci-type? iref)
-         (types/setVal iref (apply f (types/getVal iref) args))
+         ;; this world's own data, copied first (with its own JS prototype)
+         ;; when it has none: never another world's
+         (types/setVal iref (apply f (world/-own-data! iref sci.impl.deftype/fork-type-data)
+                                   args))
 
          :else
          (let [m (meta iref)]

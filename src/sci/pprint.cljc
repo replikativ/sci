@@ -5,16 +5,16 @@
   (:require
    [clojure.pprint :as pprint]
    [sci.impl.records]
+   [sci.impl.world :as world]
    [sci.lang]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
 (defmethod pprint/simple-dispatch sci.impl.records.SciRecord [obj]
-  (if-let [rv (.-type-meta ^sci.impl.records.SciRecord obj)]
-    (let [m (meta rv)]
-      (if-let [pm (:sci.impl/pprint-simple-dispatch m)]
-        (pm obj)
-        (pprint/simple-dispatch (into {} obj))))
+  ;; nil also when the type's home is retired: print the fields
+  (if-let [pm (world/printing-entry (.-type-meta ^sci.impl.records.SciRecord obj)
+                                    :sci.impl/pprint-simple-dispatch)]
+    (pm obj)
     (pprint/simple-dispatch (into {} obj))))
 
 (defmethod pprint/simple-dispatch sci.lang.Var [obj]
