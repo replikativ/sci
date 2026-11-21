@@ -841,20 +841,34 @@
 (defn- world-ctx [^ReadWorld rw]
   (when rw @(.-ctx-holder ^DenseWorld (.-world rw))))
 
+(defn host-call-ctx
+  "For a host call (no active world) of a method of instance `x` of type
+   `t`: the context of the world that constructed `x`, in which the method
+   runs, as the host invocation boundary of an interpreted fn does. Nil
+   inside an evaluation, and when `x` was constructed in the type's home,
+   where its methods were made and already run."
+  [t x]
+  (when (nil? (active-world-state))
+    (when-let [^ReadWorld iw (-instance-world x)]
+      (let [home-ctx (-world-home-ctx t)]
+        (when-not (and home-ctx (identical? (.-world iw) (:sci.impl/world home-ctx)))
+          (world-ctx iw))))))
+
 (defn type-method
   "The method stored under `k` in the data of type `t` as seen for instance
-   `x` (`type-data-of`), or nil. A host call (no SCI context) whose data
-   comes from the instance's world or the type's home runs the method in
-   that world's context, as the host invocation boundary of an interpreted
-   fn does."
+   `x` (`type-data-of`), or nil. `types/type-call` runs it in
+   `host-call-ctx`."
   [t x k]
-  (let [iw (-instance-world x)
-        f (get (-data-for t iw) k)]
-    (if (or (nil? f) (nil? iw) (some? (active-world-state)))
-      f
-      (if-let [ctx (world-ctx iw)]
-        (fn [& args] (call-with-context ctx #(apply f args)))
-        f))))
+  (get (-data-for t (-instance-world x)) k))
+
+(defn type-method-fn
+  "`type-method` as a fn that runs in `host-call-ctx` (for the built-in
+   multimethods' :sci.impl/type-method trampoline)."
+  [t x k]
+  (when-let [f (type-method t x k)]
+    (if-let [ctx (host-call-ctx t x)]
+      (fn [& args] (call-with-context ctx #(apply f args)))
+      f)))
 
 (defn type-data
   "A Type's data for a type-level read (no instance): see `type-data-of`."

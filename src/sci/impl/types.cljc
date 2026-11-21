@@ -144,7 +144,9 @@
      `(let [f# (sci.impl.world/type-method ~t ~this ~k)]
         (if (nil? f#)
           ((.getMethod ~(with-meta multifn {:tag 'clojure.lang.MultiFn}) :default) ~this ~@args)
-          (f# ~this ~@args)))))
+          (if-let [ctx# (sci.impl.world/host-call-ctx ~t ~this)]
+            (sci.impl.world/call-with-context ctx# (fn [] (f# ~this ~@args)))
+            (f# ~this ~@args))))))
 
 #?(:clj
    (defn type-method-dispatch

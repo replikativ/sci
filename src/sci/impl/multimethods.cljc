@@ -382,7 +382,7 @@
   It calls the method stored under nm in the metadata of the SCI type of its first argument, or the :default method if absent."
        [^clojure.lang.MultiFn multifn nm]
        (let [lookup (fn [x]
-                      (or (world/type-method (types/-get-type x) x nm)
+                      (or (world/type-method-fn (types/-get-type x) x nm)
                           (.getMethod multifn :default)))]
          (fn
            ([x] ((lookup x) x))
