@@ -410,3 +410,34 @@
                           5000 ::timeout)]
         (is (= :retired @retired))
         (is (contains? #{123 :retired} result) (str result))))))
+
+(deftype FailingOnceOwner [cache failures calls]
+  world/IForkableWorldCache
+  (-fork-world-cache! [_ source target]
+    (when (contains? @cache source) (swap! cache assoc target (get @cache source))))
+  world/IWorldCache
+  (-retire-world-cache! [_ selected]
+    (swap! calls inc)
+    (if (pos? @failures)
+      (do (swap! failures dec) (throw (ex-info "cleanup failed once" {})))
+      (swap! cache dissoc selected))))
+
+(deftest a-failed-final-cleanup-is-retried-by-retire
+  (let [self (atom nil) owner (atom nil)
+        parent (forkable {:namespaces
+                          {'host {'retire! #(sci/retire! @self)
+                                  'register! #(let [w (world/selected-world)
+                                                    o (FailingOnceOwner. (atom {w :cached}) (atom 1) (atom 0))]
+                                                (reset! owner o)
+                                                (world/register-world-cache! o)
+                                                nil)}}})
+        child (sci/fork parent)
+        cw (:sci.impl/world child)]
+    (reset! self child)
+    (try (sci/eval-string* child "(host/retire!) (host/register!) :done")
+         (catch Exception _ nil))
+    (is (= 1 @(.-calls ^FailingOnceOwner @owner)) "the final clear attempted the late owner")
+    (is (contains? @(.-cache ^FailingOnceOwner @owner) cw))
+    (is (nil? (sci/retire! child)))
+    (is (= 2 @(.-calls ^FailingOnceOwner @owner)) "a retried retire! resumes the cleanup")
+    (is (not (contains? @(.-cache ^FailingOnceOwner @owner) cw)))))

@@ -445,7 +445,11 @@
   (when (zero? #?(:clj (.decrementAndGet ^java.util.concurrent.atomic.AtomicLong (.-in-flight world))
                   :default (vswap! (.-in-flight world) dec)))
     (when-not @(.-open? world)
-      (reclaim-if-idle! world))))
+      ;; A failing cache owner keeps its cleanup pending; retire! retries it
+      ;; (and reports the failure). It must not replace this evaluation's
+      ;; own outcome.
+      (try (reclaim-if-idle! world)
+           (catch #?(:clj Throwable :cljs :default :cljd Object) _ nil)))))
 
 (defn- in-flight [^DenseWorld world]
   #?(:clj (.get ^java.util.concurrent.atomic.AtomicLong (.-in-flight world))
@@ -866,9 +870,11 @@
             (swap! r update :retained merge retained)
             (doseq [owner owners]
               (-retire-world-cache! owner world))
-            (swap! r assoc :done? true))))
-      (when (zero? (in-flight world))
-        (reclaim-if-idle! world))))
+            (swap! r assoc :done? true)))))
+    ;; Also on a retry after the scan completed: a final clear may still be
+    ;; pending (a late cache owner whose cleanup failed).
+    (when (zero? (in-flight world))
+      (reclaim-if-idle! world)))
   nil)
 
 (defn- reclaim-if-idle!
@@ -885,9 +891,12 @@
         (fn []
           (when (zero? (in-flight world))
             (vreset! (.-cells-holder world) (new-cells 0))
+            (swap! r assoc :retained {})
+            ;; One at a time: a failure leaves only the owners still pending,
+            ;; for retire! to retry.
             (doseq [owner (:late @r)]
-              (-retire-world-cache! owner world))
-            (swap! r assoc :retained {} :late []))))))
+              (-retire-world-cache! owner world)
+              (swap! r update :late (fn [late] (into [] (remove #(identical? owner %)) late)))))))))
   nil)
 
 (defn- fork-cleanup-failure [error cleanup-error target previous]
