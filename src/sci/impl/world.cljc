@@ -39,7 +39,11 @@
 ;; `in-flight` counts evaluations and host accesses inside the world; a
 ;; retired world is cleared (cells, retained caches) when it drops to zero.
 (deftype DenseWorld [cells-holder registry gate slot-gate publish-gate
-                     persistent? open? retirement in-flight])
+                     persistent? open? retirement in-flight
+                     ;; the context created for this world (init or fork):
+                     ;; host calls of a type method read from this world run
+                     ;; in it; cleared once the retired world is reclaimed
+                     ctx-holder])
 
 (defprotocol IForkableWorldCache
   (-fork-world-cache! [owner source target]
@@ -70,6 +74,38 @@
   (-world-tracked? [handle])
   (-world-home-ctx [handle])
   (-mark-world-tracked! [handle home-ctx]))
+
+(defprotocol ITypeData
+  "A SCI Type's data under forks (`type-data-of`); implemented by
+   `sci.lang.Type`, which owns the host field."
+  (-data-for [t instance-world]
+    "The data of the type as seen by a call on an instance constructed in
+     `instance-world` (a ReadWorld, or nil for a type-level read).")
+  (-own-data [t clone]
+    "The active world's own realization of the data, else `(clone host-field)`:
+     the base of a (re)definition in that world. Writes nothing.")
+  (-own-data! [t clone]
+    "The active world's own realization, first copied (copy-on-write, through
+     `clone`) from the authoritative data when that world has none."))
+
+(defprotocol IInstanceWorld
+  (-instance-world [x]
+    "The ReadWorld a SCI type instance was constructed in (nil if none).")
+  (-instance-type [x]
+    "The SCI type of the instance."))
+
+(extend-protocol IInstanceWorld
+  #?(:clj Object :cljs default :cljd Object)
+  (-instance-world [_] nil)
+  (-instance-type [_] nil))
+
+(defn retired-error?
+  "Whether `e` (or a cause of it) is the refusal of a retired world."
+  [e]
+  (loop [e e]
+    (cond (nil? e) false
+          (= ::retired-world (:type (ex-data e))) true
+          :else (recur (ex-cause e)))))
 
 (defn read-world [world primary?]
   (ReadWorld. world primary?))
@@ -292,7 +328,8 @@
    (volatile! persistent?)
    (volatile! true)
    (atom nil)
-   #?(:clj (java.util.concurrent.atomic.AtomicLong.) :default (volatile! 0))))
+   #?(:clj (java.util.concurrent.atomic.AtomicLong.) :default (volatile! 0))
+   (volatile! nil)))
 
 (defn new-world []
   (dense-world (new-cells 64)
@@ -709,50 +746,151 @@
         (cells-get cells slot)
         absent))))
 
-(defn- type-data-at-home
-  "A Type's data in its home world, inside a counted access of the home: its
-   value while open, the retired error once retired. A primary home keeps
-   its data in the host field (`fallback`)."
-  [handle home-ctx fallback]
-  (if-let [^ReadWorld home-read (:sci.impl/read-world home-ctx)]
-    (let [^DenseWorld home (.-world home-read)]
-      (with-world-access
-       home
-       #(if (.-primary? home-read)
-          fallback
-          (let [v (cell-value home (:value-slot (descriptor home handle)))]
-            (if (identical? absent v) fallback v)))))
-    fallback))
+(defn- type-data-in
+  "A Type's data in `rw`'s world, inside a counted access of that world: its
+   realization while open (`fallback`, the host field, for a primary, which
+   mirrors it there), `absent` when it has none, the retired error once
+   retired."
+  [handle ^ReadWorld rw fallback]
+  (let [^DenseWorld w (.-world rw)]
+    (with-world-access
+     w
+     #(let [v (cell-value w (:value-slot (descriptor w handle)))]
+        (cond (identical? absent v) absent
+              (.-primary? rw) fallback
+              :else v)))))
 
-(defn type-data
-  "A Type's data in the active world. Built-in interface methods of SCI types
-   live in it (`types/type-call`), so it is read on every such call. The
-   active world's realization is read directly (its entry is already
-   counted). A world without one (a parent or an older sibling of the
-   defining world, or no world: a host call) reads the Type's home world, as
-   a Var does: its data while open, the retired error once retired. A Type
-   registered in unrelated lineages has no home and falls back to its host
-   field."
-  [handle fallback]
+(defn type-data-of
+  "A SCI Type's data, which holds the built-in interface methods of its
+   instances (`types/type-call`), as seen by a call on an instance
+   constructed in `instance-world` (nil for a type-level read):
+   1. the active world's own realization (definitions resolve where they
+      are invoked), read directly: its entry is already counted;
+   2. else the instance's world, 3. else the type's home (the world that
+      defined it), each inside a counted access: refused once retired;
+   4. else the host field (`fallback`): a type never defined in a world, or
+      registered in unrelated lineages."
+  [handle instance-world fallback]
   (if-not (-world-tracked? handle)
     fallback
-    (let [home-ctx (-world-home-ctx handle)
-          active (active-world-state)]
-      (if (nil? active)
-        (if home-ctx (type-data-at-home handle home-ctx fallback) fallback)
-        (let [^DenseWorld world (.-world ^ReadWorld active)
-              primary? (.-primary? ^ReadWorld active)]
-          (if (and primary?
-                   (or (nil? home-ctx)
-                       (identical? world (:sci.impl/world home-ctx))))
-            ;; a primary world mirrors its own realization in the host field
-            fallback
-            (let [v (cell-value world (:value-slot (get (:descriptors @(.-registry world)) handle)))]
-              (cond
-                (not (identical? absent v)) (if primary? fallback v)
-                (and home-ctx (not (identical? world (:sci.impl/world home-ctx))))
-                (type-data-at-home handle home-ctx fallback)
-                :else fallback))))))))
+    (let [active (active-world-state)
+          home-ctx (-world-home-ctx handle)
+          ^ReadWorld home (when home-ctx (:sci.impl/read-world home-ctx))
+          aw (when active (.-world ^ReadWorld active))]
+      (if (and active (.-primary? ^ReadWorld active)
+               home (identical? aw (.-world home)))
+        ;; a primary that defined the type mirrors it in the host field
+        fallback
+        (let [v (if active
+                  (let [v (cell-value aw (:value-slot (get (:descriptors @(.-registry ^DenseWorld aw)) handle)))]
+                    (if (and (.-primary? ^ReadWorld active) (not (identical? absent v)))
+                      fallback
+                      v))
+                  absent)
+              iw (when (and (identical? absent v) instance-world
+                            (not (identical? aw (.-world ^ReadWorld instance-world))))
+                   instance-world)
+              v (if iw (type-data-in handle iw fallback) v)
+              v (if (and (identical? absent v) home
+                         (not (identical? aw (.-world home)))
+                         (not (and iw (identical? (.-world ^ReadWorld iw) (.-world home)))))
+                  (type-data-in handle home fallback)
+                  v)]
+          (if (identical? absent v) fallback v))))))
+
+(defn assert-instance-world!
+  "Before a user method of SCI type instance `x` runs where no type data is
+   read first (CLJS native protocol methods, `toString`, printing): refuse
+   it with the retired error when the world that constructed `x` is
+   retired, unless the active world has its own data of `x`'s type."
+  [x]
+  (when-let [^ReadWorld rw (-instance-world x)]
+    (let [^DenseWorld w (.-world rw)]
+      (when-not @(.-open? w)
+        (let [active (active-world-state)
+              own? (when active
+                     (let [^DenseWorld aw (.-world ^ReadWorld active)]
+                       (not (identical?
+                             absent
+                             (cell-value aw (:value-slot (get (:descriptors @(.-registry aw))
+                                                              (-instance-type x))))))))]
+          (when-not own?
+            (assert-accessible! w))))))
+  nil)
+
+(defn attach-ctx!
+  "Record `ctx` as the context of its world (the first one wins: `init` for
+   a primary, `fork` for a child)."
+  [ctx]
+  (when-let [^DenseWorld w (:sci.impl/world ctx)]
+    (when (nil? @(.-ctx-holder w))
+      (vreset! (.-ctx-holder w) ctx)))
+  ctx)
+
+(defn- world-ctx [^ReadWorld rw]
+  (when rw @(.-ctx-holder ^DenseWorld (.-world rw))))
+
+(defn type-method
+  "The method stored under `k` in the data of type `t` as seen for instance
+   `x` (`type-data-of`), or nil. A host call (no SCI context) whose data
+   comes from the instance's world or the type's home runs the method in
+   that world's context, as the host invocation boundary of an interpreted
+   fn does."
+  [t x k]
+  (let [iw (-instance-world x)
+        f (get (-data-for t iw) k)]
+    (if (or (nil? f) (nil? iw) (some? (active-world-state)))
+      f
+      (if-let [ctx (world-ctx iw)]
+        (fn [& args] (call-with-context ctx #(apply f args)))
+        f))))
+
+(defn type-data
+  "A Type's data for a type-level read (no instance): see `type-data-of`."
+  [handle fallback]
+  (type-data-of handle nil fallback))
+
+(defn instance-print-method
+  "The print-method that the type `type-meta` of SCI type instance `x` has,
+   as seen for `x`, or nil. Nil also when the world that has it is retired:
+   the printer then prints the default form and calls no user code."
+  [type-meta x]
+  (when type-meta
+    (try (:sci.impl/print-method
+          (if (satisfies? ITypeData type-meta)
+            (-data-for type-meta (-instance-world x))
+            (meta type-meta)))
+         (catch #?(:cljd Object :clj Exception :cljs :default) e
+           (when-not (retired-error? e) (throw e))))))
+
+(defn own-type-data
+  "The active world's own realization of `handle`'s data, else `(clone
+   fallback)` (`clone` may be nil). Writes nothing."
+  [handle fallback clone]
+  (let [^DenseWorld w (current-world)
+        v (if w (cell-value w (:value-slot (descriptor w handle))) absent)]
+    (if (identical? absent v)
+      (if clone (clone fallback) fallback)
+      v)))
+
+(declare allocate-descriptor! alter-slot!)
+
+(defn own-type-data!
+  "The active world's own realization of `handle`'s data. A world without
+   one first gets a copy of the authoritative data (`(read)`) through
+   `clone` (copy-on-write): a write never mutates another world's data."
+  [handle read clone mirror]
+  (if-let [^DenseWorld w (current-world)]
+    (let [{:keys [value-slot]} (or (descriptor w handle)
+                                   (allocate-descriptor! w handle :type false clone))
+          v (cell-value w value-slot)]
+      (if-not (identical? absent v)
+        v
+        (let [base (read)
+              own (if clone (clone base) base)]
+          ;; keeps a realization written meanwhile
+          (alter-slot! w value-slot own identity [] mirror))))
+    (read)))
 
 (defn var-watches [handle fallback]
   (if-let [^ReadWorld active (:sci.impl/read-world (selected-var-ctx handle))]
@@ -940,6 +1078,7 @@
         (fn []
           (when (zero? (in-flight world))
             (vreset! (.-cells-holder world) (new-cells 0))
+            (vreset! (.-ctx-holder world) nil)
             (swap! r assoc :retained {})
             ;; One at a time: a failure leaves only the owners still pending,
             ;; for retire! to retry.

@@ -444,12 +444,13 @@
             meta
             (fn [f] (store/with-ctx ctx (f)))
             #(deref (:env ctx)))]
-       (assoc ctx
-              :env (atom env)
-              :fork-fn fork-fn
-              :sci.impl/primary? false
-              :sci.impl/world forked-world
-              :sci.impl/read-world (world/read-world forked-world false)))
+       (world/attach-ctx!
+        (assoc ctx
+               :env (atom env)
+               :fork-fn fork-fn
+               :sci.impl/primary? false
+               :sci.impl/world forked-world
+               :sci.impl/read-world (world/read-world forked-world false))))
      ;; Preserve the historical namespace-environment fork for standard
      ;; contexts. Full live-state isolation is opt-in via :runtime-mode.
      (update ctx :env (fn [env] (atom @env))))))

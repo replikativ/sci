@@ -428,6 +428,45 @@
     (is (= "user.D" (str (sci/eval-string* descendant "D")))
         "printing the type needs no world")))
 
+;; A deftype analysed in the parent (inside a fn) and evaluated in a child
+;; is defined in the child only: the parent and the host use the child's
+;; definition for its instances. An instance a fork copies (held in a Var)
+;; is the child's, so it survives the source's retirement. A retired primary
+;; refuses user methods of its instances but still prints them.
+(deftest type-definitions-follow-the-evaluating-and-the-constructing-world
+  (let [p (forkable {})
+        _ (sci/eval-string*
+           p "(defn mk [] (deftype N [x] clojure.lang.IDeref (deref [_] x)
+                                      Object (hashCode [_] (int x))
+                                             (equals [_ o] (= x (.-x o))))
+                          (->N 5))")
+        c (sci/fork p)
+        n (sci/eval-string* c "(def kept (mk)) kept")
+        g (sci/fork c)
+        kept-in-g (sci/eval-string* g "kept")
+        attempt (fn [h] (try (h)
+                             (catch Exception e
+                               (if (re-find #"retired" (str (ex-message e)))
+                                 :retired
+                                 (str (class e) ": " (ex-message e))))))
+        host (fn [x y] [(.hashCode ^Object x) (.equals ^Object x y)
+                        (.get (doto (java.util.HashMap.) (.put x :v)) y)])]
+    (is (= 5 ((sci/eval-string* p "(fn [x] @x)") n)) "the parent")
+    (is (= [5 true :v] (attempt #(host n (sci/eval-string* c "(mk)")))) "the host")
+    (is (not (identical? n kept-in-g)) "the fork copied the instance")
+    (sci/retire! c)
+    (is (= :retired (attempt #(host n n))) "the host after retire")
+    (is (= [5 true :v] (attempt #(host kept-in-g kept-in-g)))
+        "the child's copy belongs to the child"))
+  (let [p (forkable {})
+        d (sci/eval-string* p "(deftype D [x] Object (hashCode [_] 7) (toString [_] \"d\")) (->D 1)")
+        r (sci/eval-string* p "(defrecord R [a]) (->R 1)")
+        h (hash r)]
+    (sci/retire! p)
+    (is (re-find #"retired" (str (try (.hashCode ^Object d) (catch Exception e (ex-message e))))))
+    (is (re-find #"retired SCI world" (pr-str d)))
+    (is (= ["#user.R{:a 1}" h true] [(pr-str r) (hash r) (= r r)]))))
+
 (deftest a-host-read-racing-retirement-never-sees-a-cleared-array
   (let [p (forkable {})
         c (sci/fork p)

@@ -19,11 +19,20 @@ SCI is used in [babashka](https://github.com/babashka/babashka),
     `Object`, `Inst`, ...) are stored in its `Type` metadata, which is
     world-local type data, so a fork's methods diverge from its parent's
     (previously they shared the process-global host multimethod table).
-    A world without the type's data (a parent or older sibling of the world
-    that defined it) and host calls (`str`, `.hashCode`, `.equals`, invoking
-    an instance) read it in the type's home world, as for Vars: they work
-    while that world is open and are refused once it is retired, also for
-    an instance already used as a key in a host collection.
+    A call on an instance uses the type's data of the world it runs in, if
+    that world has one; otherwise (a parent or sibling of the defining world,
+    a host call) that of the world that constructed the instance, else of
+    the world that defined the type. Analysis only declares a type; the
+    world that evaluates the `deftype`/`defrecord` defines it (also one
+    analysed in a parent inside a fn and evaluated in a child). A change
+    from a world without the data (`defmethod`, `alter-meta!`, CLJS
+    `extend-type`) copies it first and never changes another world's type
+    (on CLJS: its JS prototype). Once the world that has the data is
+    retired, user methods (`deref`, invoke, a deftype's
+    `toString`/`hashCode`/`equals`, `inst-ms`) are refused with the retired
+    error, also for a key in a host collection; printing falls back to the
+    default form (`#object[user.D 0x… "retired SCI world"]`, `#user.R{…}`)
+    without calling user code; record `hash`/`=` stay field-based.
   - The `:unrestricted` requirement for built-in multimethods and the
     `:deny` checks on namespace introspection (`ns-publics`, `ns-interns`,
     `ns-refers`, `ns-map`, `find-var`, `intern`, `alias`, `require :as`,

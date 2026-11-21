@@ -145,11 +145,18 @@ state; all logical SCI atom state; SCI-created volatile values and delays; SCI
 type descriptor data; and JVM/CLJS SCI multimethod tables, preferences, and
 dispatch caches are fork-local. On the JVM, the methods a SCI type implements
 for built-in interfaces (`IDeref`, `IFn`, `IAtom`, `Object`, `Inst`, ...) are
-part of its type data and therefore fork-local too. As with Vars, code
-running in a world without that data (the parent or an older sibling of the
-defining world) and host calls on an instance (`str`, `.hashCode`, `.equals`,
-invoking it) read the type's home world; once that world is retired they are
-refused, so an instance used as a host map key must not outlive its world. ClojureDart's exact-dispatch SCI multimethod
+part of its type data and therefore fork-local too. A call on an instance
+uses the data of the world it runs in when that world has its own; code in a
+world without it (a parent or sibling of the defining world) and host calls
+use the world that constructed the instance (a fork's copy of an instance held
+in a world cell is the child's), else the world that defined the type.
+Analysis only declares a type; the world evaluating the `deftype` defines it.
+A change from a world without the data copies it first (on CLJS including the
+JS prototype), so it never alters another world's type. Once the world that
+has the data is retired, user methods are refused with the retired error (an
+instance used as a host map key must not outlive it), printing falls back to
+the default form without calling user code, and record `hash`/`=` stay
+field-based. ClojureDart's exact-dispatch SCI multimethod
 tables are fork-local as well. SCI deftypes that declare mutable fields route
 their persistent field map through a managed world slot, so state diverges
 even when an instance is captured by a closure or nested in a persistent

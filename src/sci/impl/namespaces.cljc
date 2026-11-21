@@ -990,13 +990,17 @@
         ;; analyzed method bodies and factories reference that object, so
         ;; creating a fresh one here would make (instance? Foo x) and native
         ;; protocol installs miss
+        ;; (str t) is the type's name from its host field: no world read
         existing (let [t (get-in @env [:namespaces cnn :types type-name])]
                    (when (and (sci.impl.utils/sci-type? t)
-                              (= (:sci.impl/type-name (types/getVal t))
-                                 (:sci.impl/type-name data)))
+                              (= (clojure.core/str t) (clojure.core/str (:sci.impl/type-name data))))
                      t))
+        ;; The definition starts from this world's own data (a world without
+        ;; it from a copy of the host field): never from another world's,
+        ;; whose CLJS prototype it would then mutate.
+        fork-fn #?(:cljs sci.impl.deftype/fork-type-data :default nil)
         data (if existing
-               (merge (types/getVal existing) data)
+               (merge (world/-own-data existing fork-fn) data)
                data)
         ;; on CLJS every sci deftype and defrecord gets its own JS prototype
         ;; so that native protocols can be implemented/extended per type (see
@@ -1020,10 +1024,12 @@
         t (if existing existing (sci.lang/->Type data nil))]
     ;; One publication: the type's data and its namespace mapping.
     ;; The type's slot is written before the mapping publishes it. The env
-    ;; swap is outside any section: env watches are user code.
+    ;; swap is outside any section: env watches are user code. The
+    ;; evaluating world defines the type: register-type! makes it the home
+    ;; (the first one) and gives forks the clone fn; setVal then writes
+    ;; this world's data (and a primary's host field).
+    (world/register-type! t data fork-fn)
     (when existing (types/setVal existing data))
-    (world/register-type!
-     t data #?(:cljs sci.impl.deftype/fork-type-data :default nil))
     (swap! env (fn [env]
                  (-> env
                      (update-in [:namespaces cnn :types] assoc type-name t)

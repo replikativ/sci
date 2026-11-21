@@ -139,9 +139,9 @@
 
 #?(:clj
    (defmacro type-call
-     "Calls the method stored under k in the metadata of the SCI type t with this and args, or the :default method of multifn if absent."
+     "Calls the method stored under k in the data of the SCI type t, as seen for the instance this (`sci.impl.world/type-data-of`), with this and args, or the :default method of multifn if absent."
      [multifn k t this & args]
-     `(let [f# (get (.meta ~(with-meta t {:tag 'clojure.lang.IMeta})) ~k)]
+     `(let [f# (sci.impl.world/type-method ~t ~this ~k)]
         (if (nil? f#)
           ((.getMethod ~(with-meta multifn {:tag 'clojure.lang.MultiFn}) :default) ~this ~@args)
           (f# ~this ~@args)))))

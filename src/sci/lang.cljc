@@ -42,6 +42,15 @@
       (when-not current
         (set! home (or home-ctx true))))
     true)
+  world/ITypeData
+  (-data-for [this instance-world]
+    (world/type-data-of this instance-world data))
+  (-own-data [this clone]
+    (world/own-type-data this data clone))
+  (-own-data! [this clone]
+    (let [d data]
+      (world/own-type-data! this #(world/type-data this d) clone
+                            (primary-mirror-root this))))
   IWorldMirror
   (-mirror-root! [_ v] (set! data v))
   (-mirror-meta! [_ m] (set! data m))
