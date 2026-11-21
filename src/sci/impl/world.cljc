@@ -340,7 +340,7 @@
   (when-let [^ReadWorld active (active-world-state)]
     (.-world active)))
 
-(declare assert-accessible!)
+(declare assert-accessible! record-late-cache-owner!)
 
 (defn register-world-cache!
   "Register an identity-based internal owner of fork-local realizations. The
@@ -379,7 +379,11 @@
                            (fn [entry]
                              (when-not (.deref entry)
                                (.delete (:refs index) entry))))))))
-         :cljd nil)))
+         :cljd nil))
+      ;; After registering: a retirement that closed the world earlier may
+      ;; have scanned the owners already; its final clear releases this one.
+      (when-not @(.-open? world)
+        (record-late-cache-owner! world owner)))
   owner)
 
 (defn world-cache-owners
@@ -778,6 +782,18 @@
   (when-let [r @(.-retirement world)]
     (get (:retained @r) owner)))
 
+(defn- retirement-state [^DenseWorld world]
+  (or @(.-retirement world)
+      (do (compare-and-set! (.-retirement world) nil
+                            (atom {:retained {} :late [] :done? false}))
+          @(.-retirement world))))
+
+(defn- record-late-cache-owner!
+  "A cache owner registered into a world after it was closed (by an
+   evaluation still running there): released when the world is cleared."
+  [^DenseWorld world owner]
+  (swap! (retirement-state world) update :late (fnil conj []) owner))
+
 (defn retire-world!
   "Retire one interpreter world now. New evaluations and forks are refused;
    evaluations already running in it finish against it. Managed cache owners
@@ -790,10 +806,7 @@
   [^DenseWorld world]
   (assert-not-copying! world :retire)
   (vreset! (.-open? world) false)
-  (let [r (or @(.-retirement world)
-              (do (compare-and-set! (.-retirement world) nil
-                                    (atom {:retained {} :done? false}))
-                  @(.-retirement world)))]
+  (let [r (retirement-state world)]
     (when-not (:done? @r)
       ;; A slot section: a fork whose copy is in progress copies the caches
       ;; before they are released (this waits for that copy only); a fork
@@ -832,7 +845,9 @@
         (fn []
           (when (zero? (in-flight world))
             (vreset! (.-cells-holder world) (new-cells 0))
-            (swap! r assoc :retained {}))))))
+            (doseq [owner (:late @r)]
+              (-retire-world-cache! owner world))
+            (swap! r assoc :retained {} :late []))))))
   nil)
 
 (defn- fork-cleanup-failure [error cleanup-error target previous]

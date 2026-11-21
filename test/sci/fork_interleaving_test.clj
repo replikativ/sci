@@ -331,3 +331,21 @@
     (sci/eval-string* ctx "(def x 1)")
     (is (not= ::timeout (deref redefined 5000 ::no-watch)) (pr-str opts))
     (is (= 2 (sci/eval-string* ctx "x"))))))
+
+(deftest caches-created-after-retirement-by-an-admitted-evaluation-are-cleared
+  (let [captured (atom nil) held (atom nil) self (atom nil)
+        parent (forkable {:namespaces
+                          {'host {'retire! #(sci/retire! @self)
+                                  'make #(let [o (Object.)] (reset! captured (WeakReference. o)) o)
+                                  'hold #(reset! held %)}}})
+        child (sci/fork parent)]
+    (reset! self child)
+    (is (= :done (sci/eval-string*
+                  child "(def child-var 1)
+                         (host/retire!)
+                         (let [o (host/make)] (host/hold (lazy-seq (list o))))
+                         :done")))
+    (is (zero? (cells-length child)))
+    (is (collected? [@captured]) "the owner's entry for the retired world was released")
+    (is (some? @held))
+    (is (= :parent-live (sci/eval-string* parent ":parent-live")))))
