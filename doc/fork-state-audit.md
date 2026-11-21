@@ -428,7 +428,7 @@ its own slots. The 0.15.60 merge checked these sites:
 | `invoc-size` nil instead of `zero?` per call (`fns/gen-fn`) | Applied to the forkable and the standard generated bodies alike |
 | `try` extent in a `ThreadLocal` cell instead of `*in-try*` | Only decides error wrapping; restored by `finally` on the evaluating thread |
 | Tag class read at analysis (`eval-instance-method-invocation`) | A host class, the same in every world |
-| Built-in interface methods via `types/type-call` | Reads the `Type`'s metadata, its world-local data slot |
+| Built-in interface methods via `types/type-call` | Reads the `Type`'s metadata, its world-local data slot. This read is on every `deref`/`invoke`/`toString`/`hashCode`/`equals` of a SCI type instance, so `world/type-data` reads the active world's cells directly, and `forkable-deref*` does not look up a SCI type instance as a tracked handle (it never is one) |
 | `:env` as an `Env` record (JVM) | Every env update is `assoc`/`update` of its keys, so the record survives; a fork copies the record value inside the copy section |
 
 ## Longer-term definition identity

@@ -698,12 +698,24 @@
       (let [world (.-world ^ReadWorld active)]
         (slot-value world (:value-slot (descriptor world handle)) fallback)))))
 
-(defn type-data [handle fallback]
+(defn type-data
+  "A Type's data in the active world. Built-in interface methods of SCI types
+   live in it (`types/type-call`), so it is read on every such call: the
+   active world's entry is already counted, so no further access section is
+   needed (as in `with-world-access`)."
+  [handle fallback]
   (let [active (active-world-state)]
     (if (or (nil? active) (.-primary? ^ReadWorld active))
       fallback
-      (let [world (.-world ^ReadWorld active)]
-        (slot-value world (:value-slot (descriptor world handle)) fallback)))))
+      (let [^DenseWorld world (.-world ^ReadWorld active)
+            slot (:value-slot (get (:descriptors @(.-registry world)) handle))]
+        (if (nil? slot)
+          fallback
+          (let [cells (current-cells world)]
+            (if (>= slot (cells-length cells))
+              fallback
+              (let [v (cells-get cells slot)]
+                (if (identical? absent v) fallback v)))))))))
 
 (defn var-watches [handle fallback]
   (if-let [^ReadWorld active (:sci.impl/read-world (selected-var-ctx handle))]

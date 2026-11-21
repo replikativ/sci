@@ -76,16 +76,19 @@
         (vars/getRawRoot x)
         (if (refs/sci-atom? x)
         (clojure.core/deref x)
+        ;; A SCI type instance is never a world-tracked handle (its fields
+        ;; are managed slots); its deref method is in its Type's world data.
+        (if (instance? sci.impl.types.SciTypeInstance x)
+         (types/type-call deref :clojure.lang/deref (types/-get-type x) x)
         (if (and (world/primary-world?)
                (instance? clojure.lang.IDeref x))
          (clojure.core/deref x)
          (let [v (tracked-value x)]
            (if-not (identical? untracked-value v)
              v
-             (cond (instance? clojure.lang.IDeref x) (clojure.core/deref x)
-                   (instance? sci.impl.types.SciTypeInstance x)
-                   (types/type-call deref :clojure.lang/deref (types/-get-type x) x)
-                   :else (deref x))))))))
+             (if (instance? clojure.lang.IDeref x)
+               (clojure.core/deref x)
+               (deref x)))))))))
      ([x timeout-ms timeout-val]
       (cond (instance? clojure.lang.IBlockingDeref x)
             (clojure.core/deref x timeout-ms timeout-val)
