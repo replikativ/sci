@@ -530,11 +530,19 @@
 (defn clean-ns [m]
   (dissoc m :aliases :imports :obj :refer :refers :types))
 
+(defn- permitted-xf
+  "Returns a transducer that keeps the ns map entries :allow and :deny in ctx permit.
+  ns-name qualifies each key, or nil for keys written unqualified."
+  [ctx ns-name]
+  (filter (fn [[k v]]
+            (utils/permitted? ctx (if ns-name (symbol (str ns-name) (str k)) k) v))))
+
 (defn sci-ns-interns* [ctx sci-ns]
   (let [name (sci-ns-name* ctx sci-ns)
         m (get-in @(:env ctx) [:namespaces name])
         m (clean-ns m)]
-    m))
+    (cond->> m
+      (:check-permissions ctx) (into {} (permitted-xf ctx name)))))
 
 (defn sci-ns-interns [sci-ns]
   (let [ctx (store/get-ctx)]
@@ -544,10 +552,9 @@
   (let [name (sci-ns-name* ctx sci-ns)
         m (get-in @(:env ctx) [:namespaces name])
         m (clean-ns m)]
-    (into {} (keep (fn [[k v]]
-                     (when-not (:private (meta v))
-                       [k v]))
-                   m))))
+    (into {} (cond-> (remove (fn [[_ v]] (:private (meta v))))
+               (:check-permissions ctx) (comp (permitted-xf ctx name)))
+          m)))
 
 (defn sci-ns-publics [sci-ns]
   (let [ctx (store/get-ctx)]
@@ -586,8 +593,12 @@
 (defn sci-ns-refers* [ctx sci-ns]
   (let [name (sci-ns-name* ctx sci-ns)
         env @(:env ctx)
-        refers (get-in env [:namespaces name :refers])]
-    (merge (core-refers (get-in env [:namespaces 'clojure.core])) refers)))
+        the-ns-map (get-in env [:namespaces name])
+        refers (:refers the-ns-map)
+        excluded (get-in the-ns-map [:refer 'clojure.core :exclude])
+        core (core-refers (get-in env [:namespaces 'clojure.core]))]
+    (cond->> (merge (if (seq excluded) (apply dissoc core excluded) core) refers)
+      (:check-permissions ctx) (into {} (permitted-xf ctx nil)))))
 
 (defn sci-ns-refers [sci-ns]
   (let [ctx (store/get-ctx)]
@@ -615,19 +626,23 @@
              (let [name (sci-ns-name* ctx sci-ns)]
                (update-in env [:namespaces name]
                           (fn [the-ns-map]
-                            (cond (contains? (:refers the-ns-map) sym)
-                                  (-> (update the-ns-map :refers dissoc sym)
-                                      ;; remove lingering var that may have been
-                                      ;; overwritten before, see #637
-                                      (dissoc the-ns-map sym))
-                                  (contains? the-ns-map sym)
-                                  (dissoc the-ns-map sym)
-                                  (or
-                                   (contains? (:imports env) sym)
-                                   (contains? (:imports the-ns-map) sym))
-                                  ;; nil marks the imported class as unmapped
-                                  (update the-ns-map :imports assoc sym nil)
-                                  :else the-ns-map)))))))
+                            (cond-> (cond (contains? (:refers the-ns-map) sym)
+                                          (-> (update the-ns-map :refers dissoc sym)
+                                              ;; remove lingering var that may have been
+                                              ;; overwritten before, see #637
+                                              (dissoc the-ns-map sym))
+                                          (contains? the-ns-map sym)
+                                          (dissoc the-ns-map sym)
+                                          (or
+                                           (contains? (:imports env) sym)
+                                           (contains? (:imports the-ns-map) sym))
+                                          ;; nil marks the imported class as unmapped
+                                          (update the-ns-map :imports assoc sym nil)
+                                          :else the-ns-map)
+                              ;; keeps resolution from falling back to clojure.core
+                              (and (not= 'clojure.core name)
+                                   (contains? (core-refers (get-in env [:namespaces 'clojure.core])) sym))
+                              (update-in [:refer 'clojure.core :exclude] (fnil conj #{}) sym))))))))
   nil)
 
 (defn sci-ns-unalias [sci-ns sym]
@@ -661,6 +676,12 @@
                          (sci.impl.vars/getRawWatches v)))
   v)
 
+(defn- check-intern-permission [ctx ns-name var-sym v]
+  (when (and v
+             (:check-permissions ctx)
+             (not (utils/permitted? ctx (symbol (str ns-name) (str var-sym)) v)))
+    (throw (ex-info (str var-sym " is not allowed!") {:type :sci/error}))))
+
 (defn sci-intern
   ;; in this case the var will become unbound
   ([ns var-sym]
@@ -670,7 +691,9 @@
          env (:env ctx)]
      (register-interned-var!
       ctx
-      (or (get-in @env [:namespaces ns-name var-sym])
+      (or (when-let [v (get-in @env [:namespaces ns-name var-sym])]
+            (check-intern-permission ctx ns-name var-sym v)
+            v)
           (let [_ (sci.impl.utils/check-namespace-writable! ctx @env ns-name)
                 new-var (sci.impl.utils/new-var var-sym nil (assoc (meta var-sym) :ns ns))]
             (sci.impl.vars/unbind new-var)
@@ -684,6 +707,7 @@
      (register-interned-var!
       ctx
       (or (when-let [v (get-in @env [:namespaces ns-name var-sym])]
+            (check-intern-permission ctx ns-name var-sym v)
             (sci.impl.vars/bindRoot v val)
             v)
           (let [_ (sci.impl.utils/check-namespace-writable! ctx @env ns-name)
@@ -780,10 +804,14 @@
 
 (defn sci-find-var [sym]
   (if (qualified-symbol? sym)
-    (let [nsname (-> sym namespace symbol)
+    (let [ctx (store/get-ctx)
+          nsname (-> sym namespace symbol)
           sym' (-> sym name symbol)]
-      (if-let [namespace (-> (store/get-ctx) :env deref :namespaces (get nsname))]
-        (get namespace sym')
+      (if-let [namespace (-> ctx :env deref :namespaces (get nsname))]
+        (let [v (get namespace sym')]
+          (when (or (not (:check-permissions ctx))
+                    (utils/permitted? ctx sym v))
+            v))
         (throw (new #?(:cljd ArgumentError
                        :clj IllegalArgumentException
                        :cljs js/Error)
@@ -936,6 +964,7 @@
       ;; IDeref as protocol instead of class
       'IDeref core-protocols/deref-protocol
       'deref core-protocols/deref
+      'IBlockingDeref core-protocols/blocking-deref-protocol
       ;; IAtom as protocol instead of class
       'IAtom core-protocols/swap-protocol
       'swap core-protocols/swap
@@ -1022,11 +1051,28 @@
    #?@(:cljs ['-install-native-protocol! sci.impl.deftype/-install-native-protocol!])
    'type types/type-impl})
 
+#?(:clj
+   (mm/register-internal-multi-fns!
+    {core-protocols/deref :clojure.lang/deref
+     core-protocols/swap :clojure.lang/swap
+     core-protocols/reset :clojure.lang/reset
+     core-protocols/compareAndSet :clojure.lang/compareAndSet
+     core-protocols/swapVals :clojure.lang/swapVals
+     core-protocols/resetVals :clojure.lang/resetVals
+     core-protocols/inst-ms* :clojure.core/inst-ms*
+     types/sci-invoke :clojure.lang/invoke
+     types/sci-apply-to :clojure.lang/applyTo
+     sci.impl.deftype/to-string :sci.impl.deftype/toString
+     sci.impl.deftype/equals :sci.impl.deftype/equals
+     sci.impl.deftype/hashCode :sci.impl.deftype/hashCode
+     sci.impl.records/to-string :sci.impl.records/toString}))
+
 (def sci-impl-protocols
   {:obj (sci.lang/->Namespace 'sci.impl.protocols nil)
    :private true
    #?@(:cljs ['-extend-native! sci.impl.protocols/-extend-native!])
-   'type->str sci.impl.protocols/type->str})
+   'type->str sci.impl.protocols/type->str
+   '-extend-satisfies! sci.impl.protocols/-extend-satisfies!})
 
 ;;;; REPL vars
 

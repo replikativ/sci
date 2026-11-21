@@ -2,6 +2,10 @@
   (:require
    [clojure.test :as test :refer [deftest is]]
    [sci.core :as sci]
+   #?(:clj [sci.impl.deftype])
+   #?(:clj [sci.impl.core-protocols])
+   #?(:clj [sci.impl.records])
+   #?(:clj [sci.impl.types])
    [sci.test-utils :as tu]))
 
 (defn eval* [expr]
@@ -147,3 +151,131 @@
            (is (= [:animal :not-animal]
                   (sci/eval-string*
                    parent "[(animal-method ::cat) (animal-method ::dog)]"))))))))
+
+#?(:cljd nil
+   :clj
+   (deftest internal-multimethods-test
+     (when-not tu/native?
+       (test/testing "defmethod on clojure.lang/deref for String throws without :unrestricted"
+         (is (thrown-with-msg? Exception #"Access to clojure.lang/deref requires the :unrestricted option"
+                               (eval* "(defmethod clojure.lang/deref String [_] 42)"))))
+       (test/testing "defmethod on clojure.lang/deref for reified objects throws"
+         (is (thrown-with-msg? Exception #"clojure.lang/deref"
+                               (eval* "(defmethod clojure.lang/deref :sci.impl.protocols/reified [_] 42)"))))
+       (test/testing "defmethod on inst-ms* :default throws"
+         (is (thrown-with-msg? Exception #"clojure.core/inst-ms\*"
+                               (eval* "(defmethod inst-ms* :default [_] 42)"))))
+       (test/testing "extend-type String Inst throws"
+         (is (thrown-with-msg? Exception #"clojure.core/inst-ms\*"
+                               (eval* "(extend-type String Inst (inst-ms* [_] 42))"))))
+       (test/testing "remove-all-methods on sci.impl.deftype/toString throws"
+         (is (thrown-with-msg? Exception #"sci.impl.deftype/toString"
+                               (eval* "(remove-all-methods sci.impl.deftype/toString)"))))
+       (test/testing "methods on clojure.lang/deref throws"
+         (is (thrown-with-msg? Exception #"clojure.lang/deref"
+                               (eval* "(methods clojure.lang/deref)"))))
+       (test/testing "deftype with IDeref and toString returns [1 \"t\"]"
+         (is (= [1 "t"] (eval* "(deftype T [x] clojure.lang.IDeref (deref [_] x) Object (toString [_] \"t\")) [@(T. 1) (str (T. 1))]"))))
+       (test/testing "defrecord with Inst returns 3 from inst-ms"
+         (is (= 3 (eval* "(defrecord R [t] Inst (inst-ms* [_] t)) (inst-ms (->R 3))"))))
+       (test/testing "defmethod on clojure.lang/deref for String returns 42 with :unrestricted"
+         (is (= 42 (tu/eval* "(defmethod clojure.lang/deref String [_] 42) (let [r (deref \"x\")] (remove-method clojure.lang/deref String) r)"
+                             {:unrestricted true})))))))
+
+#?(:cljd nil
+   :clj
+   (deftest type-methods-test
+     (when-not tu/native?
+       (test/testing "restricted contexts leave the method tables, dispatch caches and Inst :satisfies of built-in multimethods unchanged"
+         (let [multis [sci.impl.deftype/to-string sci.impl.deftype/equals sci.impl.deftype/hashCode
+                       sci.impl.records/to-string sci.impl.core-protocols/deref sci.impl.core-protocols/inst-ms*
+                       sci.impl.types/sci-invoke sci.impl.types/sci-apply-to]
+               cache-field (doto (.getDeclaredField clojure.lang.MultiFn "methodCache") (.setAccessible true))
+               sizes (fn []
+                       [(mapv (comp count methods) multis)
+                        (mapv #(count (.get cache-field %)) multis)
+                        (count (:satisfies @sci.impl.core-protocols/inst-protocol))])
+               run (fn [i]
+                     (sci/eval-string
+                      (str "(defrecord R" i " [t] Inst (inst-ms* [_] t))
+(defrecord S" i " []) (extend-type S" i " Inst (inst-ms* [_] 1))
+(deftype T [x] clojure.lang.IDeref (deref [_] x) clojure.lang.IFn (invoke [_ a] a)
+  Object (toString [_] \"t\") (hashCode [_] 1) (equals [_ o] true))
+(try (deref (with-meta [] {:type (keyword (str \"k\" " i "))})) (catch Exception _ nil))
+(try (deref (with-meta [] {:type T})) (catch Exception _ nil))
+(try (inst-ms (with-meta {} {:type T})) (catch Exception _ nil))
+[@(T. 1) ((T. 1) 2) (apply (T. 1) [2]) (str (T. 1)) (hash (T. 1)) (= (T. 1) 2)
+ (inst-ms (->R" i " 3)) (inst? (->R" i " 3)) (inst? (->S" i "))]")))
+               _ (run 0)
+               before (sizes)]
+           (is (= [1 2 2 "t" 1 true 3 true true] (run 1)))
+           (dotimes [i 5] (run (+ 2 i)))
+           (is (= before (sizes)))))
+       (test/testing "inst? on user.Shared returns false if another context extended its own user.Shared to Inst"
+         (sci/eval-string "(defrecord Shared []) (extend-type Shared Inst (inst-ms* [_] 1))")
+         (is (false? (sci/eval-string "(defrecord Shared []) (inst? (->Shared))"))))
+       (test/testing "remove-method on a deftype's toString falls back to the default"
+         (is (= [true false]
+                (tu/eval* "(deftype T [] Object (toString [_] \"t\"))
+(let [a (= \"t\" (str (T.)))]
+  (remove-method sci.impl.deftype/toString T)
+  [a (= \"t\" (str (T.)))])" {})))))))
+
+#?(:cljd nil
+   :clj
+   (deftest extend-interface-test
+     (when-not tu/native?
+       (doseq [[iface meth] [["clojure.lang/IDeref" "(deref [_] 1)"]
+                             ["clojure.lang/IAtom" "(reset [_ v] v)"]
+                             ["clojure.lang/IAtom2" "(resetVals [_ v] v)"]
+                             ["clojure.lang/IFn" "(invoke [_] 1)"]]]
+         (test/testing (str "extend-type on " iface " throws")
+           (is (thrown-with-msg? Exception #"is not a protocol"
+                                 (eval* (str "(defrecord R []) (extend-type R " iface " " meth ")"))))))
+       (test/testing "extend on clojure.lang/IDeref throws"
+         (is (thrown-with-msg? Exception #"interface clojure.lang.IDeref is not a protocol"
+                               (eval* "(defrecord R []) (extend R clojure.lang/IDeref {:deref (fn [_] 1)})"))))
+       (test/testing "deftype with IDeref, IFn and IAtom returns [1 2 3]"
+         (is (= [1 2 3] (eval* "(deftype T [] clojure.lang.IDeref (deref [_] 1) clojure.lang.IFn (invoke [_] 2) clojure.lang.IAtom (reset [_ v] v)) [@(T.) ((T.)) (reset! (T.) 3)]")))))))
+
+#?(:cljd nil
+   :clj
+   (deftest built-in-multimethods-in-forked-worlds-test
+     (when-not tu/native?
+       (let [parent (tu/forkable-init nil)
+             _ (sci/eval-string*
+                parent
+                "(deftype T [x] clojure.lang.IDeref (deref [_] x)
+                   Object (toString [_] \"parent\"))")
+             child (sci/fork parent)]
+         (test/testing "a forked world still needs :unrestricted for built-in multimethods"
+           (doseq [expr ["(defmethod clojure.lang/deref String [_] 42)"
+                         "(methods clojure.lang/deref)"
+                         "(prefers clojure.lang/deref)"
+                         "(remove-all-methods sci.impl.deftype/toString)"
+                         "(defmethod inst-ms* :default [_] 42)"]]
+             (is (thrown-with-msg? Exception #"requires the :unrestricted option"
+                                   (sci/eval-string* child expr))
+                 expr)))
+         (test/testing "a type's built-in interface methods are world-local"
+           (is (= [:child "child"]
+                  (sci/eval-string*
+                   child
+                   "(defmethod clojure.lang/deref T [_] :child)
+                    (defmethod sci.impl.deftype/toString T [_] \"child\")
+                    [@(T. 1) (str (T. 1))]")))
+           (is (= [1 "parent"]
+                  (sci/eval-string* parent "[@(T. 1) (str (T. 1))]")))
+           (is (= [false true]
+                  (sci/eval-string*
+                   child
+                   "(remove-method sci.impl.deftype/toString T)
+                    [(= \"child\" (str (T. 1))) (= :child @(T. 1))]")))
+           (is (= "parent" (sci/eval-string* parent "(str (T. 1))"))))
+         (test/testing "an :unrestricted forkable context may change them"
+           (is (= 42 (sci/eval-string*
+                      (sci/fork (tu/forkable-init {:unrestricted true}))
+                      "(defmethod clojure.lang/deref String [_] 42)
+                       (let [r (deref \"x\")]
+                         (remove-method clojure.lang/deref String)
+                         r)"))))))))

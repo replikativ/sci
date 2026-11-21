@@ -112,11 +112,12 @@
      :default x))
 
 (defn analyze-children-tail [ctx children]
-  (let [rt (recur-target ctx)
-        non-tail-ctx (without-recur-target ctx)
-        analyzed-children-non-tail (mapv #(analyze non-tail-ctx %) (butlast children))
-        ret-child (analyze (with-recur-target ctx rt) (last children))]
-    (conj analyzed-children-non-tail ret-child)))
+  (let [non-tail-ctx (without-recur-target ctx)]
+    (loop [children (seq children)
+           analyzed []]
+      (if-let [nxt (next children)]
+        (recur nxt (conj analyzed (analyze non-tail-ctx (first children))))
+        (conj analyzed (analyze ctx (first children)))))))
 
 (defn return-do
   [ctx expr children]
@@ -354,28 +355,41 @@
 
 (declare update-parents)
 
+(defn- bind-params [bindings param-names]
+  (let [param-count (count param-names)]
+    (loop [i 0
+           bindings bindings
+           iden->invoke-idx {}]
+      (if (< i param-count)
+        (let [iden (gensym)
+              param-name (nth param-names i)]
+          (recur (inc i)
+                 (assoc (dissoc bindings param-name) param-name iden)
+                 (assoc iden->invoke-idx iden i)))
+        [bindings iden->invoke-idx]))))
+
 (defn expand-fn-args+body [{:keys [fn-expr] :as ctx} [binding-vector & body-exprs] _macro? fn-name fn-id #?(:cljs async? :default _async?)]
   (when-not binding-vector
     (throw-error-with-location "Parameter declaration missing." fn-expr))
   (when-not (vector? binding-vector)
     (throw-error-with-location "Parameter declaration should be a vector" fn-expr))
-  (let [[fixed-args [_ var-arg-name]] (split-with #(not= '& %) binding-vector)
-        fixed-args (vec fixed-args)
-        fixed-arity (count fixed-args)
+  (let [arg-count (count binding-vector)
+        fixed-arity (loop [i 0]
+                      (if (and (< i arg-count)
+                               (not= '& (nth binding-vector i)))
+                        (recur (inc i))
+                        i))
+        var-arg-name (get binding-vector (inc fixed-arity))
+        fixed-args (subvec binding-vector 0 fixed-arity)
         ;; param-names = all simple symbols, no destructuring
         param-names (cond-> fixed-args
                       var-arg-name (conj var-arg-name))
         ctx (assoc ctx :params param-names)
-        param-count (count param-names)
-        param-idens (repeatedly param-count gensym)
-        param-bindings (zipmap param-names param-idens)
-        iden->invoke-idx (zipmap param-idens (range))
-        bindings (apply dissoc (:bindings ctx) param-names)
-        ctx (assoc ctx :bindings (merge bindings param-bindings))
+        [bindings iden->invoke-idx] (bind-params (:bindings ctx) param-names)
+        ctx (assoc ctx :bindings bindings)
         ctx (assoc ctx :iden->invoke-idx iden->invoke-idx)
         ctx (update ctx :parents conj (or var-arg-name fixed-arity))
-        _ (vswap! (:closure-bindings ctx) assoc-in (conj (:parents ctx) :syms) (zipmap param-idens (range)))
-        self-ref-idx (when fn-name (update-parents ctx (:closure-bindings ctx) fn-id))
+        _ (vswap! (:closure-bindings ctx) assoc-in (conj (:parents ctx) :syms) iden->invoke-idx)
         ;; Transform async bodies before analysis
         body-exprs #?(:cljd body-exprs
                       :clj body-exprs
@@ -386,10 +400,11 @@
         #?@(:cljs [this-as-vol (volatile! false)
                    ctx (assoc ctx :this-as this-as-vol)])
         body (return-do (with-recur-target ctx true) fn-expr body-exprs)
-        iden->invoke-idx (get-in @(:closure-bindings ctx) (conj (:parents ctx) :syms))]
+        iden->invoke-idx (get-in @(:closure-bindings ctx) (conj (:parents ctx) :syms))
+        self-ref-idx (when fn-name (get iden->invoke-idx fn-id))]
     (cond-> (->FnBody binding-vector body fixed-arity var-arg-name self-ref-idx iden->invoke-idx)
       var-arg-name
-      (assoc :vararg-idx (get iden->invoke-idx (last param-idens)))
+      (assoc :vararg-idx (get iden->invoke-idx (get bindings var-arg-name)))
       #?@(:cljs [@this-as-vol (assoc :this-as-idx @this-as-vol)]))))
 
 (defn analyzed-fn-meta [ctx m]
@@ -406,6 +421,7 @@
   (let [fixed-arity (:fixed-arity fn-body)
         copy-enclosed->invocation (:copy-enclosed->invocation fn-body)
         invoc-size (:invoc-size fn-body)
+        invoc-size (when-not (zero? invoc-size) invoc-size)
         body (:body fn-body)
         vararg-idx (:vararg-idx fn-body)
         #?@(:cljs [this-as-idx (:this-as-idx fn-body)])
@@ -553,15 +569,30 @@
                                           (aset 0 binding-idx)
                                           (aset 1 enclosed-idx)))))
                                   closed-over-idens))]
-            [(fn [#?(:cljd bindings :clj ^objects bindings :cljs ^objects bindings)]
-               (areduce binding->enclosed idx ret #?(:cljd (#/(List/filled dynamic) enclosed-array-cnt nil)
-                                                     :default (object-array enclosed-array-cnt))
-                        (let [#?@(:cljd [idxs] :default [^objects idxs]) (aget binding->enclosed idx)
-                              binding-idx (aget idxs 0)
-                              binding-val (aget bindings binding-idx)
-                              enclosed-idx (aget idxs 1)]
-                          (aset #?(:cljd ^List ret :default ret) enclosed-idx binding-val)
-                          ret)))
+            [#?(:clj
+                (let [n (* 2 (alength binding->enclosed))
+                      ^ints idxs (int-array n)
+                      _ (dotimes [i (alength binding->enclosed)]
+                          (let [^objects pair (aget binding->enclosed i)]
+                            (aset idxs (* 2 i) (int (aget pair 0)))
+                            (aset idxs (inc (* 2 i)) (int (aget pair 1)))))]
+                  (fn [^objects bindings]
+                    (let [^objects ret (object-array enclosed-array-cnt)]
+                      (loop [i 0]
+                        (when (< i n)
+                          (aset ret (aget idxs (unchecked-inc-int i)) (aget bindings (aget idxs i)))
+                          (recur (unchecked-add-int i 2))))
+                      ret)))
+                :default
+                (fn [#?(:cljd bindings :cljs ^objects bindings)]
+                  (areduce binding->enclosed idx ret #?(:cljd (#/(List/filled dynamic) enclosed-array-cnt nil)
+                                                        :default (object-array enclosed-array-cnt))
+                           (let [#?@(:cljd [idxs] :default [^objects idxs]) (aget binding->enclosed idx)
+                                 binding-idx (aget idxs 0)
+                                 binding-val (aget bindings binding-idx)
+                                 enclosed-idx (aget idxs 1)]
+                             (aset #?(:cljd ^List ret :default ret) enclosed-idx binding-val)
+                             ret))))
              enclosed-array-cnt
              #?(:cljs (vec (keep (fn [iden]
                                    (when-let [binding-idx (get iden->invoke-idx iden)]
@@ -583,16 +614,32 @@
                              invoc-size (count iden->invocation-idx)
                              copy-enclosed->invocation
                              (when (pos? (alength #?(:cljd ^List enclosed->invocation :default ^objects enclosed->invocation)))
-                               (fn [#?(:cljd enclosed-array :clj ^objects enclosed-array :cljs ^objects enclosed-array)
-                                    #?(:cljd invoc-array :clj ^objects invoc-array :cljs ^objects invoc-array)]
-                                 (areduce #?(:cljd ^List enclosed->invocation :default ^objects enclosed->invocation) idx ret invoc-array
-                                          (let [#?@(:cljd [idxs] :default [^objects idxs])
-                                                (aget #?(:cljd ^List enclosed->invocation :default ^objects enclosed->invocation) idx)
-                                                enclosed-idx (aget idxs 0)
-                                                enclosed-val (aget #?(:cljd ^List enclosed-array :default ^objects enclosed-array) enclosed-idx)
-                                                invoc-idx (aget idxs 1)]
-                                            (aset #?(:cljd ^List ret :default ^objects ret) invoc-idx enclosed-val)
-                                            ret))))
+                               #?(:clj
+                                  (let [pairs ^objects enclosed->invocation
+                                        n (* 2 (alength pairs))
+                                        ^ints idxs (int-array n)
+                                        _ (dotimes [i (alength pairs)]
+                                            (let [^objects pair (aget pairs i)]
+                                              (aset idxs (* 2 i) (int (aget pair 0)))
+                                              (aset idxs (inc (* 2 i)) (int (aget pair 1)))))]
+                                    (fn [^objects enclosed-array ^objects invoc-array]
+                                      (loop [i 0]
+                                        (when (< i n)
+                                          ;; the -int ops measured faster on the JVM than unchecked-inc and unchecked-add
+                                          (aset invoc-array (aget idxs (unchecked-inc-int i)) (aget enclosed-array (aget idxs i)))
+                                          (recur (unchecked-add-int i 2))))
+                                      invoc-array))
+                                  :default
+                                  (fn [#?(:cljd enclosed-array :cljs ^objects enclosed-array)
+                                       #?(:cljd invoc-array :cljs ^objects invoc-array)]
+                                    (areduce #?(:cljd ^List enclosed->invocation :default ^objects enclosed->invocation) idx ret invoc-array
+                                             (let [#?@(:cljd [idxs] :default [^objects idxs])
+                                                   (aget #?(:cljd ^List enclosed->invocation :default ^objects enclosed->invocation) idx)
+                                                   enclosed-idx (aget idxs 0)
+                                                   enclosed-val (aget #?(:cljd ^List enclosed-array :default ^objects enclosed-array) enclosed-idx)
+                                                   invoc-idx (aget idxs 1)]
+                                               (aset #?(:cljd ^List ret :default ^objects ret) invoc-idx enclosed-val)
+                                               ret)))))
                              body (assoc body
                                          :invoc-size invoc-size
                                          :invocation-self-idx invocation-self-idx
@@ -704,13 +751,16 @@
   (let [parents (:parents ctx)
         new-cb (vswap! closure-bindings
                        (fn [cb]
-                         (update-in cb (conj parents :syms)
-                                    (fn [iden->invoke-idx]
-                                      (if (contains? iden->invoke-idx ob)
-                                        iden->invoke-idx
-                                        (assoc iden->invoke-idx ob (count iden->invoke-idx)))))))
-        closure-idx (get-in new-cb (conj parents :syms ob))]
-    closure-idx))
+                         (let [entry (get-in cb parents)
+                               iden->invoke-idx (:syms entry)]
+                           (if (contains? iden->invoke-idx ob)
+                             cb
+                             (assoc-in
+                              cb parents
+                              (assoc entry :syms
+                                     (assoc iden->invoke-idx
+                                            ob (count iden->invoke-idx))))))))]
+    (get (:syms (get-in new-cb parents)) ob)))
 
 (defn analyze-let*
   [ctx expr destructured-let-bindings exprs]
@@ -775,7 +825,7 @@
            (t/eval body ctx bindings)
            stack)
         1 (let [node0 (nth let-nodes 0)
-                idx0 (nth idxs 0)]
+                idx0 (int (nth idxs 0))]
             (sci.impl.types/->Node
              (let [val0 (t/eval node0 ctx bindings)]
                (aset #?(:cljd ^List bindings :default ^objects bindings) idx0 val0)
@@ -783,8 +833,8 @@
              stack))
         2 (let [node0 (nth let-nodes 0)
                 node1 (nth let-nodes 1)
-                idx0 (nth idxs 0)
-                idx1 (nth idxs 1)]
+                idx0 (int (nth idxs 0))
+                idx1 (int (nth idxs 1))]
             (sci.impl.types/->Node
              (let [val0 (t/eval node0 ctx bindings)]
                (aset #?(:cljd ^List bindings :default ^objects bindings) idx0 val0)
@@ -795,9 +845,9 @@
         3 (let [node0 (nth let-nodes 0)
                 node1 (nth let-nodes 1)
                 node2 (nth let-nodes 2)
-                idx0 (nth idxs 0)
-                idx1 (nth idxs 1)
-                idx2 (nth idxs 2)]
+                idx0 (int (nth idxs 0))
+                idx1 (int (nth idxs 1))
+                idx2 (int (nth idxs 2))]
             (sci.impl.types/->Node
              (let [val0 (t/eval node0 ctx bindings)]
                (aset #?(:cljd ^List bindings :default ^objects bindings) idx0 val0)
@@ -811,10 +861,10 @@
                 node1 (nth let-nodes 1)
                 node2 (nth let-nodes 2)
                 node3 (nth let-nodes 3)
-                idx0 (nth idxs 0)
-                idx1 (nth idxs 1)
-                idx2 (nth idxs 2)
-                idx3 (nth idxs 3)]
+                idx0 (int (nth idxs 0))
+                idx1 (int (nth idxs 1))
+                idx2 (int (nth idxs 2))
+                idx3 (int (nth idxs 3))]
             (sci.impl.types/->Node
              (let [val0 (t/eval node0 ctx bindings)]
                (aset #?(:cljd ^List bindings :default ^objects bindings) idx0 val0)
@@ -831,11 +881,11 @@
                 node2 (nth let-nodes 2)
                 node3 (nth let-nodes 3)
                 node4 (nth let-nodes 4)
-                idx0 (nth idxs 0)
-                idx1 (nth idxs 1)
-                idx2 (nth idxs 2)
-                idx3 (nth idxs 3)
-                idx4 (nth idxs 4)]
+                idx0 (int (nth idxs 0))
+                idx1 (int (nth idxs 1))
+                idx2 (int (nth idxs 2))
+                idx3 (int (nth idxs 3))
+                idx4 (int (nth idxs 4))]
             (sci.impl.types/->Node
              (let [val0 (t/eval node0 ctx bindings)]
                (aset #?(:cljd ^List bindings :default ^objects bindings) idx0 val0)
@@ -1132,10 +1182,11 @@
                             (throw-error-with-location (str "Unable to resolve classname: " ex) ex))))
                       catches)
         sci-error (some :sci-error catches)
+        in-try (or sci-error (when (seq catches) true))
         finally (when finally
                   (analyze ctx (cons 'do (rest finally))))
         node (sci.impl.types/->Node
-              (eval/eval-try ctx bindings body catches finally sci-error)
+              (eval/eval-try ctx bindings body catches finally sci-error in-try)
               stack)]
     ;; hybrid try: body and finally compile, catch dispatch stays
     ;; eval-catches (exception path only). The interrupt-fn masking
@@ -1218,11 +1269,12 @@
                       (when-let [t (interop/resolve-type-hint ctx t)]
                         (do (vreset! has-types? true)
                             (aset arg-types idx t)))))))
-       (with-meta (let [cache (volatile! nil)]
+       (with-meta (let [cache (volatile! nil)
+                        tag-class (:tag-class (meta instance-expr))]
                     (sci.impl.types/->Node
                      (eval/eval-instance-method-invocation
                       ctx bindings instance-expr meth-name meth-name* meth-sym field-access args arg-count
-                      (when @has-types? arg-types) cache)
+                      (when @has-types? arg-types) cache tag-class)
                      stack))
          {::instance-expr instance-expr
           ::method-name method-name
@@ -1645,7 +1697,8 @@
 
 (defn return-binding-call
   [ctx expr idx f analyzed-children stack]
-  (let [node (return-call ctx expr f analyzed-children stack
+  (let [idx (int idx)
+        node (return-call ctx expr f analyzed-children stack
                           (fn [_ctx bindings _f]
                             (aget #?(:cljd ^List bindings :default ^objects bindings) idx)))]
     (t/attach-ast node [:call-bind idx analyzed-children stack])))

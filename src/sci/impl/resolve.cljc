@@ -5,8 +5,7 @@
             [sci.impl.interop :as interop]
             [sci.impl.records :as records]
             [sci.impl.types :as t :refer [->Node]]
-            [sci.impl.utils :as utils :refer [strip-core-ns
-                                              ana-macros]]))
+            [sci.impl.utils :as utils :refer [ana-macros]]))
 
 (defn throw-error-with-location [msg node]
   (utils/throw-error-with-location msg node {:phase "analysis"}))
@@ -23,18 +22,8 @@
 (defn check-permission! [ctx sym kv]
   (or (identical? utils/allowed-loop sym)
       (identical? utils/allowed-recur sym)
-      (let [check-sym (strip-core-ns sym)
-            allow (:allow ctx)]
-        (when-not (if allow
-                    (let [[_ v] kv]
-                      (or (and (utils/var? v) (not (:sci/built-in (meta v))))
-                          (contains? allow check-sym)))
-                      true)
-          (throw-error-with-location (str sym " is not allowed!") sym))
-        (let [deny (:deny ctx)]
-          (when (if deny (contains? deny check-sym)
-                    false)
-            (throw-error-with-location (str sym " is not allowed!") sym))))))
+      (when-not (utils/permitted? ctx sym (second kv))
+        (throw-error-with-location (str sym " is not allowed!") sym))))
 
 (defn lookup*
   ([ctx sym call?] (lookup* ctx sym call? false))
@@ -148,16 +137,15 @@
         (when-not only-var?
           (when-let [types (:types the-current-ns)]
             (find types sym-name)))
-        (let [kv (some-> env :namespaces (get 'clojure.core) (find sym-name))]
-          ;; only valid when the symbol isn't excluded
-          (when-not (some-> the-current-ns
-                            :refer
-                            (get 'clojure.core)
-                            :exclude
-                            (contains? sym-name))
-            kv))
-        (when (when call? (get ana-macros sym))
-          [sym sym])
+        ;; only valid when the symbol isn't excluded
+        (when-not (some-> the-current-ns
+                          :refer
+                          (get 'clojure.core)
+                          :exclude
+                          (contains? sym-name))
+          (or (some-> env :namespaces (get 'clojure.core) (find sym-name))
+              (when (when call? (get ana-macros sym))
+                [sym sym])))
         (when-not only-var?
           (or
            (when-let [c (interop/resolve-class ctx sym)]
@@ -181,31 +169,23 @@
   (let [parents (:parents ctx)
         new-cb (vswap! closure-bindings
                        (fn [cb]
-                         (first
-                          (reduce
-                           (fn [[acc path] _idx]
-                             (let [new-acc
-                                   (update-in
-                                    acc path
-                                    (fn [entry]
-                                      (let [iden->invoke-idx (or (:syms entry)
-                                                                 {})
-                                            added-before? (contains? iden->invoke-idx ob)]
-                                        (if added-before?
-                                          entry
-                                          (assoc entry :syms
-                                                 (assoc iden->invoke-idx
-                                                        ob (count iden->invoke-idx)))))))
-                                   new-res [new-acc
-                                            (-> path pop pop)]]
-                               (if (= acc new-acc)
-                                 (reduced new-res)
-                                 new-res)))
-                           [cb
-                            parents]
-                           (range (/ (count parents) 2))))))
-        closure-idx (get-in new-cb (conj parents :syms ob))]
-    closure-idx))
+                         (loop [cb cb
+                                path parents
+                                levels (quot (inc (count parents)) 2)]
+                           (if (zero? levels)
+                             cb
+                             (let [entry (get-in cb path)
+                                   iden->invoke-idx (or (:syms entry) {})]
+                               (if (contains? iden->invoke-idx ob)
+                                 cb
+                                 (recur (assoc-in
+                                         cb path
+                                         (assoc entry :syms
+                                                (assoc iden->invoke-idx
+                                                       ob (count iden->invoke-idx))))
+                                        (-> path pop pop)
+                                        (dec levels))))))))]
+    (get (:syms (get-in new-cb parents)) ob)))
 
 (defn lookup
   ([ctx sym call?] (lookup ctx sym call? nil))
@@ -329,10 +309,11 @@
   ([ctx sym] (resolve-symbol ctx sym false nil))
   ([ctx sym call?] (resolve-symbol ctx sym call? nil))
   ([ctx sym call? m]
-   (second
+   (nth
     (or (resolve-symbol* ctx sym call? m)
         #?(:cljs (let [resolved (resolve-dotted-access ctx sym call? m)]
                    resolved))
         (throw-error-with-location
          (str "Unable to resolve symbol: " sym)
-         sym)))))
+         sym))
+    1)))

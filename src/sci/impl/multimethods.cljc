@@ -5,6 +5,8 @@
    #?(:clj [clojure.string :as str])
    [sci.ctx-store :as store]
    [sci.fork :as fork]
+   #?@(:cljd [] :clj [[sci.impl.io :as sio]
+                      [sci.impl.types :as types]])
    [sci.impl.world :as world]
    ;; no hierarchies on cljd, like the host
    #?@(:cljd [] :default [[sci.impl.hierarchies :refer [global-hierarchy]]])))
@@ -367,6 +369,46 @@
      :cljs (or (instance? SciMultiFn x)
                (instance? cljs.core/MultiFn x))))
 
+#?(:cljd nil
+   :clj
+   (do
+     ;; Built-in multimethods (deref, invoke, toString, ...) are host
+     ;; MultiFns shared by all contexts. A SCI type's method for one of them
+     ;; lives in that Type's metadata, which is world-local type data, so
+     ;; forks keep their own implementations.
+     (def ^:private internal-multi-fns (volatile! {}))
+     (defn- type-method-fn
+       "Returns the :sci.impl/type-method method of multifn.
+  It calls the method stored under nm in the metadata of the SCI type of its first argument, or the :default method if absent."
+       [^clojure.lang.MultiFn multifn nm]
+       (let [lookup (fn [x]
+                      (or (get (meta (types/-get-type x)) nm)
+                          (.getMethod multifn :default)))]
+         (fn
+           ([x] ((lookup x) x))
+           ([x a] ((lookup x) x a))
+           ([x a b] ((lookup x) x a b))
+           ([x a b c] ((lookup x) x a b c))
+           ([x a b c & more] (apply (lookup x) x a b c more)))))
+     (defn register-internal-multi-fns!
+       "Sets the multimethods shared by all contexts and adds their :sci.impl/type-method method.
+  m maps each multimethod to its name."
+       [m]
+       (doseq [[^clojure.lang.MultiFn multifn nm] m]
+         (.addMethod multifn :sci.impl/type-method (type-method-fn multifn nm)))
+       (vreset! internal-multi-fns m))
+     (defn- internal-type-method?
+       "Returns the name of multifn, or nil if multifn is not a built-in multimethod or dispatch-val is not a SCI type."
+       [multifn dispatch-val]
+       (when (instance? sci.lang.Type dispatch-val)
+         (get @internal-multi-fns multifn)))
+     (defn- check-internal-multi-fn [multifn dispatch-val]
+       (when-let [nm (get @internal-multi-fns multifn)]
+         (when-not (or (instance? sci.lang.Type dispatch-val)
+                       (:unrestricted (store/get-ctx)))
+           (throw (ex-info (str "Access to " (symbol nm) " requires the :unrestricted option")
+                           {:multimethod nm})))))))
+
 (defn multi-fn-impl [name dispatch-fn default hierarchy]
   #?(:cljd (let [method-table (atom {})]
              (when (world/current-world)
@@ -379,16 +421,38 @@
                 (new-host-multifn name dispatch-fn default hierarchy))))
 
 (defn multi-fn-add-method-impl
-  [multifn dispatch-val f]
-  #?(:cljd (do (cljd-swap-method-table!
-                (.-method-table ^SciMultiFn multifn) assoc
-                (normalize-dispatch-val dispatch-val) f)
-               multifn)
-     :default
-     (if (instance? SciMultiFn multifn)
-       (mutate-sci-multifn!
-        multifn #(host-add-method! % dispatch-val f))
-       (host-add-method! multifn dispatch-val f))))
+  ([multifn dispatch-val f]
+   #?(:cljd (do (cljd-swap-method-table!
+                 (.-method-table ^SciMultiFn multifn) assoc
+                 (normalize-dispatch-val dispatch-val) f)
+                multifn)
+      :clj (do (check-internal-multi-fn multifn dispatch-val)
+               (if-let [nm (internal-type-method? multifn dispatch-val)]
+                 (do (alter-meta! dispatch-val assoc nm f)
+                     multifn)
+                 (if (instance? SciMultiFn multifn)
+                   (mutate-sci-multifn!
+                    multifn #(host-add-method! % dispatch-val f))
+                   (host-add-method! multifn dispatch-val f))))
+      :cljs (if (instance? SciMultiFn multifn)
+              (mutate-sci-multifn!
+               multifn #(host-add-method! % dispatch-val f))
+              (host-add-method! multifn dispatch-val f))))
+  #?@(:cljd []
+      :clj
+      [([multifn dispatch-val f kind]
+        (let [f (if (or (identical? :print-method kind) (identical? :print-dup kind))
+                  (sio/print-fn-with-host-vars f)
+                  f)]
+          (if (and (instance? sci.lang.Type dispatch-val)
+                   (or (identical? :print-method kind) (identical? :simple-dispatch kind)))
+            (do (alter-meta! dispatch-val assoc
+                             (if (identical? :print-method kind)
+                               :sci.impl/print-method
+                               :sci.impl/pprint-simple-dispatch)
+                             f)
+                multifn)
+            (multi-fn-add-method-impl multifn dispatch-val f))))]))
 
 (defn get-method-impl [multifn dispatch-val]
   #?(:cljd
@@ -396,14 +460,27 @@
                (.-method-table ^SciMultiFn multifn))
            dispatch-val (normalize-dispatch-val dispatch-val)]
        (or (get mt dispatch-val) (get mt (.-default ^SciMultiFn multifn))))
-     :default
+     :clj
+     (if-let [nm (internal-type-method? multifn dispatch-val)]
+       (or (get (meta dispatch-val) nm)
+           (host-get-method multifn :default))
+       (host-get-method
+        (if (instance? SciMultiFn multifn)
+          (state-delegate (sci-multifn-state multifn))
+          multifn)
+        dispatch-val))
+     :cljs
      (host-get-method
       (if (instance? SciMultiFn multifn)
         (state-delegate (sci-multifn-state multifn))
         multifn)
       dispatch-val)))
 
-(defn methods-impl [multifn]
+(defn method-table
+  "The method table of a SCI or host multimethod, for SCI's own lookups:
+  unlike `methods-impl` it does not require :unrestricted for a built-in
+  multimethod."
+  [multifn]
   #?(:cljd (cljd-method-table-value (.-method-table ^SciMultiFn multifn))
      :default
      (host-methods
@@ -411,13 +488,19 @@
         (state-delegate (sci-multifn-state multifn))
         multifn))))
 
+(defn methods-impl [multifn]
+  #?(:clj (check-internal-multi-fn multifn nil))
+  (method-table multifn))
+
 (defn prefers-impl [multifn]
   #?(:cljd {}
      :default
-     (host-prefers
-      (if (instance? SciMultiFn multifn)
-        (state-delegate (sci-multifn-state multifn))
-        multifn))))
+     (do
+       #?(:clj (check-internal-multi-fn multifn nil))
+       (host-prefers
+        (if (instance? SciMultiFn multifn)
+          (state-delegate (sci-multifn-state multifn))
+          multifn)))))
 
 (defn remove-method-impl [multifn dispatch-val]
   #?(:cljd
@@ -426,10 +509,16 @@
           dissoc (normalize-dispatch-val dispatch-val))
          multifn)
      :default
-     (if (instance? SciMultiFn multifn)
-       (mutate-sci-multifn!
-        multifn #(host-remove-method! % dispatch-val))
-       (host-remove-method! multifn dispatch-val))))
+     (do
+       #?(:clj (check-internal-multi-fn multifn dispatch-val))
+       (if-let [nm #?(:clj (internal-type-method? multifn dispatch-val)
+                      :cljs nil)]
+         (do (alter-meta! dispatch-val dissoc nm)
+             multifn)
+         (if (instance? SciMultiFn multifn)
+           (mutate-sci-multifn!
+            multifn #(host-remove-method! % dispatch-val))
+           (host-remove-method! multifn dispatch-val))))))
 
 (defn remove-all-methods-impl [multifn]
   #?(:cljd
@@ -437,17 +526,21 @@
           (.-method-table ^SciMultiFn multifn) (constantly {}))
          multifn)
      :default
-     (if (instance? SciMultiFn multifn)
-       (mutate-sci-multifn! multifn host-reset!)
-       (host-reset! multifn))))
+     (do
+       #?(:clj (check-internal-multi-fn multifn nil))
+       (if (instance? SciMultiFn multifn)
+         (mutate-sci-multifn! multifn host-reset!)
+         (host-reset! multifn)))))
 
 (defn prefer-method-impl [multifn x y]
   #?(:cljd multifn
      :default
-     (if (instance? SciMultiFn multifn)
-       (mutate-sci-multifn!
-        multifn #(host-prefer-method! % x y))
-       (host-prefer-method! multifn x y))))
+     (do
+       #?(:clj (check-internal-multi-fn multifn nil))
+       (if (instance? SciMultiFn multifn)
+         (mutate-sci-multifn!
+          multifn #(host-prefer-method! % x y))
+         (host-prefer-method! multifn x y)))))
 
 (defn defmethod
   "Creates and installs a new method of multimethod associated with dispatch-value. "
@@ -457,24 +550,14 @@
      :clj
      (let [multifn-str (str multifn)]
        (if (or (str/ends-with? multifn-str "print-method")
+               (str/ends-with? multifn-str "print-dup")
                (str/ends-with? multifn-str "simple-dispatch"))
-         `(let [v# ~dispatch-val
-                m# (meta v#)
-                mf# (resolve '~multifn)]
-            ;; TODO: what about deftype - how can we detect deftype at runtime?
-            ;; Should we inject the ctx here to resolve the type? no, because type can really be dynamic?
-            ;; thus we need a way to detect if a value is an instance of a record or type
-            ;; or change `type` to return the deftype type, wouldn't this work?
-            ;; no, because print-method looks at core type
-            (if (instance? sci.lang.Type v#)
-              (do
-                (cond
-                  (= (resolve 'clojure.pprint/simple-dispatch) mf#)
-                  (alter-meta! v# assoc :sci.impl/pprint-simple-dispatch (fn ~@fn-tail))
-                  (= (resolve 'clojure.core/print-method) mf#)
-                  (alter-meta! v# assoc :sci.impl/print-method (fn ~@fn-tail))
-                  :else (clojure.core/multi-fn-add-method-impl ~multifn ~dispatch-val (fn ~@fn-tail))))
-              (clojure.core/multi-fn-add-method-impl ~multifn ~dispatch-val (fn ~@fn-tail))))
+         `(clojure.core/multi-fn-add-method-impl
+           ~multifn ~dispatch-val (fn ~@fn-tail)
+           (let [mf# (resolve '~multifn)]
+             (cond (= (resolve 'clojure.core/print-method) mf#) :print-method
+                   (= (resolve 'clojure.core/print-dup) mf#) :print-dup
+                   (= (resolve 'clojure.pprint/simple-dispatch) mf#) :simple-dispatch)))
          `(clojure.core/multi-fn-add-method-impl ~multifn ~dispatch-val (fn ~@fn-tail))))
      :cljs
      (list 'clojure.core/multi-fn-add-method-impl multifn dispatch-val (list* 'fn fn-tail))))

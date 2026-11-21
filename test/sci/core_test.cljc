@@ -551,6 +551,36 @@
   (is (thrown-with-msg? #?(:cljd cljd.core/ExceptionInfo :clj Exception :cljs js/Error)
                         #"allowed"
                         (tu/eval* "(clojure.core/inc 1)" {:deny '[clojure.core/inc]})))
+  (testing "ns-publics, ns-interns, ns-refers, ns-map and find-var omit a var in :deny"
+    (is (= [false false false false nil true]
+           (tu/eval* "[(contains? (ns-publics 'clojure.core) 'inc)
+                       (contains? (ns-interns 'clojure.core) 'inc)
+                       (contains? (ns-refers *ns*) 'inc)
+                       (contains? (ns-map *ns*) 'inc)
+                       (find-var 'clojure.core/inc)
+                       (contains? (ns-publics 'clojure.core) 'dec)]"
+                     {:deny '[inc]})))
+    (doseq [expr ["(do (alias 'c 'clojure.core) (c/inc 1))"
+                  "(do (require '[clojure.core :as c]) (c/inc 1))"
+                  "(do (refer 'clojure.core :rename '{inc plus}) (plus 1))"
+                  "(@(intern 'clojure.core 'inc) 1)"]]
+      (testing expr
+        (is (thrown-with-msg? #?(:cljd cljd.core/ExceptionInfo :clj Exception :cljs js/Error)
+                              #"allowed"
+                              (tu/eval* expr {:deny '[inc]}))))))
+  (testing "ns-publics and ns-interns list foo/x under :deny [x]"
+    (is (= [true true 1]
+           (tu/eval* "(do (ns foo) (def x 1) (ns user)
+                          [(contains? (ns-publics 'foo) 'x) (contains? (ns-interns 'foo) 'x) foo/x])"
+                     {:deny '[x]}))))
+  (testing ":allow accepts a listed symbol with an alias"
+    (is (= "a,b" (tu/eval* "(do (require '[clojure.string :as str]) (str/join \",\" [\"a\" \"b\"]))"
+                           {:allow '[do require quote str/join]}))))
+  (testing "ns-publics omits a built-in var missing from :allow"
+    (is (= [false true]
+           (tu/eval* "[(contains? (ns-publics 'clojure.core) 'inc)
+                       (contains? (ns-publics 'clojure.core) 'ns-publics)]"
+                     {:allow '[contains? ns-publics quote]}))))
 
   (testing "for/doseq are macroexpanded properly"
     (is (= 'loop* (first (tu/eval* "(macroexpand '(doseq [i [1 2 3]] nil))" {}))))
@@ -2729,6 +2759,16 @@
 #?(:cljs
    (deftest js-in-test
      (is (true? (sci/eval-string "(js-in \"foo\" #js {:foo 1})")))))
+
+(deftest named-fn-self-reference-test
+  (testing "one arity of a named fn calls another arity"
+    (is (= 3 (eval* "((fn f ([] (f 1)) ([x] (+ x 2))))"))))
+  (testing "a closure inside a named fn calls the named fn"
+    (is (= 6 (eval* "((fn f [n] (if (pos? n) ((fn [] (+ n (f (dec n))))) 0)) 3)"))))
+  (testing "a self reference returns the fn with its metadata"
+    (is (= 1 (eval* "(:a (meta (^{:a 1} (fn f [] f))))"))))
+  (testing "a named fn that ignores its name returns its result"
+    (is (= 2 (eval* "((fn f [x] (inc x)) 1)")))))
 
 ;;;; Scratch
 

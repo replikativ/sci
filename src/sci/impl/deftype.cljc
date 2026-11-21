@@ -23,6 +23,31 @@
             (str "defrecord/deftype currently only support protocol implementations, found: " protocol-name))
         expr))))
 
+(defn ^:private merge-shared-methods
+  "Returns protocol-impls with each method impl moved to the first protocol in the same namespace with a method of that name."
+  [ctx protocol-impls]
+  (let [protocol-ns (fn [protocol-name]
+                      (let [p (@utils/eval-resolve-state ctx (:bindings ctx) protocol-name)
+                            p (if (utils/var? p) @p p)]
+                        (when (and (map? p) (not (:marker-setter p)))
+                          (:ns p))))]
+    (:groups
+     (reduce (fn [{:keys [groups owner]} [protocol-name & impls]]
+               (let [pns (protocol-ns protocol-name)
+                     idx (count groups)]
+                 (reduce (fn [acc impl]
+                           (let [k [pns (first impl)]
+                                 target (when pns (get (:owner acc) k))]
+                             (if target
+                               (update-in acc [:groups target] conj impl)
+                               (cond-> (update-in acc [:groups idx] conj impl)
+                                 pns (assoc-in [:owner k] idx)))))
+                         {:groups (conj groups [protocol-name])
+                          :owner owner}
+                         impls)))
+             {:groups [] :owner {}}
+             protocol-impls))))
+
 (defn hex-hash [this]
   #?(:cljd (.toRadixString (hash this) 16)
      :clj (Integer/toHexString (hash this))
@@ -35,7 +60,7 @@
                              (fn [this]
                                (str (types/type-impl this) "@" (hex-hash this)))})))
    :default
-   (do (defmulti to-string types/type-impl)
+   (do (defmulti to-string #?(:clj types/type-method-dispatch :cljs types/type-impl))
        (defmethod to-string :default [this]
          (let [t (types/type-impl this)]
            (str t "@"
@@ -43,14 +68,13 @@
 
 #?(:clj
    (do
-     (defmulti equals (fn [this _other]
-                        (types/type-impl this)))
+     (defmulti equals types/type-method-dispatch)
      (defmethod equals :default [this other]
        (identical? this other))))
 
 #?(:clj
    (do
-     (defmulti hashCode types/type-impl)
+     (defmulti hashCode types/type-method-dispatch)
      (defmethod hashCode :default [this]
        (System/identityHashCode this))))
 
@@ -73,12 +97,14 @@
      home registry value-slot]
   Object
   (toString [this]
-    (to-string this))
+    #?(:cljd (to-string this)
+       :clj (types/type-call to-string :sci.impl.deftype/toString type this)
+       :cljs (to-string this)))
   #?@(:cljd []
       :clj [(equals [this other]
-              (sci.impl.deftype/equals this other))
+              (types/type-call sci.impl.deftype/equals :sci.impl.deftype/equals type this other))
             (hashCode [this]
-              (sci.impl.deftype/hashCode this))])
+              (types/type-call sci.impl.deftype/hashCode :sci.impl.deftype/hashCode type this))])
 
   sci.impl.types/SciTypeInstance
   (-get-type [_]
@@ -120,28 +146,28 @@
                                      (.write ^java.io.Writer w ^String (clojure-str this))))
                                  (.write ^java.io.Writer w ^String (clojure-str this))))
             clojure.lang.IFn
-            (invoke [this] (types/sci-invoke this))
-            (invoke [this a] (types/sci-invoke this a))
-            (invoke [this a b] (types/sci-invoke this a b))
-            (invoke [this a b c] (types/sci-invoke this a b c))
-            (invoke [this a b c d] (types/sci-invoke this a b c d))
-            (invoke [this a b c d e] (types/sci-invoke this a b c d e))
-            (invoke [this a b c d e f] (types/sci-invoke this a b c d e f))
-            (invoke [this a b c d e f g] (types/sci-invoke this a b c d e f g))
-            (invoke [this a b c d e f g h] (types/sci-invoke this a b c d e f g h))
-            (invoke [this a b c d e f g h i] (types/sci-invoke this a b c d e f g h i))
-            (invoke [this a b c d e f g h i j] (types/sci-invoke this a b c d e f g h i j))
-            (invoke [this a b c d e f g h i j k] (types/sci-invoke this a b c d e f g h i j k))
-            (invoke [this a b c d e f g h i j k l] (types/sci-invoke this a b c d e f g h i j k l))
-            (invoke [this a b c d e f g h i j k l m] (types/sci-invoke this a b c d e f g h i j k l m))
-            (invoke [this a b c d e f g h i j k l m n] (types/sci-invoke this a b c d e f g h i j k l m n))
-            (invoke [this a b c d e f g h i j k l m n o] (types/sci-invoke this a b c d e f g h i j k l m n o))
-            (invoke [this a b c d e f g h i j k l m n o p] (types/sci-invoke this a b c d e f g h i j k l m n o p))
-            (invoke [this a b c d e f g h i j k l m n o p q] (types/sci-invoke this a b c d e f g h i j k l m n o p q))
-            (invoke [this a b c d e f g h i j k l m n o p q r] (types/sci-invoke this a b c d e f g h i j k l m n o p q r))
-            (invoke [this a b c d e f g h i j k l m n o p q r s] (types/sci-invoke this a b c d e f g h i j k l m n o p q r s))
-            (invoke [this a b c d e f g h i j k l m n o p q r s t] (types/sci-invoke this a b c d e f g h i j k l m n o p q r s t))
-            (applyTo [this args] (types/sci-apply-to this args))]
+            (invoke [this] (types/type-call types/sci-invoke :clojure.lang/invoke type this))
+            (invoke [this a] (types/type-call types/sci-invoke :clojure.lang/invoke type this a))
+            (invoke [this a b] (types/type-call types/sci-invoke :clojure.lang/invoke type this a b))
+            (invoke [this a b c] (types/type-call types/sci-invoke :clojure.lang/invoke type this a b c))
+            (invoke [this a b c d] (types/type-call types/sci-invoke :clojure.lang/invoke type this a b c d))
+            (invoke [this a b c d e] (types/type-call types/sci-invoke :clojure.lang/invoke type this a b c d e))
+            (invoke [this a b c d e f] (types/type-call types/sci-invoke :clojure.lang/invoke type this a b c d e f))
+            (invoke [this a b c d e f g] (types/type-call types/sci-invoke :clojure.lang/invoke type this a b c d e f g))
+            (invoke [this a b c d e f g h] (types/type-call types/sci-invoke :clojure.lang/invoke type this a b c d e f g h))
+            (invoke [this a b c d e f g h i] (types/type-call types/sci-invoke :clojure.lang/invoke type this a b c d e f g h i))
+            (invoke [this a b c d e f g h i j] (types/type-call types/sci-invoke :clojure.lang/invoke type this a b c d e f g h i j))
+            (invoke [this a b c d e f g h i j k] (types/type-call types/sci-invoke :clojure.lang/invoke type this a b c d e f g h i j k))
+            (invoke [this a b c d e f g h i j k l] (types/type-call types/sci-invoke :clojure.lang/invoke type this a b c d e f g h i j k l))
+            (invoke [this a b c d e f g h i j k l m] (types/type-call types/sci-invoke :clojure.lang/invoke type this a b c d e f g h i j k l m))
+            (invoke [this a b c d e f g h i j k l m n] (types/type-call types/sci-invoke :clojure.lang/invoke type this a b c d e f g h i j k l m n))
+            (invoke [this a b c d e f g h i j k l m n o] (types/type-call types/sci-invoke :clojure.lang/invoke type this a b c d e f g h i j k l m n o))
+            (invoke [this a b c d e f g h i j k l m n o p] (types/type-call types/sci-invoke :clojure.lang/invoke type this a b c d e f g h i j k l m n o p))
+            (invoke [this a b c d e f g h i j k l m n o p q] (types/type-call types/sci-invoke :clojure.lang/invoke type this a b c d e f g h i j k l m n o p q))
+            (invoke [this a b c d e f g h i j k l m n o p q r] (types/type-call types/sci-invoke :clojure.lang/invoke type this a b c d e f g h i j k l m n o p q r))
+            (invoke [this a b c d e f g h i j k l m n o p q r s] (types/type-call types/sci-invoke :clojure.lang/invoke type this a b c d e f g h i j k l m n o p q r s))
+            (invoke [this a b c d e f g h i j k l m n o p q r s t] (types/type-call types/sci-invoke :clojure.lang/invoke type this a b c d e f g h i j k l m n o p q r s t))
+            (applyTo [this args] (types/type-call types/sci-apply-to :clojure.lang/applyTo type this args))]
       :cljs [IPrintWithWriter
              (-pr-writer [this w opts]
                          (types/sci-pr-writer this w opts))
@@ -541,6 +567,7 @@
                 (recur (next ifaces) (next counts) (+ offset cnt)
                        (conj result (into [(first ifaces)] impls))))
               result)))
+        protocol-impls (merge-shared-methods ctx protocol-impls)
         field-set (set fields)
         ;; The Type object is created here, at analysis time, so that method
         ;; bodies and factories referencing the type (e.g. (instance? Foo x))

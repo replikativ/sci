@@ -248,7 +248,48 @@
                      (intern *ns* 'cake "bar")
                      [resolved cake])))))))
   (testing "unmapping Class and then fully qualifying it"
-    (is (= 'user/String (eval* "(ns-unmap *ns* 'String) `String ;;=> user/String")))))
+    (is (= 'user/String (eval* "(ns-unmap *ns* 'String) `String ;;=> user/String"))))
+  (testing "ns-unmap of a default clojure.core refer removes it from resolve and ns-refers"
+    (is (= [nil nil nil 'other.ns/assoc]
+           (eval* "(ns other.ns) (ns-unmap 'other.ns 'assoc)
+                   [(ns-resolve 'other.ns 'assoc) (get (ns-refers 'other.ns) 'assoc)
+                    (get (ns-map 'other.ns) 'assoc) `assoc]"))))
+  (testing "ns-unmap of a default clojure.core refer leaves clojure.core and other namespaces alone"
+    (is (= [true true]
+           (eval* "(ns other.ns) (ns-unmap 'other.ns 'assoc) (ns user)
+                   [(some? (resolve 'assoc)) (some? (ns-resolve 'clojure.core 'assoc))]"))))
+  (testing "refer after ns-unmap of a default clojure.core refer brings it back"
+    (is (eval* "(ns other.ns) (ns-unmap 'other.ns 'assoc) (refer 'clojure.core :only '[assoc])
+                (= #'clojure.core/assoc (resolve 'assoc) (get (ns-refers 'other.ns) 'assoc))"))
+    (is (eval* "(ns other.ns) (ns-unmap 'other.ns 'assoc) (refer 'clojure.core)
+                (= #'clojure.core/assoc (resolve 'assoc) (get (ns-refers 'other.ns) 'assoc))")))
+  (testing "ns-unmap of a clojure.core var brought back by refer :only removes it again"
+    (is (nil? (eval* "(ns other.ns) (ns-unmap 'other.ns 'assoc) (refer 'clojure.core :only '[assoc])
+                      (ns-unmap 'other.ns 'assoc) (resolve 'assoc)"))))
+  (testing "ns-unmap of a def that shadows clojure.core leaves the name unresolved"
+    (is (nil? (eval* "(ns other.ns) (def assoc 1) (ns-unmap 'other.ns 'assoc) (resolve 'assoc)"))))
+  (testing "refer clojure.core with :exclude refers the unmapped vars again, except the excluded ones"
+    (is (= [true nil]
+           (eval* "(ns other.ns) (ns-unmap 'other.ns 'assoc) (ns-unmap 'other.ns 'dissoc)
+                   (refer 'clojure.core :exclude '[dissoc])
+                   [(some? (resolve 'assoc)) (resolve 'dissoc)]")))))
+
+(deftest ns-refers-refer-clojure-exclude-test
+  (testing ":refer-clojure :exclude leaves the excluded vars out of ns-refers and ns-map"
+    (is (= [nil nil nil true]
+           (eval* "(ns foo (:refer-clojure :exclude [zero?]))
+                   [(get (ns-refers 'foo) 'zero?) (get (ns-map 'foo) 'zero?) (resolve 'zero?)
+                    (some? (get (ns-refers 'foo) 'inc))]"))))
+  (testing "an excluded clojure.core macro is an unresolved symbol"
+    (is (thrown-with-msg? #?(:cljd cljd.core/ExceptionInfo :clj Exception :cljs js/Error) #"Unable to resolve symbol: fn"
+                          (eval* "(ns foo (:refer-clojure :exclude [fn])) ((fn [] 1))")))
+    (is (thrown-with-msg? #?(:cljd cljd.core/ExceptionInfo :clj Exception :cljs js/Error) #"Unable to resolve symbol: fn"
+                          (eval* "(ns foo) (ns-unmap 'foo 'fn) ((fn [] 1))")))
+    (is (= [1 2] (eval* "(ns foo (:refer-clojure :exclude [fn do])) (defn f [] 1) [(f) (do 2)]"))))
+  (testing ":refer-clojure :rename lists the new name in ns-refers"
+    (is (= [nil true]
+           (eval* "(ns foo (:refer-clojure :rename {zero? z?}))
+                   [(get (ns-refers 'foo) 'zero?) (some? (get (ns-refers 'foo) 'z?))]")))))
 
 (deftest find-var-test
   (is (eval* "(= #'clojure.core/map (find-var 'clojure.core/map))"))
