@@ -1000,7 +1000,8 @@
         ;; whose CLJS prototype it would then mutate.
         fork-fn #?(:cljs sci.impl.deftype/fork-type-data :default nil)
         data (if existing
-               (merge (world/-own-data existing fork-fn) data)
+               (dissoc (merge (world/-own-data existing fork-fn) data)
+                       :sci.impl/declared)
                data)
         ;; on CLJS every sci deftype and defrecord gets its own JS prototype
         ;; so that native protocols can be implemented/extended per type (see

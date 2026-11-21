@@ -44,12 +44,12 @@
     true)
   world/ITypeData
   (-data-for [this instance-world]
-    (world/type-data-of this instance-world data))
+    (world/type-data-of this true instance-world data))
   (-own-data [this clone]
     (world/own-type-data this data clone))
   (-own-data! [this clone]
     (let [d data]
-      (world/own-type-data! this #(world/type-data this d) clone
+      (world/own-type-data! this #(world/type-data-of this true nil d) clone
                             (primary-mirror-root this))))
   IWorldMirror
   (-mirror-root! [_ v] (set! data v))
@@ -100,7 +100,7 @@
                   (locking this
                     (if (world/current-world)
                       (world/alter-type-data!
-                       this (world/type-data this data) f args
+                       this (world/type-data-of this true nil data) f args
                        (primary-mirror-root this))
                       (set! data (apply f data args)))))
        (resetMeta [this m]

@@ -746,31 +746,42 @@
         (cells-get cells slot)
         absent))))
 
+(defn- declared?
+  "Type data written by analysis only (`declare-type!`): the type is not
+   defined in that world."
+  [v]
+  (boolean (:sci.impl/declared v)))
+
 (defn- type-data-in
   "A Type's data in `rw`'s world, inside a counted access of that world: its
    realization while open (`fallback`, the host field, for a primary, which
-   mirrors it there), `absent` when it has none, the retired error once
-   retired."
-  [handle ^ReadWorld rw fallback]
+   mirrors it there), `absent` when it has none (for an instance call also
+   when it is only declared there), the retired error once retired."
+  [handle ^ReadWorld rw instance-call? fallback]
   (let [^DenseWorld w (.-world rw)]
     (with-world-access
      w
      #(let [v (cell-value w (:value-slot (descriptor w handle)))]
         (cond (identical? absent v) absent
+              (and instance-call? (declared? v)) absent
               (.-primary? rw) fallback
               :else v)))))
 
 (defn type-data-of
   "A SCI Type's data, which holds the built-in interface methods of its
-   instances (`types/type-call`), as seen by a call on an instance
-   constructed in `instance-world` (nil for a type-level read):
-   1. the active world's own realization (definitions resolve where they
-      are invoked), read directly: its entry is already counted;
+   instances (`types/type-call`). For a call on an instance (`instance-call?`,
+   constructed in `instance-world`):
+   1. the active world's own definition (definitions resolve where they are
+      invoked), read directly: its entry is already counted;
    2. else the instance's world, 3. else the type's home (the world that
       defined it), each inside a counted access: refused once retired;
    4. else the host field (`fallback`): a type never defined in a world, or
-      registered in unrelated lineages."
-  [handle instance-world fallback]
+      registered in unrelated lineages.
+   A type only declared in a world (analysis) is not defined there. A
+   type-level read (no instance) takes a world's declaration as its own
+   data, so a world forked between a type's analysis and its definition
+   elsewhere keeps the bare declaration."
+  [handle instance-call? instance-world fallback]
   (if-not (-world-tracked? handle)
     fallback
     (let [active (active-world-state)
@@ -783,18 +794,19 @@
         fallback
         (let [v (if active
                   (let [v (cell-value aw (:value-slot (get (:descriptors @(.-registry ^DenseWorld aw)) handle)))]
-                    (if (and (.-primary? ^ReadWorld active) (not (identical? absent v)))
-                      fallback
-                      v))
+                    (cond (identical? absent v) absent
+                          (and instance-call? (declared? v)) absent
+                          (.-primary? ^ReadWorld active) fallback
+                          :else v))
                   absent)
               iw (when (and (identical? absent v) instance-world
                             (not (identical? aw (.-world ^ReadWorld instance-world))))
                    instance-world)
-              v (if iw (type-data-in handle iw fallback) v)
+              v (if iw (type-data-in handle iw instance-call? fallback) v)
               v (if (and (identical? absent v) home
                          (not (identical? aw (.-world home)))
                          (not (and iw (identical? (.-world ^ReadWorld iw) (.-world home)))))
-                  (type-data-in handle home fallback)
+                  (type-data-in handle home instance-call? fallback)
                   v)]
           (if (identical? absent v) fallback v))))))
 
@@ -809,11 +821,10 @@
       (when-not @(.-open? w)
         (let [active (active-world-state)
               own? (when active
-                     (let [^DenseWorld aw (.-world ^ReadWorld active)]
-                       (not (identical?
-                             absent
-                             (cell-value aw (:value-slot (get (:descriptors @(.-registry aw))
-                                                              (-instance-type x))))))))]
+                     (let [^DenseWorld aw (.-world ^ReadWorld active)
+                           v (cell-value aw (:value-slot (get (:descriptors @(.-registry aw))
+                                                              (-instance-type x))))]
+                       (not (or (identical? absent v) (declared? v)))))]
           (when-not own?
             (assert-accessible! w))))))
   nil)
@@ -848,7 +859,7 @@
 (defn type-data
   "A Type's data for a type-level read (no instance): see `type-data-of`."
   [handle fallback]
-  (type-data-of handle nil fallback))
+  (type-data-of handle false nil fallback))
 
 (defn instance-print-method
   "The print-method that the type `type-meta` of SCI type instance `x` has,
@@ -873,7 +884,7 @@
       (if clone (clone fallback) fallback)
       v)))
 
-(declare allocate-descriptor! alter-slot!)
+(declare allocate-descriptor! alter-type-slot!)
 
 (defn own-type-data!
   "The active world's own realization of `handle`'s data. A world without
@@ -884,12 +895,12 @@
     (let [{:keys [value-slot]} (or (descriptor w handle)
                                    (allocate-descriptor! w handle :type false clone))
           v (cell-value w value-slot)]
-      (if-not (identical? absent v)
+      (if-not (or (identical? absent v) (declared? v))
         v
         (let [base (read)
-              own (if clone (clone base) base)]
-          ;; keeps a realization written meanwhile
-          (alter-slot! w value-slot own identity [] mirror))))
+              own (dissoc (if clone (clone base) base) :sci.impl/declared)]
+          ;; keeps a definition written meanwhile
+          (alter-type-slot! w value-slot own identity [] mirror))))
     (read)))
 
 (defn var-watches [handle fallback]
@@ -1407,6 +1418,23 @@
              (cells-set! cells value-slot m))))))
   handle)
 
+(defn declare-type!
+  "Analysis of a deftype: the type's slot holds its declaration `data` (its
+   name, marked `:sci.impl/declared`) before the namespace mapping publishes the
+   type, so a fork in between keeps it undefined. Marks no home: the world
+   that evaluates the deftype defines the type (`register-type!`)."
+  [handle data value-fork-fn]
+  (when-let [^DenseWorld world (current-world)]
+    (let [{:keys [value-slot]}
+          (allocate-descriptor! world handle :type false value-fork-fn)]
+      (ensure-capacity! world (inc value-slot))
+      (with-cells-read-lock
+        world
+        #(let [cells (current-cells world)]
+           (when (identical? absent (cells-get cells value-slot))
+             (cells-set! cells value-slot data))))))
+  handle)
+
 (defn register-type!
   ([handle data]
    (register-type! handle data nil))
@@ -1555,6 +1583,24 @@
        (alter-slot! world value-slot fallback f args mirror))
      ::no-world)))
 
+(defn- alter-type-slot!
+  "`alter-slot!` for type data: a slot holding only the analysis-time
+   declaration starts from `fallback` (the defining world's data), so a
+   change in a world that has not defined the type copies the definition."
+  [^DenseWorld world slot fallback f args mirror]
+  (ensure-capacity! world (inc slot))
+  (loop []
+    (let [raw-old (cells-get (current-cells world) slot)
+          old (if (or (identical? absent raw-old) (declared? raw-old)) fallback raw-old)
+          new (apply f old args)]
+      (if (with-cells-read-lock
+            world
+            #(when (cells-cas! (current-cells world) slot raw-old new)
+               (mirror! world slot mirror)
+               true))
+        new
+        (recur)))))
+
 (defn alter-type-data!
   ([handle fallback f args] (alter-type-data! handle fallback f args nil))
   ([handle fallback f args mirror]
@@ -1562,7 +1608,7 @@
      (let [{:keys [value-slot]}
            (or (descriptor world handle)
                (allocate-descriptor! world handle :type false nil))]
-       (alter-slot! world value-slot fallback f args mirror))
+       (alter-type-slot! world value-slot fallback f args mirror))
      ::no-world)))
 
 (defn alter-var-watches! [handle fallback f args]

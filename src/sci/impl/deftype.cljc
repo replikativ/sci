@@ -601,9 +601,17 @@
         ;; at eval time, adding the constructor var and (on CLJS) the JS
         ;; prototype.
         _ (utils/check-namespace-writable! ctx @(:env ctx) (symbol (namespace tagged-name)))
-        _ (let [t (lang/->Type {:sci.impl/type-name rec-type} nil)]
-            ;; Analysis only declares the type: its host field has the name.
-            ;; -create-type defines it in the evaluating world (its home).
+        _ (let [t (lang/->Type (cond-> {:sci.impl/type-name rec-type}
+                                 ;; also in the host field: a primary's
+                                 ;; first fork realizes its slots from it
+                                 (world/current-world)
+                                 (assoc :sci.impl/declared true))
+                               nil)]
+            ;; Analysis only declares the type (slot first: the mapping
+            ;; makes it reachable, also to a fork). -create-type defines it
+            ;; in the evaluating world, which becomes its home.
+            (world/declare-type! t (types/getVal t)
+                                 #?(:cljs fork-type-data :default nil))
             (swap! (:env ctx) update-in
                    [:namespaces (symbol (namespace tagged-name)) :types]
                    assoc record-name t))

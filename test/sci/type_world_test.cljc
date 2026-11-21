@@ -112,3 +112,15 @@
     (is (re-find #"\{:a 1\}" (str (attempt #(pr-str r)))) "printing works")
     #?(:clj (is (= :retired (attempt #(str r))) "a user toString is refused"))
     (is (= :retired (attempt #(r 2))) "a user method is refused")))
+
+(deftest a-fork-between-analysis-and-definition-keeps-the-declaration
+  ;; The parent analysed the deftype (inside mk) but defines it only when it
+  ;; runs mk, after forking g. g keeps the bare declaration; a call in g on
+  ;; an instance the parent made uses the parent's definition.
+  (let [p (forkable)
+        _ (sci/eval-string* p (str "(defn mk [] " deftype-src " (->D 42))"))
+        g (sci/fork p)
+        d (sci/eval-string* p "(mk)")]
+    (is (= [42 43 "D:42"] ((sci/eval-string* g use-src) d)))
+    #?(:clj (is (nil? (sci/eval-string* g "(:clojure.lang/deref (meta D))"))
+                "g's own data is the declaration"))))
