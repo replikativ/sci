@@ -575,7 +575,7 @@
         ;; at eval time, adding the constructor var and (on CLJS) the JS
         ;; prototype.
         _ (utils/check-namespace-writable! ctx @(:env ctx) (symbol (namespace tagged-name)))
-        _ (let [t (lang/->Type {:sci.impl/type-name rec-type})]
+        _ (let [t (lang/->Type {:sci.impl/type-name rec-type} nil)]
             ;; Slot first: the mapping makes the type reachable (also to a
             ;; fork, which would otherwise read its shared host field).
             (world/register-type!

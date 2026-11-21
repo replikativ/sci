@@ -19,6 +19,11 @@ SCI is used in [babashka](https://github.com/babashka/babashka),
     `Object`, `Inst`, ...) are stored in its `Type` metadata, which is
     world-local type data, so a fork's methods diverge from its parent's
     (previously they shared the process-global host multimethod table).
+    A world without the type's data (a parent or older sibling of the world
+    that defined it) and host calls (`str`, `.hashCode`, `.equals`, invoking
+    an instance) read it in the type's home world, as for Vars: they work
+    while that world is open and are refused once it is retired, also for
+    an instance already used as a key in a host collection.
   - The `:unrestricted` requirement for built-in multimethods and the
     `:deny` checks on namespace introspection (`ns-publics`, `ns-interns`,
     `ns-refers`, `ns-map`, `find-var`, `intern`, `alias`, `require :as`,

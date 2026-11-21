@@ -1017,7 +1017,7 @@
                       (boolean (:sci.impl/record data))))
              :default nil)
         _ (utils/check-namespace-writable! ctx @env cnn)
-        t (if existing existing (sci.lang/->Type data))]
+        t (if existing existing (sci.lang/->Type data nil))]
     ;; One publication: the type's data and its namespace mapping.
     ;; The type's slot is written before the mapping publishes it. The env
     ;; swap is outside any section: env watches are user code.

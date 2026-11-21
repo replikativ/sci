@@ -24,7 +24,24 @@
 #?(:cljd nil :clj (definterface ^{:doc "Marker interface for SCI vars."} IVar))
 
 (deftype ^{:doc "Representation of a SCI custom type, created e.g. with `(defrecord Foo [])`. The fields of this type are implementation detail and should not be accessed directly."}
-    Type [#?(:cljd ^:mutable data :clj ^:volatile-mutable data :cljs ^:volatile-mutable data)]
+    Type [#?(:cljd ^:mutable data :clj ^:volatile-mutable data :cljs ^:volatile-mutable data)
+          ;; the context of the world that registered the type (its home),
+          ;; true when registered in unrelated lineages, nil if never
+          #?(:cljd ^:mutable home :clj ^:volatile-mutable home :cljs ^:volatile-mutable home)]
+  world/IWorldTracked
+  (-world-tracked? [_] (boolean home))
+  (-world-home-ctx [_] (when (map? home) home))
+  (-mark-world-tracked! [_ home-ctx]
+    (let [current home]
+      (when (and (map? current)
+                 home-ctx
+                 (not (identical? (:sci.impl/lineage current)
+                                  (:sci.impl/lineage home-ctx))))
+        ;; no unambiguous home: reads fall back to the host field
+        (set! home true))
+      (when-not current
+        (set! home (or home-ctx true))))
+    true)
   IWorldMirror
   (-mirror-root! [_ v] (set! data v))
   (-mirror-meta! [_ m] (set! data m))
@@ -40,7 +57,10 @@
   ;; NOTE: returns "user.Foo" rather than "class user.Foo" (unlike java.lang.Class).
   ;; Changing this would break downstream libs (e.g. prismatic/schema).
   (toString [this]
-    (str (:sci.impl/type-name (world/type-data this data))))
+    ;; The name never changes and the host field always has it, so printing
+    ;; a type works without its world (also once that world is retired).
+    (str (or (:sci.impl/type-name data)
+             (:sci.impl/type-name (world/type-data this data)))))
 
   ;; meta is only supported to get our implementation! keys out
   #?@(:cljd

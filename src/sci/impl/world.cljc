@@ -698,24 +698,61 @@
       (let [world (.-world ^ReadWorld active)]
         (slot-value world (:value-slot (descriptor world handle)) fallback)))))
 
+(defn- cell-value
+  "The value of `slot` in `world`'s current cells, or `absent`. No access
+   section: the caller is inside the world or holds a counted access."
+  [^DenseWorld world slot]
+  (if (nil? slot)
+    absent
+    (let [cells (current-cells world)]
+      (if (< slot (cells-length cells))
+        (cells-get cells slot)
+        absent))))
+
+(defn- type-data-at-home
+  "A Type's data in its home world, inside a counted access of the home: its
+   value while open, the retired error once retired. A primary home keeps
+   its data in the host field (`fallback`)."
+  [handle home-ctx fallback]
+  (if-let [^ReadWorld home-read (:sci.impl/read-world home-ctx)]
+    (let [^DenseWorld home (.-world home-read)]
+      (with-world-access
+       home
+       #(if (.-primary? home-read)
+          fallback
+          (let [v (cell-value home (:value-slot (descriptor home handle)))]
+            (if (identical? absent v) fallback v)))))
+    fallback))
+
 (defn type-data
   "A Type's data in the active world. Built-in interface methods of SCI types
-   live in it (`types/type-call`), so it is read on every such call: the
-   active world's entry is already counted, so no further access section is
-   needed (as in `with-world-access`)."
+   live in it (`types/type-call`), so it is read on every such call. The
+   active world's realization is read directly (its entry is already
+   counted). A world without one (a parent or an older sibling of the
+   defining world, or no world: a host call) reads the Type's home world, as
+   a Var does: its data while open, the retired error once retired. A Type
+   registered in unrelated lineages has no home and falls back to its host
+   field."
   [handle fallback]
-  (let [active (active-world-state)]
-    (if (or (nil? active) (.-primary? ^ReadWorld active))
-      fallback
-      (let [^DenseWorld world (.-world ^ReadWorld active)
-            slot (:value-slot (get (:descriptors @(.-registry world)) handle))]
-        (if (nil? slot)
-          fallback
-          (let [cells (current-cells world)]
-            (if (>= slot (cells-length cells))
-              fallback
-              (let [v (cells-get cells slot)]
-                (if (identical? absent v) fallback v)))))))))
+  (if-not (-world-tracked? handle)
+    fallback
+    (let [home-ctx (-world-home-ctx handle)
+          active (active-world-state)]
+      (if (nil? active)
+        (if home-ctx (type-data-at-home handle home-ctx fallback) fallback)
+        (let [^DenseWorld world (.-world ^ReadWorld active)
+              primary? (.-primary? ^ReadWorld active)]
+          (if (and primary?
+                   (or (nil? home-ctx)
+                       (identical? world (:sci.impl/world home-ctx))))
+            ;; a primary world mirrors its own realization in the host field
+            fallback
+            (let [v (cell-value world (:value-slot (get (:descriptors @(.-registry world)) handle)))]
+              (cond
+                (not (identical? absent v)) (if primary? fallback v)
+                (and home-ctx (not (identical? world (:sci.impl/world home-ctx))))
+                (type-data-at-home handle home-ctx fallback)
+                :else fallback))))))))
 
 (defn var-watches [handle fallback]
   (if-let [^ReadWorld active (:sci.impl/read-world (selected-var-ctx handle))]
@@ -1236,6 +1273,9 @@
    (register-type! handle data nil))
   ([handle data value-fork-fn]
    (when-let [^DenseWorld world (current-world)]
+     ;; The registering world is the type's home: worlds without its data
+     ;; (and host calls) read it there.
+     (-mark-world-tracked! handle store/*ctx*)
      (let [{:keys [value-slot]}
            (allocate-descriptor! world handle :type false value-fork-fn)]
        (ensure-capacity! world (inc value-slot))

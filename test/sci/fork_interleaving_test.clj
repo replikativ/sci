@@ -386,6 +386,48 @@
     (is (= [123 456] [(attempt descendant f) (attempt descendant g)])
         "a descendant keeps its own copies")))
 
+;; The built-in interface methods of a SCI type live in its Type's world data
+;; (babashka/sci#1132). For a type defined in a child, a world without that
+;; data (the parent, an older sibling) and the host read its home world, as
+;; for Vars; a descendant has its own copy.
+(deftest a-child-types-interface-methods-consult-its-home
+  (let [p (forkable {})
+        older (sci/fork p)
+        c (sci/fork p)
+        d (sci/eval-string*
+           c "(deftype D [x]
+                clojure.lang.IDeref (deref [_] x)
+                clojure.lang.IFn (invoke [_ a] (+ x a))
+                Object (toString [_] (str \"D:\" x))
+                       (hashCode [_] (int x))
+                       (equals [_ o] (and (instance? D o) (= x (.-x o)))))
+              (->D 42)")
+        other (sci/eval-string* c "(->D 42)")
+        descendant (sci/fork c)
+        newer (sci/fork p)
+        use-it "(fn [x] [@x (x 1) (str x) (hash x) (= x x)])"
+        fns (into {} (for [[label ctx] [[:parent p] [:older older] [:newer newer]
+                                        [:descendant descendant]]]
+                       [label (sci/eval-string* ctx use-it)]))
+        attempt (fn [h] (try (h)
+                             (catch Exception e
+                               (if (re-find #"retired" (str (ex-message e)))
+                                 :retired
+                                 (str (class e) ": " (ex-message e))))))
+        host (fn [] [(.hashCode ^Object d) (.equals ^Object d other) (str d) (d 1)
+                     (.get (doto (java.util.HashMap.) (.put d :v)) other)])
+        expected [42 43 "D:42" 42 true]]
+    (doseq [[label f] fns]
+      (is (= expected (attempt #(f d))) (str label " while the home is open")))
+    (is (= [42 true "D:42" 43 :v] (attempt host)) "host while the home is open")
+    (sci/retire! c)
+    (doseq [label [:parent :older :newer]]
+      (is (= :retired (attempt #((get fns label) d))) (str label " after retire")))
+    (is (= :retired (attempt host)) "host after retire")
+    (is (= expected (attempt #((:descendant fns) d))) "a descendant keeps its own copy")
+    (is (= "user.D" (str (sci/eval-string* descendant "D")))
+        "printing the type needs no world")))
+
 (deftest a-host-read-racing-retirement-never-sees-a-cleared-array
   (let [p (forkable {})
         c (sci/fork p)
