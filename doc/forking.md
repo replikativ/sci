@@ -143,7 +143,9 @@ prototype, although its managed mutable fields remain fork-local.
 Var roots, metadata, and watch maps; namespace metadata and loaded-library
 state; all logical SCI atom state; SCI-created volatile values and delays; SCI
 type descriptor data; and JVM/CLJS SCI multimethod tables, preferences, and
-dispatch caches are fork-local. ClojureDart's exact-dispatch SCI multimethod
+dispatch caches are fork-local. On the JVM, the methods a SCI type implements
+for built-in interfaces (`IDeref`, `IFn`, `IAtom`, `Object`, `Inst`, ...) are
+part of its type data and therefore fork-local too. ClojureDart's exact-dispatch SCI multimethod
 tables are fork-local as well. SCI deftypes that declare mutable fields route
 their persistent field map through a managed world slot, so state diverges
 even when an instance is captured by a closure or nested in a persistent

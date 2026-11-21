@@ -61,3 +61,45 @@
   (let [c (ctx)]
     (sci/add-namespace! c 'host.lib {'h inc})
     (is (= 2 (sci/eval-string* c "(host.lib/h 1)")))))
+
+(deftest deny-covers-forked-worlds-and-read-only-namespaces
+  ;; :deny on namespace introspection and aliasing (babashka/sci#1134) holds
+  ;; in a forked world, for a read-only host namespace and for a namespace
+  ;; that exists only in the child's world.
+  ;; `f` is a Var: :deny reaches an aliased name through the Var's qualified
+  ;; name (a raw value under an alias is not covered, as in :standard mode).
+  (let [host-ns (sci/create-ns 'host.lib {:sci/built-in true})
+        parent (sci/init {:runtime-mode :forkable
+                          :namespaces {'host.lib {:obj host-ns
+                                                  'f (sci/new-var 'f identity {:ns host-ns})}}
+                          :deny '[host.lib/f inc app/secret kid/secret]})
+        _ (sci/eval-string* parent "(ns app) (def secret 1) (def visible 2) (in-ns 'user)")
+        child (sci/fork parent)
+        _ (sci/eval-string* child "(ns kid) (def secret 3) (def visible 4) (in-ns 'user)")]
+    (doseq [[label c] [["parent" parent] ["child" child]]]
+      (testing label
+        (is (= [false false false false nil nil false true]
+               (sci/eval-string*
+                c "[(contains? (ns-publics 'host.lib) 'f)
+                    (contains? (ns-interns 'host.lib) 'f)
+                    (contains? (ns-refers *ns*) 'inc)
+                    (contains? (ns-map *ns*) 'inc)
+                    (find-var 'host.lib/f)
+                    (find-var 'clojure.core/inc)
+                    (contains? (ns-publics 'app) 'secret)
+                    (contains? (ns-publics 'app) 'visible)]")))
+        (doseq [expr ["(do (alias 'h 'host.lib) (h/f 1))"
+                      "(do (require '[host.lib :as h]) (h/f 1))"
+                      "(do (refer 'host.lib :rename '{f g}) (g 1))"
+                      "(@(intern 'host.lib 'f) 1)"
+                      "(do (alias 'c 'clojure.core) (c/inc 1))"
+                      "(@(intern 'app 'secret) 1)"]]
+          (is (re-find #"not allowed" (str (refused c expr))) expr))))
+    (testing "a namespace that exists only in the child"
+      (is (= [false true nil]
+             (sci/eval-string*
+              child "[(contains? (ns-publics 'kid) 'secret)
+                      (contains? (ns-interns 'kid) 'visible)
+                      (find-var 'kid/secret)]")))
+      (is (re-find #"not allowed" (str (refused child "kid/secret"))))
+      (is (nil? (sci/eval-string* parent "(find-ns 'kid)"))))))

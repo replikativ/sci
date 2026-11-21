@@ -146,11 +146,12 @@ child-only dynamic metadata cannot affect a nested parent evaluation.
 | Host atom/ref/agent/volatile/native multimethod, common JVM atomic/synchronization holders | Detected as unmanaged mutable or affine host state | Fork rejected by default; `Forkable` wrapper or `:fork-fn` must choose copy or sharing |
 | Plain JS object / mutable host collection | Same host object | Shared unless it implements `Forkable` or `:fork-fn` copies it |
 | JVM/CLJS SCI multimethod tables, preferences, and caches | Stable `SciMultiFn` handle with a fork-local host dispatch engine | Implemented; method mutations use copy-on-write and caches are rebuilt per fork |
+| JVM built-in interface methods of SCI types (`IDeref`, `IFn`, `IAtom`, `Object`, `Inst`, ...) | Stored in the `Type`'s metadata (upstream 0.15.60), which is the Type's world-local data slot; the built-in host `MultiFn`s hold one shared `:sci.impl/type-method` trampoline | Implemented; before 0.15.60 these methods lived in the process-global host `MultiFn` and a child's `defmethod` changed its parent |
 | ClojureDart SCI multimethod tables | Stable `SciMultiFn` with a dense world-local persistent method map | Implemented for interpreter-created exact-dispatch multimethods; built-in runtime tables remain global |
 | SCI protocol extension registries | Protocol Vars and method multimethods are world-local | Implemented; CLJS native prototypes isolate copied world-cell instances, while opaque closure-only instances retain their creation prototype |
 | Record hash caches | Shared memoized hash only | Benign derived state if records remain immutable |
 | Exception callstack side table (JVM `utils/recorded-callstacks`) | One process-wide weak map from exception identity to its SCI callstack, filled when an exception is raised and read by `callstack-of` | Benign derived state: keyed by exception identity, and an exception's callstack does not change across worlds |
-| Core refers cache (`namespaces/core-refers-cache`) | One process-wide volatile keyed by the identity of the `clojure.core` namespace map, filtering out vars whose metadata is `:private` | Derived state over world-local Var metadata: a world that changes `:private` on a non-built-in `clojure.core` var could see another world's cached result; built-in vars are read-only. Key it by world, or rebuild per world, if `clojure.core` vars become mutable per world |
+| Core refers cache (`namespaces/core-refers-cache`) | One process-wide volatile keyed by the identity of the `clojure.core` namespace map, filtering out vars whose metadata is `:private`; since 0.15.60 also read by `ns-unmap` and `ns-map` | Derived state over world-local Var metadata: a world that changes `:private` on a non-built-in `clojure.core` var could see another world's cached result; built-in vars are read-only. Key it by world, or rebuild per world, if `clojure.core` vars become mutable per world |
 | Watches with external effects | Shared callback registrations | Must be copied, shared, or prohibited explicitly by capability |
 | RNG, `gensym`, clock, UUID | Host/global nondeterministic source | External capability; not reproducibly forked |
 | Readers, writers, streams, iterators, regex matchers, mutable Java collections | Mutable/consuming host resource | Known JVM direct values are rejected; explicitly share or virtualize with `Forkable`/`:fork-fn` |
@@ -345,6 +346,14 @@ noise to nine percent. ClojureDart routes its exact-dispatch persistent method
 map through an ordinary world slot; the Dart test suite was unavailable in the
 current environment, so that port still needs verification on a Dart host.
 
+Upstream 0.15.60 moved the methods a SCI type defines for SCI's built-in
+JVM multimethods (`deref`, `invoke`, `toString`, `equals`, `hashCode`,
+`inst-ms*`, ...) out of those process-global host `MultiFn`s into the type's
+metadata. In a forkable context that metadata is the `Type`'s world-local
+data slot, so these methods are now fork-local too. Changing a built-in
+multimethod for any other dispatch value still requires `:unrestricted` and
+then changes the process-global table.
+
 ### Memoization and lazy computation
 
 SCI's `memoize` now closes over a `SciAtom`, so it inherits the parent's cache
@@ -404,6 +413,23 @@ extension installed only after the fork is not retroactively visible through
 that captured instance. Fully solving this requires a managed closure/fiber
 environment or world-routed native protocol dispatch, not a deeper generic
 object copy.
+
+## Upstream fast paths and world selection
+
+Upstream optimizations that touch evaluation must keep a forked child reading
+its own slots. The 0.15.60 merge checked these sites:
+
+| Site | Why it stays world-correct |
+|---|---|
+| Closure copies through `int` index arrays (`analyzer/analyze-fn*`) | Copy only captured locals; captured SCI handles select the world when used |
+| `int` binding indices, `bind-params`, self reference on use | Analysis-time layout only |
+| Inlined `types/eval` (`instance? Eval`, else the value itself) | Every node, including the forkable `VarNode`/`DirectVarNode`, implements `Eval` in its type; nothing is extended to `Eval` by `extend-protocol` |
+| Multi-arity dispatch with precomputed arity fns (`fns/multi-arity-dispatch`) | Each arity fn comes from `fns/fun`, which selects the active world; the dispatcher is registered as an interpreted fn |
+| `invoc-size` nil instead of `zero?` per call (`fns/gen-fn`) | Applied to the forkable and the standard generated bodies alike |
+| `try` extent in a `ThreadLocal` cell instead of `*in-try*` | Only decides error wrapping; restored by `finally` on the evaluating thread |
+| Tag class read at analysis (`eval-instance-method-invocation`) | A host class, the same in every world |
+| Built-in interface methods via `types/type-call` | Reads the `Type`'s metadata, its world-local data slot |
+| `:env` as an `Env` record (JVM) | Every env update is `assoc`/`update` of its keys, so the record survives; a fork copies the record value inside the copy section |
 
 ## Longer-term definition identity
 
