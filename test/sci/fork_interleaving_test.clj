@@ -312,3 +312,22 @@
             ctx (forkable {:namespaces {'host {'done done}}})
             _ (sci/eval-string* ctx "(def done host/done)")]
         (is (identical? done (sci/eval-string* (sci/fork ctx) "done")))))))
+
+(deftest a-var-watch-may-wait-for-a-redefinition
+  ;; Standard contexts keep their behaviour (no SCI lock around a def, whose
+  ;; watches run at once); in a forkable one watches run after the def's
+  ;; stripe and publication are released.
+  (doseq [opts [{} {:runtime-mode :forkable}]]
+  (let [ctx (sci/init opts)
+        _ (sci/eval-string* ctx "(def x 0)")
+        redefined (promise)
+        x (sci/eval-string* ctx "#'x")]
+    (add-watch x ::redefine
+               (fn [_ _ _ n]
+                 (when (= 1 n)
+                   (let [done (promise)]
+                     (.start (Thread. ^Runnable #(deliver done (sci/eval-string* ctx "(def x 2)"))))
+                     (deliver redefined (deref done 2000 ::timeout))))))
+    (sci/eval-string* ctx "(def x 1)")
+    (is (not= ::timeout (deref redefined 5000 ::no-watch)) (pr-str opts))
+    (is (= 2 (sci/eval-string* ctx "x"))))))

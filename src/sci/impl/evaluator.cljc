@@ -36,15 +36,22 @@
             (do (utils/check-namespace-writable! ctx @env cnn)
                 (let [m (meta prev)]
                   (lang/->Var prev var-name m false false nil (:ns m) false))))]
-    ;; Value and metadata are one publication (Var watches run after it),
-    ;; and one definition's pair is never interleaved with another's.
-    (world/publishing-in (:sci.impl/world ctx)
-                         #(world/with-handle-lock
-                            v
-                            (fn []
-                              (when-not (identical? utils/var-unbound init)
-                                (vars/bindRoot v init))
-                              (utils/reset-meta!* v m))))
+    (if-let [world (:sci.impl/world ctx)]
+      ;; Value and metadata are one publication, and one definition's pair is
+      ;; never interleaved with another's. Var watches (user code) are
+      ;; deferred by the publication until after both the stripe and the
+      ;; section are released.
+      (world/publishing-in world
+                           #(world/with-handle-lock
+                              v
+                              (fn []
+                                (when-not (identical? utils/var-unbound init)
+                                  (vars/bindRoot v init))
+                                (utils/reset-meta!* v m))))
+      ;; Standard contexts: SCI's plain behaviour, no lock; watches run at once.
+      (do (when-not (identical? utils/var-unbound init)
+            (vars/bindRoot v init))
+          (utils/reset-meta!* v m)))
     ;; The mapping follows its slots. Outside the publication: watches and a
     ;; validator on the env atom are user code.
     (swap! env assoc-in [:namespaces cnn var-name] v)
