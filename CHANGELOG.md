@@ -12,6 +12,8 @@ SCI is used in [babashka](https://github.com/babashka/babashka),
 
 ## Unreleased
 
+## 0.15.59-replikativ.9
+
 - Read-only host namespaces (off by default): a namespace whose object
   carries `:sci/built-in` metadata, e.g. `(sci/create-ns 'lib {:sci/built-in
   true})` as the `:obj` of its `:namespaces` or `add-namespace!` map, refuses
