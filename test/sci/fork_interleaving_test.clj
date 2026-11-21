@@ -349,3 +349,15 @@
     (is (collected? [@captured]) "the owner's entry for the retired world was released")
     (is (some? @held))
     (is (= :parent-live (sci/eval-string* parent ":parent-live")))))
+
+(deftest a-related-world-without-the-vars-slot-consults-its-home
+  (let [p (forkable {})
+        c (sci/fork p)
+        v (sci/eval-string* c "(intern 'user 'child-only 123)")]
+    (is (= 123 (sci/call-with-context p #(deref v))) "the open home's value")
+    (sci/retire! c)
+    (is (re-find #"retired" (str (try (sci/call-with-context p #(deref v))
+                                      (catch Exception e (ex-message e))))))
+    (let [sibling (sci/fork p)]
+      (is (re-find #"retired" (str (try (sci/call-with-context sibling #(deref v))
+                                        (catch Exception e (ex-message e)))))))))

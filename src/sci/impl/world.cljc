@@ -620,22 +620,44 @@
           (if (identical? absent v) fallback v))))
     fallback))
 
+(defn- var-slot-read
+  "Read a Var's value or meta slot in its selected world. When that world
+   (a related one: parent, sibling) has no realization of the Var, its home
+   world answers: its value while open, the retired error once retired,
+   never the Var's raw root."
+  [handle fallback slot-key]
+  (let [ctx (selected-var-ctx handle)
+        ^ReadWorld active (:sci.impl/read-world ctx)]
+    (if (nil? active)
+      fallback
+      (let [^DenseWorld world (.-world active)
+            slot (slot-key (descriptor world handle))
+            home (when-not (present-slot? world slot) (-world-home-ctx handle))
+            ^ReadWorld home-read (:sci.impl/read-world home)]
+        (if (and home-read (not (identical? world (.-world home-read))))
+          (let [^DenseWorld home-world (.-world home-read)]
+            (with-world-access
+             home-world
+             #(if (.-primary? home-read)
+                fallback
+                (slot-value home-world slot fallback))))
+          (with-world-access
+           world
+           #(if (.-primary? active)
+              fallback
+              (slot-value world slot fallback))))))))
+
 (defn var-value
   "Primary contexts retain their direct Var realization. Descendants resolve
   the stable Var handle through its dense lineage slot."
   [handle fallback]
-  (let [ctx (selected-var-ctx handle)
-        active (:sci.impl/read-world ctx)]
-    (if (nil? active)
-      fallback
-      (let [world (.-world ^ReadWorld active)]
-        (with-world-access
-         world
-         #(if (.-primary? ^ReadWorld active)
-            fallback
-            (slot-value world (:value-slot (descriptor world handle)) fallback)))))))
+  (var-slot-read handle fallback :value-slot))
 
-(defn var-meta [handle fallback]
+(defn var-meta
+  "A Var's metadata in its selected world. Unlike its value, metadata without
+   a realization there falls back to the Var's own field (name, namespace),
+   so printing a retired world's Var still works."
+  [handle fallback]
   (let [ctx (selected-var-ctx handle)
         active (:sci.impl/read-world ctx)]
     (if (nil? active)
