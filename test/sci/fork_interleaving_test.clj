@@ -278,3 +278,37 @@
     (sci/retire! child)
     (is (collected? [@captured]) "the initial value and what it captures are collected")
     (is (= :parent-live (sci/eval-string* parent ":parent-live")))))
+
+(deftest a-core-future-with-an-untrusted-delegate-is-never-asked-whether-it-is-done
+  ;; clojure.core/future delegates isDone to what the send-off executor's
+  ;; submit returned; a custom executor can return any Future.
+  (let [called (atom 0)
+        original clojure.lang.Agent/soloExecutor
+        executor (proxy [java.util.concurrent.AbstractExecutorService] []
+                   (execute [^Runnable r] (.start (Thread. r)))
+                   (submit [task]
+                     ;; on its own thread: the task resets its thread's binding frame
+                     (let [t (proxy [java.util.concurrent.FutureTask] [^java.util.concurrent.Callable task]
+                               (isDone [] (swap! called inc) true))]
+                       (.start (Thread. ^Runnable t))
+                       t))
+                   (shutdown [])
+                   (shutdownNow [] [])
+                   (isShutdown [] false)
+                   (isTerminated [] false)
+                   (awaitTermination [_ _] true))
+        task (try (set-agent-send-off-executor! executor)
+                  (future :host-value)
+                  (finally (set-agent-send-off-executor! original)))
+        ctx (forkable {:namespaces {'host {'task task}}})
+        _ (sci/eval-string* ctx "(def task host/task)")
+        child (sci/fork ctx)]
+    (is (zero? @called) "the delegate's isDone was not called")
+    (is (= :sci/forked-future
+           (sci/eval-string* child "(try @task (catch Exception e (:type (ex-data e))))")))
+    (testing "a core future over a FutureTask is still trusted"
+      (let [done (future :done)
+            _ (deref done 5000 :timeout)
+            ctx (forkable {:namespaces {'host {'done done}}})
+            _ (sci/eval-string* ctx "(def done host/done)")]
+        (is (identical? done (sci/eval-string* (sci/fork ctx) "done")))))))

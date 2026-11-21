@@ -29,7 +29,7 @@ SCI is used in [babashka](https://github.com/babashka/babashka),
   completed future whose deref throws ex-data `{:type :sci/forked-future}`
   (`realized?`/`future-done?` true, `future-cancelled?` false); one completed
   before the cut forks as its value or failure. Only trusted futures
-  (`FutureTask`, `CompletableFuture`, `clojure.core/future`) are asked
+  (exactly `FutureTask` or `CompletableFuture`, or a `clojure.core/future` whose delegate is one of those) are asked
   whether they are done; any other Future forks as forked. Host futures are
   not part of the consistent cut: each is classified when the copy reads it.
   The parent's task is never waited for, re-run or changed.

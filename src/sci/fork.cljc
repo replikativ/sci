@@ -19,17 +19,45 @@
 (def ^:no-doc ^:dynamic *done-at-cut* nil)
 
 #?(:clj
+   (defn- exact-trusted-future-class? [^Class c]
+     (or (identical? c java.util.concurrent.FutureTask)
+         (identical? c java.util.concurrent.CompletableFuture))))
+
+#?(:clj
+   (def ^:private future-call-delegate-fields
+     ;; the future-call wrapper class -> its captured `fut` field (or ::none)
+     (java.util.concurrent.ConcurrentHashMap.)))
+
+#?(:clj
+   (defn- future-call-delegate
+     "The Future a clojure.core/future wrapper delegates to, read from its
+      captured field (no method of it is called), or nil."
+     [value]
+     (let [c (class value)
+           field (or (.get ^java.util.concurrent.ConcurrentHashMap future-call-delegate-fields c)
+                     (let [f (try (doto (.getDeclaredField ^Class c "fut")
+                                    (.setAccessible true))
+                                  (catch Exception _ ::none))]
+                       (.put ^java.util.concurrent.ConcurrentHashMap future-call-delegate-fields c f)
+                       f))]
+       (when (instance? java.lang.reflect.Field field)
+         (.get ^java.lang.reflect.Field field value)))))
+
+#?(:clj
    (defn ^:no-doc trusted-future?
      "Futures whose isDone is a plain volatile read, safe to call while the
       copy section excludes every writer: exactly FutureTask and
-      CompletableFuture (subclasses may override isDone), and the future-call
-      wrapper clojure.core/future returns (it delegates to a FutureTask). Any
-      other Future's isDone is host code and is never called by a fork."
+      CompletableFuture (subclasses may override isDone), and a
+      clojure.core/future wrapper whose delegate (what the send-off
+      executor's submit returned) is exactly one of those. Any other Future's
+      isDone is host code and is never called by a fork."
      [value]
      (let [c (class value)]
-       (or (identical? c java.util.concurrent.FutureTask)
-           (identical? c java.util.concurrent.CompletableFuture)
-           (.startsWith (.getName ^Class c) "clojure.core$future_call$reify")))))
+       (or (exact-trusted-future-class? c)
+           (and (.startsWith (.getName ^Class c) "clojure.core$future_call$reify")
+                (let [delegate (future-call-delegate value)]
+                  (and (some? delegate)
+                       (exact-trusted-future-class? (class delegate)))))))))
 
 #?(:clj
    (defn- forked-future-error []

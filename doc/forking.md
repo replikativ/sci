@@ -65,7 +65,7 @@ This shape combines four useful precedents:
   sequence still being realized forks as pending. A JVM Future held in the
   world forks by its state when the copy reads it: a trusted Future
   (exactly `FutureTask` or `CompletableFuture`, or one from
-  `clojure.core/future`) that is done is shared with its value, failure or
+  `clojure.core/future` whose delegate is one of those) that is done is shared with its value, failure or
   cancellation; a pending one, or any other Future (its `isDone` is host code
   and is never called), forks as a completed future whose `deref`/`.get`
   throws an ex-info with ex-data `{:type :sci/forked-future}` (`realized?`
