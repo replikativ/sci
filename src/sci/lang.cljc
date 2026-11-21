@@ -186,11 +186,16 @@
     ;; A Var can be marked ^:dynamic after this read site was analyzed. Keep
     ;; the same late binding-frame check as deref while retaining the resolved
     ;; root slot for the common non-dynamic case.
-    (if thread-bound
-      (if-let [tbox (vars/get-thread-binding this)]
-        (types/getVal tbox)
-        (world/var-value-at slot root))
-      (world/var-value-at slot root)))
+    (let [x (if thread-bound
+              (if-let [tbox (vars/get-thread-binding this)]
+                (types/getVal tbox)
+                (world/var-value-at slot root))
+              (world/var-value-at slot root))]
+      (if (identical? x world/absent)
+        ;; no realization in the active world: the full read consults the
+        ;; Var's home (its value, or the retired error)
+        (world/var-value this root)
+        x)))
   (toSymbol [this]
     ;; if we have at least a name from metadata, then build the symbol from that
     (let [current-meta (if world-tracked (world/var-meta this meta) meta)]

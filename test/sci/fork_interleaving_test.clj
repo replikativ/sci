@@ -362,6 +362,30 @@
       (is (re-find #"retired" (str (try (sci/call-with-context sibling #(deref v))
                                         (catch Exception e (ex-message e)))))))))
 
+(deftest compiled-var-reads-in-a-related-world-consult-the-home
+  ;; A fn compiled in child c reads x through its slot (VarNode) and calls
+  ;; target through getRootAt. Run in a sibling that has no realization of
+  ;; them, both answer from their home world, or refuse once it is retired.
+  (let [p (forkable {})
+        older (sci/fork p)
+        c (sci/fork p)
+        [f g] (sci/eval-string* c "(def x 123) (def target (fn [] 456)) [(fn [] x) (fn [] (target))]")
+        newer (sci/fork p)
+        descendant (sci/fork c)
+        attempt (fn [ctx h] (try (sci/call-with-context ctx h)
+                                 (catch Exception e (if (re-find #"retired" (str (ex-message e)))
+                                                      :retired
+                                                      (str (class e) ": " (ex-message e))))))]
+    (doseq [[label ctx] [[:older older] [:newer newer] [:descendant descendant]]]
+      (is (= 123 (attempt ctx f)) (str label " value read"))
+      (is (= 456 (attempt ctx g)) (str label " call through the Var")))
+    (sci/retire! c)
+    (doseq [[label ctx] [[:older older] [:newer newer]]]
+      (is (= :retired (attempt ctx f)) (str label " value read after retire"))
+      (is (= :retired (attempt ctx g)) (str label " call after retire")))
+    (is (= [123 456] [(attempt descendant f) (attempt descendant g)])
+        "a descendant keeps its own copies")))
+
 (deftest a-host-read-racing-retirement-never-sees-a-cleared-array
   (let [p (forkable {})
         c (sci/fork p)

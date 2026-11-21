@@ -612,14 +612,16 @@
     fallback))
 
 (defn var-value-at
-  "Read a Var through a slot already resolved by the analyzer."
+  "Read a Var through a slot already resolved by the analyzer: its value in
+   the active world, `absent` when that world has no realization of it (the
+   caller then reads the Var fully, which consults its home), or `fallback`
+   outside a forked world."
   [slot fallback]
   (if-let [holder (execution/active-cells-holder)]
     (let [cells @holder]
       (if (>= slot (cells-length cells))
-        fallback
-        (let [v (cells-get cells slot)]
-          (if (identical? absent v) fallback v))))
+        absent
+        (cells-get cells slot)))
     fallback))
 
 (declare read-through-home)

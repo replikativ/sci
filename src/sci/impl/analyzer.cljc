@@ -78,7 +78,12 @@
                (when holder (.deref holder))]
            (if (nil? holder)
              (.getDirectRoot v)
-             (.selectRoot v (.get cells slot)))))
+             (let [x (if (< slot (.length cells)) (.get cells slot) world/absent)]
+               (if (identical? x world/absent)
+                 ;; no realization in this world (a related world): the
+                 ;; full read consults the Var's home
+                 (.getDirectRoot v)
+                 (.selectRoot v x))))))
        sci.impl.types/Stack
        (stack [_] nil))))
 
