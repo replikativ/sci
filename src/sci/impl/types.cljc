@@ -141,7 +141,7 @@
    (defmacro type-call
      "Calls the method stored under k in the definition of the SCI type t (`sci.impl.world/type-data-of`) with this and args, or the :default method of multifn if absent."
      [multifn k t this & args]
-     `(let [f# (sci.impl.world/type-method ~t ~k)]
+     `(let [f# (get (sci.impl.world/-data-for ~t) ~k)]
         (if (nil? f#)
           ((.getMethod ~(with-meta multifn {:tag 'clojure.lang.MultiFn}) :default) ~this ~@args)
           (f# ~this ~@args)))))

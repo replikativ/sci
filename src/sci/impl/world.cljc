@@ -763,6 +763,8 @@
       absent
       v)))
 
+(declare type-data-at)
+
 (defn type-data-of
   "A SCI Type's data, which holds the built-in interface methods of its
    instances (`types/type-call`):
@@ -779,9 +781,17 @@
   [handle instance-call? fallback]
   (if-not (-world-tracked? handle)
     fallback
+    (let [home-ctx (-world-home-ctx handle)]
+      (type-data-at handle (when home-ctx (:sci.impl/read-world home-ctx))
+                    instance-call? fallback))))
+
+(defn type-data-at
+  "`type-data-of` for a type known to be tracked, with its home's ReadWorld
+   (nil when it has no unambiguous home): `sci.lang.Type` calls this with
+   the home it holds, the hot path of every type method call."
+  [handle ^ReadWorld home instance-call? fallback]
+  (do
     (let [active (active-world-state)
-          home-ctx (-world-home-ctx handle)
-          ^ReadWorld home (when home-ctx (:sci.impl/read-world home-ctx))
           aw (when active (.-world ^ReadWorld active))]
       (if (and active (.-primary? ^ReadWorld active)
                home (identical? aw (.-world home)))

@@ -25,12 +25,13 @@
 
 (deftype ^{:doc "Representation of a SCI custom type, created e.g. with `(defrecord Foo [])`. The fields of this type are implementation detail and should not be accessed directly."}
     Type [#?(:cljd ^:mutable data :clj ^:volatile-mutable data :cljs ^:volatile-mutable data)
-          ;; an atom of the context of the world that defined the type (its
-          ;; home), true when defined in unrelated lineages, nil if never
+          ;; an atom of the home, the world that defined the type: [its
+          ;; context, its ReadWorld], true when defined in unrelated
+          ;; lineages, nil if never defined in a world
           home]
   world/IWorldTracked
-  (-world-tracked? [_] (boolean @home))
-  (-world-home-ctx [_] (let [h @home] (when (map? h) h)))
+  (-world-tracked? [_] (some? @home))
+  (-world-home-ctx [_] (let [h @home] (when (vector? h) (nth h 0))))
   (-mark-world-tracked! [_ home-ctx]
     ;; Elected by CAS: the first definer wins; a definition in an unrelated
     ;; lineage leaves no unambiguous home (reads fall back to the host field).
@@ -38,15 +39,24 @@
       (let [current @home]
         (cond
           (nil? current)
-          (when-not (compare-and-set! home nil (or home-ctx true)) (recur))
-          (and (map? current) home-ctx
-               (not (identical? (:sci.impl/lineage current)
+          (when-not (compare-and-set! home nil
+                                      (if home-ctx
+                                        [home-ctx (:sci.impl/read-world home-ctx)]
+                                        true))
+            (recur))
+          (and (vector? current) home-ctx
+               (not (identical? (:sci.impl/lineage (nth current 0))
                                 (:sci.impl/lineage home-ctx))))
           (when-not (compare-and-set! home current true) (recur)))))
     true)
   world/ITypeData
   (-data-for [this]
-    (world/type-data-of this true data))
+    ;; the hot path of type methods: a type never defined in a world (all of
+    ;; :standard mode) answers from its host field at once
+    (let [h @home]
+      (if (nil? h)
+        data
+        (world/type-data-at this (when (vector? h) (nth h 1)) true data))))
   (-own-data [this clone]
     (world/own-type-data this data clone))
   (-own-data! [this clone]
@@ -57,7 +67,7 @@
   (-mirror-root! [_ v] (set! data v))
   (-mirror-meta! [_ m] (set! data m))
   sci.impl.types/IBox
-  (getVal [this] (world/type-data this data))
+  (getVal [this] (let [h @home] (if (nil? h) data (world/type-data-at this (when (vector? h) (nth h 1)) false data))))
   (setVal [this v]
     (if (world/current-world)
       (do
@@ -71,18 +81,18 @@
     ;; The name never changes and the host field always has it, so printing
     ;; a type works without its world (also once that world is retired).
     (str (or (:sci.impl/type-name data)
-             (:sci.impl/type-name (world/type-data this data)))))
+             (:sci.impl/type-name (let [h @home] (if (nil? h) data (world/type-data-at this (when (vector? h) (nth h 1)) false data)))))))
 
   ;; meta is only supported to get our implementation! keys out
   #?@(:cljd
       [IMeta
-       (-meta [this] (world/type-data this data))]
+       (-meta [this] (let [h @home] (if (nil? h) data (world/type-data-at this (when (vector? h) (nth h 1)) false data))))]
       :clj
       [clojure.lang.IMeta
-       (meta [this] (world/type-data this data))]
+       (meta [this] (let [h @home] (if (nil? h) data (world/type-data-at this (when (vector? h) (nth h 1)) false data))))]
       :cljs
       [IMeta
-       (-meta [this] (world/type-data this data))])
+       (-meta [this] (let [h @home] (if (nil? h) data (world/type-data-at this (when (vector? h) (nth h 1)) false data))))])
 
   ;; support alter-meta! for storing print-method etc.
   #?@(:cljd
