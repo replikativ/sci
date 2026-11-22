@@ -8,7 +8,7 @@
         :url "https://github.com/replikativ/sci"
         :connection "scm:git:https://github.com/replikativ/sci.git"
         :developerConnection "scm:git:ssh://git@github.com/replikativ/sci.git"
-        :tag "replikativ-v0.15.59.9"}
+        :tag "replikativ-v0.15.60.1"}
   :license {:name "Eclipse Public License 1.0"
             :url "http://opensource.org/licenses/eclipse-1.0.php"}
   :source-paths ["src"]

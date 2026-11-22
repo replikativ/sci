@@ -12,6 +12,8 @@ SCI is used in [babashka](https://github.com/babashka/babashka),
 
 ## Unreleased
 
+## 0.15.60-replikativ.1
+
 - Merge upstream SCI 0.15.60 and master through `be4048ec` (the `Env`
   record, #1144); see the 0.15.60 section below for upstream's changes. All
   of them apply to forkable worlds too:
@@ -53,7 +55,6 @@ SCI is used in [babashka](https://github.com/babashka/babashka),
     still selects the active world's slots.
   - The context's `:env` holds an `Env` record on the JVM; a fork's
     namespace snapshot keeps that record.
-- The SCI version stays `0.15.59-replikativ.9` until the next release.
 
 ### Known issues
 
