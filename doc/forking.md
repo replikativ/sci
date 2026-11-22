@@ -179,7 +179,11 @@ prototype), so it never alters another world's type. Once the home is
 retired, user methods are refused with the retired error (an instance used as
 a host map key must not outlive its type's home), printing falls back to the
 default form without calling user code, and record `hash`/`=` stay
-field-based. ClojureDart's exact-dispatch SCI multimethod
+field-based. Printing renders the whole form first and prints the fallback
+instead if it meets any retired world on the way (a mutable field is managed
+in the world that constructed the instance). Only evaluating a `deftype`
+defines a type in a world; registering an existing type in a context
+(`:namespaces`, `merge-opts`) does not. ClojureDart's exact-dispatch SCI multimethod
 tables are fork-local as well. SCI deftypes that declare mutable fields route
 their persistent field map through a managed world slot, so state diverges
 even when an instance is captured by a closure or nested in a persistent

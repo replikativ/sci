@@ -217,9 +217,12 @@
        (let [p (forkable)
              _ (sci/eval-string* p "(deftype P [x])")
              c (sci/fork p)
+             ;; the method reads an atom of the child (captured: a CLJS
+             ;; JIT-compiled fn called from the host does not enter its
+             ;; world, so a Var read would not see the child's value)
              d (sci/eval-string*
-                c "(def tag \"<P>\")
-                   (extend-type P IPrintWithWriter (-pr-writer [_ w _] (-write w tag)))
+                c "(let [tag (atom \"<P>\")]
+                     (extend-type P IPrintWithWriter (-pr-writer [_ w _] (-write w @tag))))
                    (->P 1)")]
          (is (= "<P>" (pr-str d)))
          (sci/retire! c)

@@ -34,9 +34,14 @@ SCI is used in [babashka](https://github.com/babashka/babashka),
     (`#object[user.D 0x… "retired SCI world"]`, `#user.R{…}`) without
     calling user code, also when the home is retired while printing; record
     `hash`/`=` stay field-based. An instance does not retain the world that
-    constructed it. A delayed `deftype` (inside a fn) defines exactly the
-    type it was analysed with, in its own namespace, and only a definition
-    (never a declaration, e.g. on `merge-opts`) elects the home, atomically.
+    constructed it. A `deftype`/`defrecord` defines exactly the type its
+    analysis created (also when delayed inside a fn, called from another
+    namespace, or when the name is redefined meanwhile), in its own
+    namespace; only that definition elects the home, atomically.
+    Registering an existing type (`init`/`merge-opts` `:namespaces`) never
+    defines it in a world nor changes its home. Printing renders the whole
+    form or, if a retired world is met while rendering (also a mutable
+    field managed in a retired world), the fallback.
   - The `:unrestricted` requirement for built-in multimethods and the
     `:deny` checks on namespace introspection (`ns-publics`, `ns-interns`,
     `ns-refers`, `ns-map`, `find-var`, `intern`, `alias`, `require :as`,

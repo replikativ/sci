@@ -391,7 +391,9 @@
        (some (fn [field]
                (let [m (meta field)]
                  (or (:volatile-mutable m)
-                     (:unsynchronized-mutable m))))
+                     (:unsynchronized-mutable m)
+                     ;; the CLJS spelling
+                     (:mutable m))))
              (:sci.impl/fields (world/-data-for type)))))
 
 (defn ->type-impl [rec-name type type-meta m]
