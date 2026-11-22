@@ -63,7 +63,8 @@
       `sci.lang.Var` and `sci.lang.Type` are in the default `:classes` (for
       `instance?` and type hints), so every reflective member access below
       refuses these classes: an instance call resolves against
-      `java.lang.Object` only (plus the read-only `getName`), and their constructors, fields and static
+      `java.lang.Object` and `internal-instance-methods` only, and their
+      constructors, fields (but a Var's `sym` and `ns`) and static
       members are not reachable. Host overrides in `:classes` (fns) are
       host code and still apply."
      #{"sci.lang.Var" "sci.lang.Namespace" "sci.lang.Type" "sci.lang.IVar"
@@ -85,6 +86,24 @@
      (throw (IllegalArgumentException.
              (str member " on SCI internal class " (.getName c) " not allowed!")))))
 
+#?(:clj
+   (def ^:private internal-instance-methods
+     "Instance methods interop may call on SCI's internal classes, besides
+      `java.lang.Object`'s: the public Clojure read/call interfaces
+      (`IDeref`, `IFn`, `IMeta`) and read-only accessors (`getName`; a Var's
+      `hasRoot`, `getRawRoot`, `toSymbol`). They are the same checked paths a
+      deref, call or `meta` takes: world-relative reads, no write."
+     #{"deref" "invoke" "applyTo" "call" "run" "meta"
+       "getName" "hasRoot" "getRawRoot" "toSymbol"}))
+
+#?(:clj
+   (defn internal-instance-field?
+     "The public fields interop may read on a SCI internal class: a Var's
+      immutable `sym` and `ns` (a namespace, whose interop stays closed)."
+     [^Class c ^String field-name]
+     (and (= "sci.lang.Var" (.getName c))
+          (contains? #{"sym" "ns"} field-name))))
+
 ;; Reflector functions
 
 #?(:clj
@@ -96,9 +115,8 @@
      [^Class c arity ^String method-name static?]
      (if (internal-class? c)
        (cond static? (refuse-internal c (str "Method " method-name))
-             ;; the read-only name a Type answers like a Class (also a
-             ;; Var's and namespace's name)
-             (= "getName" method-name) (Reflector/getMethods c arity method-name false)
+             (contains? internal-instance-methods method-name)
+             (Reflector/getMethods c arity method-name false)
              :else (Reflector/getMethods Object arity method-name false))
        (Reflector/getMethods c arity method-name static?))))
 

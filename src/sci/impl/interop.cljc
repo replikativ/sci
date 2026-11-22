@@ -15,7 +15,8 @@
    (defn get-instance-field
      "This function resolves a public non-static field on target-class."
      [^Class target-class ^String field-name]
-     (when (reflector/internal-class? target-class)
+     (when (and (reflector/internal-class? target-class)
+                (not (reflector/internal-instance-field? target-class field-name)))
        (throw (IllegalArgumentException.
                (str "Field " field-name " on SCI internal class "
                     (.getName target-class) " not allowed!"))))

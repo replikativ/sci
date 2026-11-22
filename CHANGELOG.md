@@ -60,14 +60,25 @@ SCI is used in [babashka](https://github.com/babashka/babashka),
   interop and rebind it for every context (also in 0.15.60-replikativ.1,
   through the mirror methods). Reflective interop now treats `sci.lang.Var`,
   `Namespace`, `Type` and the interfaces of SCI's internal protocols as
-  closed: an instance call resolves against `java.lang.Object` only
-  (`toString`, `hashCode`, `equals`, `getClass`) plus the read-only
-  `getName` (a Type's name, like a Class's), and their constructors,
-  fields and static members are refused, also through type hints and
-  `Class/.method` / `Class/new` values. `instance?` and type hints keep
-  working; host `:classes` overrides (fns) still apply. On CLJS, member
-  access, method calls and `set!` on a SCI Var, namespace or Type (or their
-  constructors) and constructing them are refused, except `toString`.
+  closed, also through type hints and `Class/.method` / `Class/new` values.
+  On these classes an instance call may only resolve to:
+  - `java.lang.Object`'s methods (`toString`, `hashCode`, `equals`,
+    `getClass`);
+  - the public Clojure read/call interfaces `clojure.lang.IDeref` (`deref`),
+    `IFn` (`invoke`, `applyTo`, `call`, `run`) and `IMeta` (`meta`), which
+    take the same checked, world-relative paths as a deref, call or `meta`
+    (no bypass of `:allow` / `:deny`: interop needs the Var first);
+  - read-only accessors: `getName`, and a Var's `hasRoot`, `getRawRoot`,
+    `toSymbol` and its immutable fields `sym` and `ns` (a namespace, whose
+    interop stays closed).
+
+  Everything else is refused: `IReference` (`alterMeta`, `resetMeta`),
+  `bindRoot`, `setVal`, `unbind`, the internal protocols, constructors,
+  other fields and static members. `instance?`, type hints and host
+  `:classes` override fns keep working. On CLJS (where `sci.lang.Var` was
+  never in the default `:classes`), member access, method calls, `set!` and
+  construction on a SCI Var, namespace or Type (or their constructors) are
+  refused, except `toString`.
 - CLJS: interpreted `alter-meta!` of a type, and a direct
   `sci.impl.deftype/-create-type` call, can no longer replace the type's JS
   prototype, the operand of the fixed type-data copier.
@@ -99,12 +110,15 @@ SCI is used in [babashka](https://github.com/babashka/babashka),
   `:sci/built-in` (use `new-var` for host built-in Vars). A `sci.lang.Var` /
   `sci.lang.Namespace` built with its positional constructor (host code)
   takes one more argument, the built-in flag; use `sci/new-var` and
-  `sci/create-ns`. Interpreted code that called methods of `sci.lang.Var` /
-  `sci.lang.Type` by interop (other than `Object`'s) is refused.
-- Known issues: on CLJS, JS interop the embedder allows (`aset`, `aget`,
-  `goog.object`, `js/Object` functions) can still read and write SCI's
-  internal object fields, so the guarantees above are JVM guarantees there.
-  ClojureDart was not built or tested for this release.
+  `sci/create-ns`. Interpreted interop on SCI Vars, namespaces and Types
+  outside the allowed read/call set above is refused.
+- Known issues: on CLJS, `aset` and `aget` are default SCI core functions,
+  so interpreted code can read and write SCI's internal object fields
+  (e.g. a Var's metadata or built-in flag) by property name in any default
+  context, as in earlier releases; `goog.object` and `js/Object` functions
+  can too where the embedder allows them. The `:sci/built-in` and interop
+  guarantees above are therefore JVM guarantees. ClojureDart was not built
+  or tested for this release.
 
 ## 0.15.60-replikativ.1
 

@@ -289,8 +289,12 @@
       "(._world_home_ctx #'clojure.core/frequencies)"
       "(.setThreadBound #'clojure.core/frequencies true)"
       "(.bindRoot #'clojure.core/frequencies (fn [_] :pwned))"
-      "(.getRawRoot #'clojure.core/frequencies)"
-      "(.-sym #'clojure.core/frequencies)"
+      "(.alterMeta #'clojure.core/frequencies dissoc '(:sci/built-in))"
+      "(.resetMeta #'clojure.core/frequencies {})"
+      "(.setVal #'clojure.core/frequencies (fn [_] :pwned))"
+      "(.unbind #'clojure.core/frequencies)"
+      "(.-root #'clojure.core/frequencies)"
+      "(._set_built_in_BANG_ (.ns #'clojure.core/frequencies) false)"
       "(sci.lang.Var. (fn [_] :pwned) 'f {} false false nil *ns* {:unrestricted true} false)"
       "(sci.lang.Var/new (fn [_] :pwned) 'f {} false false nil *ns* {:unrestricted true} false)"
       "(sci.lang.Var/getBasis)"
@@ -323,6 +327,41 @@
                       (str (refused ctx "(alter-var-root #'clojure.core/frequencies (constantly (fn [_] :pwned)))"))))
          (doseq [c [ctx (sci/init {}) (sci/init {:runtime-mode :forkable})]]
            (is (= {1 2} (sci/eval-string* c "(frequencies [1 1])"))))))))
+
+#?(:clj
+   (deftest interop-keeps-reading-and-calling-vars
+     (doseq [mode [:standard :forkable]
+             [s expected] [["(.hasRoot #'x)" true]
+                           ["(.getRawRoot #'x)" 1]
+                           ["(.deref #'x)" 1]
+                           ["(.invoke #'clojure.core/inc 1)" 2]
+                           ["(.applyTo #'clojure.core/inc '(1))" 2]
+                           ["(:name (.meta #'x))" 'x]
+                           ["(.toSymbol #'x)" 'user/x]
+                           ["(.sym #'x)" 'x]
+                           ["(.-sym #'x)" 'x]
+                           ["(str (.ns #'x))" "user"]
+                           ["(.getName #'x)" 'x]
+                           ["(let [^clojure.lang.IFn f #'clojure.core/inc] (.invoke f 1))" 2]
+                           ["(let [^clojure.lang.IDeref d #'x] (.deref d))" 1]
+                           ["(.hashCode #'x)" ::any]]]
+       (each-route (str (name mode) " " s)
+         ;; library code type-hinted with the interfaces the embedder allows
+         #(let [ctx (sci/init {:runtime-mode mode
+                               :classes {'clojure.lang.IFn clojure.lang.IFn
+                                         'clojure.lang.IDeref clojure.lang.IDeref}})
+                v (sci/eval-string* ctx (str "(def x 1) " s))]
+            (if (= ::any expected) (is (some? v)) (is (= expected v))))))
+     (testing "deref and invoke read the active world"
+       (let [ctx (sci/init {:runtime-mode :forkable})
+             _ (sci/eval-string* ctx "(def x 1) (defn f [] x)")
+             child (sci/fork ctx)]
+         (sci/eval-string* child "(def x 2)")
+         (is (= [1 1] (sci/eval-string* ctx "[(.deref #'x) (.invoke #'f)]")))
+         (is (= [2 2] (sci/eval-string* child "[(.deref #'x) (.invoke #'f)]")))))
+     (testing ":deny still applies: interop needs the Var first"
+       (is (re-find #"not allowed"
+                    (str (refused (sci/init {:deny '[inc]}) "(.invoke #'clojure.core/inc 1)")))))))
 
 (deftest interop-on-internal-objects-keeps-object-methods
   (let [ctx (sci/init {:runtime-mode :forkable})]
