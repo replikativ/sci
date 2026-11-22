@@ -321,9 +321,11 @@
                        (-write writer "#'")
                        (-pr-writer (vars/toSymbol a) writer opts)))
   #?(:cljd IMeta :clj clojure.lang.IMeta :cljs IMeta)
-  #?(:cljd (-meta [this] (if world-tracked (world/var-meta this meta) meta))
-     :clj (clojure.core/meta [this] (if world-tracked (world/var-meta this meta) meta))
-     :cljs (-meta [this] (if world-tracked (world/var-meta this meta) meta)))
+  ;; `:sci/built-in` as the trusted flag says (`vars/flag-meta`), in every
+  ;; world, also one whose metadata predates the flag
+  #?(:cljd (-meta [this] (vars/flag-meta (if world-tracked (world/var-meta this meta) meta) (world/-built-in? this)))
+     :clj (clojure.core/meta [this] (vars/flag-meta (if world-tracked (world/var-meta this meta) meta) (world/-built-in? this)))
+     :cljs (-meta [this] (vars/flag-meta (if world-tracked (world/var-meta this meta) meta) (world/-built-in? this))))
   ;; #?(:clj Comparable :cljs IEquiv)
   ;; (-equiv [this other]
   ;;   (if (instance? Var other)
@@ -334,47 +336,56 @@
   ;;   (hash-symbol sym))
   #?@(:cljd [] :clj [clojure.lang.IReference
                      (alterMeta [this f args]
-                                (world/call-with-var-context
-                                 this
-                                 (fn []
-                                   (let [current-meta (world/var-meta this meta)]
-                                     (vars/with-writeable-var this current-meta
-                                       ;; In a world `f` runs outside every
-                                       ;; world lock; the monitor only orders
-                                       ;; alterMeta callers.
-                                       (locking this
-                                         (vars/sync-built-in!
-                                          this
-                                          (if (world/current-world)
-                                            (world/alter-var-meta! this current-meta f args
-                                                                   (primary-mirror-meta this))
-                                            (set! (.-meta this) (apply f meta args))))))))))
-                     (resetMeta [this m]
-                                (world/call-with-var-context
-                                 this
-                                 (fn []
-                                   (let [current-meta (world/var-meta this meta)]
-                                     (vars/with-writeable-var this current-meta
-                                       ;; No monitor in a world: this may run
-                                       ;; inside a publication (def).
-                                       (if (world/current-world)
-                                         (do (world/reset-var-meta! this m (primary-mirror-meta this))
-                                             (vars/sync-built-in! this m))
+                                ;; provenance before the Var's context is selected
+                                (let [source (vars/meta-write-source)
+                                      f (vars/meta-fn this f source)]
+                                  (world/call-with-var-context
+                                   this
+                                   (fn []
+                                     (let [current-meta (world/var-meta this meta)]
+                                       (vars/with-writeable-var this current-meta
+                                         ;; In a world `f` runs outside every
+                                         ;; world lock; the monitor only orders
+                                         ;; alterMeta callers.
                                          (locking this
-                                           (vars/sync-built-in! this (set! (.-meta this) m)))))))))])
+                                           (vars/commit-built-in!
+                                            this
+                                            (if (world/current-world)
+                                              (world/alter-var-meta! this current-meta f args
+                                                                     (primary-mirror-meta this))
+                                              (set! (.-meta this) (apply f meta args)))
+                                            source))))))))
+                     (resetMeta [this m]
+                                (let [source (vars/meta-write-source)
+                                      m (vars/meta-to-write this m source)]
+                                  (world/call-with-var-context
+                                   this
+                                   (fn []
+                                     (let [current-meta (world/var-meta this meta)]
+                                       (vars/with-writeable-var this current-meta
+                                         ;; No monitor in a world: this may run
+                                         ;; inside a publication (def).
+                                         (if (world/current-world)
+                                           (do (world/reset-var-meta! this m (primary-mirror-meta this))
+                                               (vars/commit-built-in! this m source))
+                                           (locking this
+                                             (vars/commit-built-in! this (set! (.-meta this) m) source)))))))))])
   #?@(:cljd [types/IResetMeta
              (-reset-meta! [this m]
-               (world/call-with-var-context
-                this
-                (fn []
-                  (let [current-meta (world/var-meta this meta)]
-                    (vars/with-writeable-var this current-meta
-                      (vars/sync-built-in!
-                       this
-                       (if (world/current-world)
-                         (do (world/reset-var-meta! this m (primary-mirror-meta this))
-                             m)
-                         (set! (.-meta this) m))))))))
+               (let [source (vars/meta-write-source)
+                     m (vars/meta-to-write this m source)]
+                 (world/call-with-var-context
+                  this
+                  (fn []
+                    (let [current-meta (world/var-meta this meta)]
+                      (vars/with-writeable-var this current-meta
+                        (vars/commit-built-in!
+                         this
+                         (if (world/current-world)
+                           (do (world/reset-var-meta! this m (primary-mirror-meta this))
+                               m)
+                           (set! (.-meta this) m))
+                         source)))))))
              IWatchable
              (-add-watch [this key watch-fn]
                          (world/call-with-var-context
@@ -581,37 +592,45 @@
   (-mirror-root! [_ m] (set! meta m))
   (-mirror-meta! [_ m] (set! meta m))
   #?(:cljd IMeta :clj clojure.lang.IMeta :cljs IMeta)
-  #?(:cljd (-meta [this] (world/namespace-meta this meta))
-     :clj (clojure.core/meta [this] (world/namespace-meta this meta))
-     :cljs (-meta [this] (world/namespace-meta this meta)))
+  #?(:cljd (-meta [this] (vars/flag-meta (world/namespace-meta this meta) (world/-built-in? this)))
+     :clj (clojure.core/meta [this] (vars/flag-meta (world/namespace-meta this meta) (world/-built-in? this)))
+     :cljs (-meta [this] (vars/flag-meta (world/namespace-meta this meta) (world/-built-in? this))))
   #?@(:cljd [types/IResetMeta
              (-reset-meta! [this m]
-               (let [current-meta (world/namespace-meta this meta)]
+               (let [source (vars/meta-write-source)
+                     m (vars/meta-to-write this m source)
+                     current-meta (world/namespace-meta this meta)]
                  (vars/with-writeable-namespace this current-meta
-                   (vars/sync-built-in!
+                   (vars/commit-built-in!
                     this
                     (if (world/current-world)
                       (do (world/reset-namespace-meta! this m (primary-mirror-meta this))
                           m)
-                      (set! meta m))))))]
+                      (set! meta m))
+                    source))))]
       :clj [clojure.lang.IReference
             (alterMeta [this f args]
-                       (let [current-meta (world/namespace-meta this meta)]
+                       (let [source (vars/meta-write-source)
+                             f (vars/meta-fn this f source)
+                             current-meta (world/namespace-meta this meta)]
                          (vars/with-writeable-namespace this current-meta
                            (locking this
-                             (vars/sync-built-in!
+                             (vars/commit-built-in!
                               this
                               (if (world/current-world)
                                 (world/alter-namespace-meta!
                                  this current-meta f args (primary-mirror-meta this))
-                                (set! meta (apply f meta args))))))))
+                                (set! meta (apply f meta args)))
+                              source)))))
             (resetMeta [this m]
-                       (let [current-meta (world/namespace-meta this meta)]
+                       (let [source (vars/meta-write-source)
+                             m (vars/meta-to-write this m source)
+                             current-meta (world/namespace-meta this meta)]
                          (vars/with-writeable-namespace this current-meta
                            (if (world/current-world)
                              (do (world/reset-namespace-meta! this m (primary-mirror-meta this))
-                                 (vars/sync-built-in! this m))
-                             (locking this (vars/sync-built-in! this (set! meta m)))))))]))
+                                 (vars/commit-built-in! this m source))
+                             (locking this (vars/commit-built-in! this (set! meta m) source))))))]))
 
 (defn new-type
   "A SCI type with type data `data` and no home yet."

@@ -51,20 +51,63 @@
                      method))
                  methods))))))
 
+;; SCI's own runtime types
+
+#?(:clj
+   (def ^:private internal-class-names
+     "SCI's runtime types (`sci.lang.Var`, `Namespace`, `Type`) and the
+      interfaces of the internal protocols they implement. Their public Java
+      members include unchecked engine mutators (the trusted built-in flag, a
+      primary world's host mirror, a Var's or Type's home, type data, thread
+      binding state) and the constructors take that state as arguments.
+      `sci.lang.Var` and `sci.lang.Type` are in the default `:classes` (for
+      `instance?` and type hints), so every reflective member access below
+      refuses these classes: an instance call resolves against
+      `java.lang.Object` only (plus the read-only `getName`), and their constructors, fields and static
+      members are not reachable. Host overrides in `:classes` (fns) are
+      host code and still apply."
+     #{"sci.lang.Var" "sci.lang.Namespace" "sci.lang.Type" "sci.lang.IVar"
+       "sci.lang.IWorldMirror"
+       "sci.impl.vars.IVar" "sci.impl.vars.DynVar"
+       "sci.impl.world.IWorldTracked" "sci.impl.world.IBuiltIn"
+       "sci.impl.world.ITypeData" "sci.impl.world.IForkableWorldCache"
+       "sci.impl.world.IWorldCache" "sci.impl.world.IRetainedWorldCache"
+       "sci.impl.types.IBox" "sci.impl.types.HasName"}))
+
+#?(:clj
+   (defn internal-class?
+     "Whether reflective interop must not reach the members of class `c`."
+     [^Class c]
+     (and (some? c) (contains? internal-class-names (.getName c)))))
+
+#?(:clj
+   (defn- refuse-internal [^Class c ^String member]
+     (throw (IllegalArgumentException.
+             (str member " on SCI internal class " (.getName c) " not allowed!")))))
+
 ;; Reflector functions
 
 #?(:clj
    (defn get-methods
      "Get methods matching the given class, arity, method name and static flag.
-      Delegates directly to clojure.lang.Reflector."
+      Delegates directly to clojure.lang.Reflector. On a SCI internal class
+      (`internal-class?`) an instance method resolves against
+      `java.lang.Object` only, and a static one is refused."
      [^Class c arity ^String method-name static?]
-     (Reflector/getMethods c arity method-name static?)))
+     (if (internal-class? c)
+       (cond static? (refuse-internal c (str "Method " method-name))
+             ;; the read-only name a Type answers like a Class (also a
+             ;; Var's and namespace's name)
+             (= "getName" method-name) (Reflector/getMethods c arity method-name false)
+             :else (Reflector/getMethods Object arity method-name false))
+       (Reflector/getMethods c arity method-name static?))))
 
 #?(:clj
    (defn get-static-field
      "Get a static field value from a class.
       Delegates directly to clojure.lang.Reflector."
      [^Class c ^String field-name]
+     (when (internal-class? c) (refuse-internal c (str "Field " field-name)))
      (Reflector/getStaticField c field-name)))
 
 #?(:clj
@@ -72,6 +115,7 @@
      "Invoke a constructor on a class with the given arguments.
       Delegates directly to clojure.lang.Reflector."
      [^Class c args]
+     (when (internal-class? c) (refuse-internal c "Constructor"))
      (Reflector/invokeConstructor c args)))
 
 #?(:clj
@@ -79,6 +123,7 @@
      "Invoke a static method on a class with the given arguments.
       Delegates directly to clojure.lang.Reflector."
      [^Class c ^String method-name ^objects args]
+     (when (internal-class? c) (refuse-internal c (str "Method " method-name)))
      (Reflector/invokeStaticMethod c method-name args)))
 
 #?(:clj
@@ -315,6 +360,7 @@
      "This function selects a constructor in the same way as invoke-constructor.
       It returns [Constructor paramTypes multiple?] but does not invoke the constructor."
      [^Class c ^objects args]
+     (when (internal-class? c) (refuse-internal c "Constructor"))
      (let [ctors (.getConstructors c)
            arg-count (alength args)
            matching (java.util.ArrayList.)]

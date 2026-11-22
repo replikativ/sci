@@ -263,8 +263,9 @@
         ns-map (get-in env* [:namespaces ns-sym])
         ns-obj (or (:obj ns-map)
                    (when (or ns-map create?)
-                     (let [ns-obj (lang/->Namespace ns-sym attr-map
-                                                   (vars/evaluation-built-in attr-map))]
+                     (let [b (vars/evaluation-built-in attr-map)
+                           attr-map (vars/flag-meta attr-map b)
+                           ns-obj (lang/->Namespace ns-sym attr-map b)]
                        ;; Slot first: the mapping makes the namespace
                        ;; reachable (also to a fork).
                        (world/register-namespace! ns-obj attr-map)
@@ -301,7 +302,16 @@
   (let [env (:env ctx)
         attr-map (merge (meta ns-sym) attr-map)
         ns-obj (namespace-object env ns-sym true attr-map)]
-    (when set-meta? (reset-meta!* ns-obj attr-map))
+    ;; the `ns` form's metadata is evaluation's: on CLJS `reset-meta!*`
+    ;; writes the namespace's field directly, so it is made to report the
+    ;; trusted flag here
+    (when set-meta?
+      #?(:cljs (let [source (vars/meta-write-source)]
+                 (vars/commit-built-in!
+                  ns-obj
+                  (reset-meta!* ns-obj (vars/meta-to-write ns-obj attr-map source))
+                  source))
+         :default (reset-meta!* ns-obj attr-map)))
     (t/setVal current-ns ns-obj)))
 
 ;; identity keeps the cljd Volatile type parameter dynamic instead of Null
@@ -438,6 +448,36 @@
 
 (defn sci-type? [x]
   (instance? #?(:cljd lang/Type :clj sci.lang.Type :cljs sci.lang.Type) x))
+
+(defn sci-internal-object?
+  "SCI's own runtime objects (Var, namespace, Type), whose host members
+   include unchecked engine mutators: interop must not reach them."
+  [x]
+  (or (var? x) (namespace? x) (sci-type? x)))
+
+#?(:cljs
+   (defn- internal-constructor? [x]
+     (or (identical? x lang/Var)
+         (identical? x lang/Namespace)
+         (identical? x lang/Type))))
+
+#?(:cljs
+   (defn check-internal-member!
+     "CLJS interop on a SCI runtime object or its constructor (whose
+      prototype holds the engine's methods): only `toString` (JS has no
+      reflection to restrict, so the object itself is checked)."
+     [obj member-name]
+     (when (and (or (sci-internal-object? obj) (internal-constructor? obj))
+                (not= "toString" member-name))
+       (throw (js/Error. (str "Member " member-name
+                              " of a SCI internal object not allowed!"))))))
+
+#?(:cljs
+   (defn check-internal-constructor!
+     "SCI's runtime types take engine state as constructor arguments."
+     [constructor]
+     (when (internal-constructor? constructor)
+       (throw (js/Error. "Constructor of a SCI internal type not allowed!")))))
 
 (defmacro dotimes+ [n body]
   `(do (dotimes [i# ~(dec n)]

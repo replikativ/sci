@@ -697,8 +697,8 @@
           (let [_ (sci.impl.utils/check-namespace-writable! ctx @env ns-name)
                 m (assoc (meta var-sym) :ns ns)
                 ;; the name symbol's metadata is evaluation's: untrusted
-                new-var (sci.impl.utils/new-var var-sym nil m
-                                                (sci.impl.vars/evaluation-built-in m))]
+                b (sci.impl.vars/evaluation-built-in m)
+                new-var (sci.impl.utils/new-var var-sym nil (sci.impl.vars/flag-meta m b) b)]
             (sci.impl.vars/unbind new-var)
             (swap! env assoc-in [:namespaces ns-name var-sym] new-var)
             new-var)))))
@@ -719,8 +719,9 @@
                 ;; lineage's lifetime, which must not retain the child's value.
                 child? (and (:sci.impl/world ctx) (not (world/primary-world?)))
                 m (assoc (meta var-sym) :ns ns)
-                new-var (sci.impl.utils/new-var var-sym (when-not child? val) m
-                                                (sci.impl.vars/evaluation-built-in m))]
+                b (sci.impl.vars/evaluation-built-in m)
+                new-var (sci.impl.utils/new-var var-sym (when-not child? val)
+                                                (sci.impl.vars/flag-meta m b) b)]
             ;; Slots first: the mapping makes the Var reachable.
             (if child?
               (world/register-var! new-var val (meta new-var))
@@ -1250,26 +1251,32 @@
        (apply refs/alter-meta!* iref f args)
        (cond
          (utils/namespace? iref)
-         (let [current-meta (meta iref)]
+         (let [current-meta (meta iref)
+               source (vars/meta-write-source)
+               f (vars/meta-fn iref f source)]
            (vars/with-writeable-namespace iref current-meta
-             (vars/sync-built-in!
+             (vars/commit-built-in!
               iref
               (if (world/current-world)
                 (world/alter-namespace-meta!
                  iref current-meta f args
                  (when (world/primary-world?) #(sci.lang/-mirror-meta! iref %)))
-                (apply cljs.core/alter-meta! iref f args)))))
+                (apply cljs.core/alter-meta! iref f args))
+              source)))
 
          (utils/var? iref)
-         (let [current-meta (meta iref)]
+         (let [current-meta (meta iref)
+               source (vars/meta-write-source)
+               f (vars/meta-fn iref f source)]
            (vars/with-writeable-var iref current-meta
-             (vars/sync-built-in!
+             (vars/commit-built-in!
               iref
               (if (world/current-world)
                 (world/alter-var-meta!
                  iref current-meta f args
                  (when (world/primary-world?) #(sci.lang/-mirror-meta! iref %)))
-                (apply cljs.core/alter-meta! iref f args)))))
+                (apply cljs.core/alter-meta! iref f args))
+              source)))
 
          (utils/sci-type? iref)
          ;; this world's own data, copied first (with its own JS prototype)
@@ -1291,26 +1298,32 @@
        (refs/reset-meta!* iref m)
        (cond
          (utils/namespace? iref)
-         (let [current-meta (meta iref)]
+         (let [current-meta (meta iref)
+               source (vars/meta-write-source)
+               m (vars/meta-to-write iref m source)]
            (vars/with-writeable-namespace iref current-meta
-             (vars/sync-built-in!
+             (vars/commit-built-in!
               iref
               (if (world/current-world)
                 (do (world/reset-namespace-meta!
                      iref m (when (world/primary-world?) #(sci.lang/-mirror-meta! iref %)))
                     m)
-                (cljs.core/reset-meta! iref m)))))
+                (cljs.core/reset-meta! iref m))
+              source)))
 
          (utils/var? iref)
-         (let [current-meta (meta iref)]
+         (let [current-meta (meta iref)
+               source (vars/meta-write-source)
+               m (vars/meta-to-write iref m source)]
            (vars/with-writeable-var iref current-meta
-             (vars/sync-built-in!
+             (vars/commit-built-in!
               iref
               (if (world/current-world)
                 (do (world/reset-var-meta!
                      iref m (when (world/primary-world?) #(sci.lang/-mirror-meta! iref %)))
                     m)
-                (cljs.core/reset-meta! iref m)))))
+                (cljs.core/reset-meta! iref m))
+              source)))
 
          :else
          (cljs.core/reset-meta! iref m)))))

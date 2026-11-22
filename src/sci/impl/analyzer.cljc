@@ -935,7 +935,7 @@
                                       nil
                                       @utils/current-ns
                                       false
-                                      ;; untrusted: see vars/sync-built-in!
+                                      ;; untrusted: see vars/commit-built-in!
                                       false)
                       (vars/unbind))]
         (swap! env
@@ -1652,6 +1652,7 @@
                  (sci.impl.types/->Node
                   (let [obj (t/eval obj ctx bindings)
                         v (t/eval v ctx bindings)]
+                    (utils/check-internal-member! obj (str "set! " prop))
                     ;; set! returns the assigned value, like CLJS
                     (gobj/set obj prop v)
                     v)
@@ -1687,6 +1688,7 @@
                  (sci.impl.types/->Node
                   (let [obj (t/eval obj ctx bindings)
                         v (t/eval v ctx bindings)]
+                    (utils/check-internal-member! obj (str "set! " k))
                     ;; set! returns the assigned value, like CLJS
                     (gobj/set obj k v)
                     v)

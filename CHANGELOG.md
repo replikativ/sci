@@ -20,30 +20,60 @@ SCI is used in [babashka](https://github.com/babashka/babashka),
   symbol), or `reset-meta!` / `alter-meta!` followed by a root bind, unbind
   or watch registration, including by upgrading an existing descriptor.
   Agent code could thereby run arbitrary code under the copy locks during
-  every fork and change what a fork's child received. Now:
-  - A Var's copier comes only from SCI's own registrations (`*loaded-libs*`,
-    CLJS type data, ClojureDart method tables) and from the host's new
-    `:fork-fns` option. The `:sci.impl/fork-fn` metadata key is ignored,
-    with no compatibility path: whoever installs a namespace does not prove
-    who wrote its Vars' metadata.
-  - `:sci/built-in` is a trusted flag of the Var or namespace object, set
-    by host constructors (`new-var`, `new-dynamic-var`, `new-macro-var`,
-    `copy-var`, `copy-var*`, `create-ns`, SCI's own tables) from their
-    construction metadata. Write protection, a Var's home and whether a
-    fork processes its value read the flag, never the current metadata, so
-    interpreted metadata can neither set nor clear it (`def`, `defonce`,
-    `intern`, `ns`, `reset-meta!`, `alter-meta!`). An `:unrestricted`
-    context's evaluation is host-trusted (it may already alter built-in
-    Vars), so its metadata writes still set or clear the flag.
-    `sci/intern` follows the evaluation rule: build host built-in Vars with
-    `new-var`.
-  - CLJS: interpreted `alter-meta!` of a type, and a direct
-    `sci.impl.deftype/-create-type` call, can no longer replace the type's
-    JS prototype, the operand of the fixed type-data copier.
-  - The copy-section participants and their rule (no user code, waits only
-    on leaf locks) are documented in `sci.impl.world`. The locks are
-    blocking and non-fair: waiting under them is acyclic but has no time
-    bound.
+  every fork and change what a fork's child received. A Var's copier now
+  comes only from SCI's own registrations (`*loaded-libs*`, CLJS type data,
+  ClojureDart method tables) and from the host's new `:fork-fns` option.
+  The `:sci.impl/fork-fn` metadata key is ignored, with no compatibility
+  path: whoever installs a namespace does not prove who wrote its Vars'
+  metadata.
+- **Security / sandbox fix: `:sci/built-in` has trusted provenance.** It is
+  a flag of the Var or namespace object. Write protection, a Var's home,
+  whether a fork processes a Var's value, and `:allow` (which implicitly
+  permits non-built-in Vars) read the flag, never the stored metadata;
+  metadata reads report it in every world.
+  - Host constructors set it from their construction metadata:
+    `new-var`, `new-dynamic-var`, `new-macro-var`, `create-ns`, and SCI's
+    own tables. (`copy-var` / `copy-var*` produce non-built-in Vars, as
+    before.)
+  - Host code may set or clear it afterwards: `sci/alter-var-meta!`,
+    `sci/reset-var-meta!`, and on the JVM `alter-meta!` / `reset-meta!`
+    called with no SCI context bound (CLJS's `alter-meta!` writes the
+    object field directly and does not change the flag). Clearing a
+    built-in Var still requires the write check, as before. An `:unrestricted` evaluation may set it (e.g. to make
+    Vars loaded from source read-only) but not clear it: the flag is shared
+    by every context holding the object, so one unrestricted context must
+    not unprotect a shared Var for the others. A fork whose stored metadata
+    predates the flag keeps it.
+  - On the JVM, interpreted metadata can neither set nor clear it, through
+    `def`, `defonce`, `intern`, `ns`, `alter-meta!` or `reset-meta!` (its
+    `:sci/built-in` is replaced by the flag's value). A host function that
+    interpreted code calls runs with that code's context and is treated the
+    same; interpreted code the host runs with no context bound (e.g. a host
+    callback) counts as host code, which can set but, through the write
+    check, not clear the flag.
+- **Security / sandbox fix: interop cannot reach SCI's internal members.**
+  `sci.lang.Var` and `sci.lang.Type` are in the default `:classes`, and
+  their public Java methods include unchecked engine mutators (the
+  built-in flag, a primary world's root and metadata mirror, a Var's or
+  Type's home, Type data, thread-bound state); their constructors take that
+  state. A restricted context could, e.g., clear a core Var's flag by
+  interop and rebind it for every context (also in 0.15.60-replikativ.1,
+  through the mirror methods). Reflective interop now treats `sci.lang.Var`,
+  `Namespace`, `Type` and the interfaces of SCI's internal protocols as
+  closed: an instance call resolves against `java.lang.Object` only
+  (`toString`, `hashCode`, `equals`, `getClass`) plus the read-only
+  `getName` (a Type's name, like a Class's), and their constructors,
+  fields and static members are refused, also through type hints and
+  `Class/.method` / `Class/new` values. `instance?` and type hints keep
+  working; host `:classes` overrides (fns) still apply. On CLJS, member
+  access, method calls and `set!` on a SCI Var, namespace or Type (or their
+  constructors) and constructing them are refused, except `toString`.
+- CLJS: interpreted `alter-meta!` of a type, and a direct
+  `sci.impl.deftype/-create-type` call, can no longer replace the type's JS
+  prototype, the operand of the fixed type-data copier.
+- The copy-section participants and their rule (no user code, waits only
+  on leaf locks) are documented in `sci.impl.world`. The locks are blocking
+  and non-fair: waiting under them is acyclic but has no time bound.
 - New `:fork-fns` option of `init` and `merge-opts`: a map from SCI Var to
   a one-argument copy-time fork fn, run on the Var's value while a fork
   copies the source (instead of `Forkable` / `:fork-fn` processing after
@@ -51,7 +81,7 @@ SCI is used in [babashka](https://github.com/babashka/babashka),
   interpreted code. It is lineage policy (every fork and sibling of the
   context), installed when the host calls `init` / `merge-opts`: installing
   the same fn again is a no-op, a different one is refused, and nothing an
-  evaluation does installs or changes one.
+  evaluation does installs or changes one. A `:standard` context ignores it.
 - Migration: an embedder that marked host Vars with
   `(alter-meta! v assoc :sci.impl/fork-fn f)` passes them as
   `:fork-fns {v f}` to the `init` or `merge-opts` call that installs them.
@@ -65,9 +95,16 @@ SCI is used in [babashka](https://github.com/babashka/babashka),
 
   Without the migration those Vars' values get the default fork processing,
   which refuses unmanaged mutable host values: the fork fails rather than
-  running the old copier. A `sci.lang.Var` / `sci.lang.Namespace` built
-  with its positional constructor takes one more argument (the trusted
-  built-in flag); use `sci/new-var` and `sci/create-ns`.
+  running the old copier. `sci/intern` follows the evaluation rule for
+  `:sci/built-in` (use `new-var` for host built-in Vars). A `sci.lang.Var` /
+  `sci.lang.Namespace` built with its positional constructor (host code)
+  takes one more argument, the built-in flag; use `sci/new-var` and
+  `sci/create-ns`. Interpreted code that called methods of `sci.lang.Var` /
+  `sci.lang.Type` by interop (other than `Object`'s) is refused.
+- Known issues: on CLJS, JS interop the embedder allows (`aset`, `aget`,
+  `goog.object`, `js/Object` functions) can still read and write SCI's
+  internal object fields, so the guarantees above are JVM guarantees there.
+  ClojureDart was not built or tested for this release.
 
 ## 0.15.60-replikativ.1
 

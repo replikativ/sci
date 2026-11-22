@@ -495,19 +495,67 @@
 (defn built-in-var? [var-meta]
   (:sci/built-in var-meta))
 
-(defn evaluation-built-in
-  "The trusted built-in flag (`sci.impl.world/IBuiltIn`) of a Var or
-   namespace that evaluation creates with metadata `m`: only an
-   `:unrestricted` context's evaluation (host-trusted code) can set it."
-  [m]
-  (boolean (and (:unrestricted store/*ctx*) (:sci/built-in m))))
+(defn meta-write-source
+  "The provenance of a metadata write made now, for `:sci/built-in`
+   (`sci.impl.world/IBuiltIn`): `:host` when no SCI context is bound (host
+   code; interpreted code always runs with its context bound, a host
+   function it calls too), `:unrestricted` for an `:unrestricted` context's
+   evaluation, else nil (untrusted). The host API (`sci/alter-var-meta!`,
+   `sci/reset-var-meta!`) passes `:host`."
+  []
+  (let [ctx store/*ctx*]
+    (cond (nil? ctx) :host
+          (:unrestricted ctx) :unrestricted)))
 
-(defn sync-built-in!
-  "After evaluation wrote `m` as the metadata of Var or namespace `x`: in an
-   `:unrestricted` context the written metadata decides the trusted flag;
-   any other evaluation leaves it unchanged. Returns `m`."
-  [x m]
-  (when (:unrestricted store/*ctx*)
+(defn evaluation-built-in
+  "The trusted built-in flag of a Var or namespace an evaluation creates
+   with metadata `m` (`intern`, `ns`): only a trusted source sets it."
+  [m]
+  (boolean (and (meta-write-source) (:sci/built-in m))))
+
+(defn flag-meta
+  "`m` with `:sci/built-in` as the trusted flag `built-in?` says: what a
+   metadata read reports (in every world, also one whose metadata predates
+   the flag) and what a write stores."
+  [m built-in?]
+  (if (= (boolean (:sci/built-in m)) (boolean built-in?))
+    m
+    (if built-in?
+      (assoc m :sci/built-in true)
+      (dissoc m :sci/built-in))))
+
+(defn- built-in-after
+  "The flag of `x` after a write of `m` from `source`. Any trusted source
+   may set it (more protection). Only host code may clear it: the flag
+   belongs to the object, shared by every context holding it, so an
+   `:unrestricted` evaluation must not unprotect it for other contexts.
+   Untrusted writes change nothing."
+  [x m source]
+  (let [now (world/-built-in? x)
+        wanted (boolean (:sci/built-in m))]
+    (cond (= now wanted) now
+          wanted (if source true now)
+          :else (if (= :host source) false now))))
+
+(defn meta-to-write
+  "The metadata a write of `m` from `source` to Var or namespace `x`
+   stores: `m` with `:sci/built-in` as the flag will be after the write
+   (`built-in-after`), so metadata and flag stay consistent."
+  [x m source]
+  (flag-meta m (built-in-after x m source)))
+
+(defn meta-fn
+  "`alter-meta!`'s `f` for Var or namespace `x`: it sees the metadata as a
+   read reports it, and its result is written as `meta-to-write` says."
+  [x f source]
+  (fn [old & args]
+    (meta-to-write x (apply f (flag-meta old (world/-built-in? x)) args) source)))
+
+(defn commit-built-in!
+  "After a write of `m` (from `meta-to-write`) to Var or namespace `x`: the
+   flag takes the written value. Returns `m`."
+  [x m source]
+  (when source
     (world/-set-built-in! x (:sci/built-in m)))
   m)
 
@@ -519,12 +567,9 @@
        (if (or (:unrestricted sci.ctx-store/*ctx*)
                (not (sci.impl.world/-built-in? the-var#)))
          (do ~@body)
-         (let [vm# ~var-meta
-               ns# (:ns vm#)
-               ns-name# (t/getName ns#)
-               name# (t/getName the-var#)]
-           (throw (ex-info (str "Built-in var #'" ns-name# "/" name# " is read-only.")
-                           {:var ~the-var})))))))
+         ;; the Var's own name: a shipped Var's metadata may lack :ns
+         (throw (ex-info (str "Built-in var " the-var# " is read-only.")
+                         {:var the-var#}))))))
 
 (defn var-get [v]
   (deref v))

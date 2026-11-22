@@ -120,14 +120,21 @@
 
 (defprotocol IBuiltIn
   "Trusted provenance of `:sci/built-in` on a SCI Var or namespace. The flag,
-   not the object's current metadata, decides write protection, a Var's
-   home and whether forks process its value (`host-fork?`). Host
-   constructors (`sci.core/new-var`, `copy-var`, `create-ns`, SCI's own
-   tables) take it from their construction metadata. Evaluation sets it only
-   in an `:unrestricted` context (host-trusted code, which may already alter
-   built-in Vars): any other evaluation can neither set nor clear it, through
-   `def`, `intern`, `ns`, `alter-meta!` or `reset-meta!`. The flag belongs to
-   the object, so it is shared by every world and lineage holding it."
+   not the object's stored metadata, decides write protection, a Var's
+   home, whether forks process its value (`host-fork?`) and `:allow`'s
+   implicit permission of non-built-in Vars; metadata reads report it.
+   - Set at construction by the host constructors `sci.core/new-var`,
+     `new-dynamic-var`, `new-macro-var` and `create-ns` (and SCI's own
+     tables) from their construction metadata.
+   - Afterwards by trusted metadata writes (`sci.impl.vars/meta-write-source`):
+     host code may set or clear it (JVM `alter-meta!` with no SCI context bound,
+     `sci/alter-var-meta!`, `sci/reset-var-meta!`; clearing still passes the
+     write check); an `:unrestricted` evaluation may only set it.
+   - Interpreted metadata (`def`, `defonce`, `intern`, `ns`, `alter-meta!`,
+     `reset-meta!`) can neither set nor clear it, and interop cannot reach
+     `-set-built-in!` (`sci.impl.reflector/internal-class?`).
+   The flag belongs to the object: it holds for every world and lineage
+   holding it, also a fork whose stored metadata predates it."
   (-built-in? [x])
   (-set-built-in! [x built-in?]))
 

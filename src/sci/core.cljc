@@ -317,38 +317,50 @@
 (defn alter-var-meta!
   "Atomically alter metadata for SCI Var `v` in its home world, or in the
   world selected by `call-with-context`. This is the portable host boundary;
-  ClojureScript's native `alter-meta!` writes object fields directly."
+  ClojureScript's native `alter-meta!` writes object fields directly. A host
+  call is trusted: `:sci/built-in` in the result sets or clears the Var's
+  built-in flag, for every context holding the Var (clearing a built-in
+  Var still requires the write check: an `:unrestricted` selected ctx)."
   [v f & args]
-  (world/call-with-var-context
-   v
-   (fn []
-     (let [current (meta v)]
-       (vars/with-writeable-var v current
-         (vars/sync-built-in!
-          v
-          (if (world/current-world)
-            (world/alter-var-meta! v current f args
-                                   (when (world/primary-world?)
-                                     #(sci.lang/-mirror-meta! v %)))
-            (apply #?(:cljd utils/alter-meta!* :default c/alter-meta!)
-                   v f args))))))))
+  (let [f (vars/meta-fn v f :host)]
+    (world/call-with-var-context
+     v
+     (fn []
+       (let [current (meta v)]
+         (vars/with-writeable-var v current
+           (vars/commit-built-in!
+            v
+            (if (world/current-world)
+              (world/alter-var-meta! v current f args
+                                     (when (world/primary-world?)
+                                       #(sci.lang/-mirror-meta! v %)))
+              (locking v
+                (let [m (apply f current args)]
+                  (sci.lang/-mirror-meta! v m)
+                  m)))
+            :host)))))))
 
 (defn reset-var-meta!
-  "Reset metadata for SCI Var `v` in its home or explicitly selected world."
+  "Reset metadata for SCI Var `v` in its home or explicitly selected world.
+  A host call is trusted: `:sci/built-in` in `m` sets or clears the Var's
+  built-in flag, for every context holding the Var (clearing a built-in
+  Var still requires the write check: an `:unrestricted` selected ctx)."
   [v m]
-  (world/call-with-var-context
+  (let [m (vars/meta-to-write v m :host)]
+   (world/call-with-var-context
    v
    (fn []
      (let [current (meta v)]
        (vars/with-writeable-var v current
-         (vars/sync-built-in!
+         (vars/commit-built-in!
           v
           (if (world/current-world)
             (do (world/reset-var-meta! v m
                                        (when (world/primary-world?)
                                          #(sci.lang/-mirror-meta! v %)))
                 m)
-            (utils/reset-meta!* v m))))))))
+            (do (sci.lang/-mirror-meta! v m) m))
+          :host)))))))
 
 (defn intern
   "Finds or creates a sci var named by the symbol name in the namespace

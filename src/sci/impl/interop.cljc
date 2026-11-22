@@ -15,6 +15,10 @@
    (defn get-instance-field
      "This function resolves a public non-static field on target-class."
      [^Class target-class ^String field-name]
+     (when (reflector/internal-class? target-class)
+       (throw (IllegalArgumentException.
+               (str "Field " field-name " on SCI internal class "
+                    (.getName target-class) " not allowed!"))))
      (let [^Field field (.getField target-class field-name)
            mod (.getModifiers field)]
        (if (and (not (Modifier/isStatic mod))
@@ -26,6 +30,7 @@
   #?@(:cljd [[obj _target-class field-name]
              (throw (ex-info (str "Instance fields not yet supported in cljd: " field-name) {}))]
       :cljs [[obj _target-class field-name]
+             (utils/check-internal-member! obj field-name)
              ;; gobject/get didn't work here
              (aget obj field-name)]
       :clj
@@ -154,6 +159,7 @@
   #?@(:cljd [[_ctx _bindings _obj _target-class method-name _args _arg-count _arg-types]
              (throw (ex-info (str "Instance methods not yet supported in cljd: " method-name) {}))]
       :cljs [[ctx bindings obj _target-class method-name args _arg-count _arg-types]
+             (utils/check-internal-member! obj method-name)
              ;; gobject/get didn't work here
              (if-some [method (aget obj method-name)]
                ;; use Reflect rather than (.apply method ...), see https://github.com/babashka/nbb/issues/118
@@ -180,7 +186,11 @@
      [^Class class ^String field-name cache]
      (let [f @cache
            ^Field f (or f
-                        (let [f (clojure.lang.Reflector/getField class field-name true)]
+                        (let [f (if (reflector/internal-class? class)
+                                  (throw (IllegalArgumentException.
+                                          (str "Field " field-name " on SCI internal class "
+                                               (.getName class) " not allowed!")))
+                                  (clojure.lang.Reflector/getField class field-name true))]
                           (if (nil? f)
                             (throw (IllegalArgumentException.
                                     (str "No matching field found: " field-name " for " class)))
@@ -196,6 +206,8 @@
 #?(:cljs
    (do
      (defn get-static-fields [cur ^js parts]
+       (when (pos? (.-length parts))
+         (utils/check-internal-member! cur (aget parts 0)))
        (loop [cur cur
               i 0]
          (if (< i (.-length parts))
@@ -210,6 +222,7 @@
 
 #?(:cljs
    (defn invoke-js-constructor* [ctx bindings constructor args]
+     (utils/check-internal-constructor! constructor)
      (js/Reflect.construct constructor (.map args #(sci.impl.types/eval % ctx bindings)))))
 
 #?(:cljd nil
@@ -234,7 +247,8 @@
          ;; Note: I also tried caching the method that invokeMatchingMethod looks up, but retrieving it from the cache was actually more expensive than just doing the invocation!
          ;; See getMatchingMethod in Reflector
          (reflector/invoke-matching-method method-name meths nil args-array)))
-     :cljs (js/Reflect.apply method class (.map args #(sci.impl.types/eval % ctx bindings)))))
+     :cljs (do (utils/check-internal-member! class "static method")
+               (js/Reflect.apply method class (.map args #(sci.impl.types/eval % ctx bindings))))))
 
 #?(:clj
    (defn- resolve-static-and-cache

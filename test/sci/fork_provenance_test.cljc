@@ -211,7 +211,7 @@
            (is (identical? token (sci/eval-string* c "host.open/w"))
                "a built-in Var's value is not processed by forks"))))))
 
-(deftest an-unrestricted-evaluation-is-host-trusted
+(deftest an-unrestricted-evaluation-may-set-but-not-clear
   ;; e.g. spindel marks Vars it loads from source read-only this way
   (let [{:keys [ctx]} (token-env)
         unrestricted (assoc ctx :unrestricted true)]
@@ -220,8 +220,114 @@
                                     (alter-meta! (find-ns 'app) assoc :sci/built-in true)")
     (is (re-find #"read-only" (str (refused ctx "(alter-var-root #'x inc)"))))
     (is (re-find #"read-only" (str (refused ctx "(in-ns 'app) (def y 1)"))))
-    (sci/eval-string* unrestricted "(alter-meta! #'x dissoc :sci/built-in)")
-    (is (= 2 (sci/eval-string* ctx "(alter-var-root #'x inc)")))))
+    (is (true? (sci/eval-string* ctx "(:sci/built-in (meta #'x))")))
+    (testing "the flag is shared by every context: an unrestricted evaluation cannot clear it"
+      (sci/eval-string* unrestricted "(alter-meta! #'x dissoc :sci/built-in) (reset-meta! #'x {})")
+      (is (re-find #"read-only" (str (refused ctx "(alter-var-root #'x inc)"))))
+      (is (true? (sci/eval-string* ctx "(:sci/built-in (meta #'x))"))))))
+
+(deftest an-unrestricted-context-cannot-unprotect-shared-vars-for-others
+  (doseq [mode [:standard :forkable]]
+    (each-route (name mode)
+      #(let [u (assoc (sci/init {:runtime-mode mode}) :unrestricted true)
+             other (sci/init {:runtime-mode mode})]
+         (sci/eval-string* u "(reset-meta! #'clojure.core/frequencies {:doc \"x\"})
+                              (alter-meta! #'clojure.core/frequencies dissoc :sci/built-in)")
+         (is (re-find #"read-only"
+                      (str (refused other "(alter-var-root #'clojure.core/frequencies (constantly (fn [_] :pwned)))"))))
+         (is (= {1 2} (sci/eval-string* (sci/init {}) "(frequencies [1 1])")))))))
+
+(deftest a-fork-with-older-metadata-reports-and-keeps-the-flag
+  (let [{:keys [ctx]} (token-env)
+        _ (sci/eval-string* ctx "(def x 1)")
+        before (sci/fork ctx)]
+    (sci/eval-string* (assoc ctx :unrestricted true) "(alter-meta! #'x assoc :sci/built-in true)")
+    (is (true? (sci/eval-string* before "(:sci/built-in (meta #'x))"))
+        "a read in a fork made before the flag reports it")
+    (sci/eval-string* (assoc before :unrestricted true) "(alter-meta! #'x assoc :doc \"d\")")
+    (doseq [c [ctx before]]
+      (is (re-find #"read-only" (str (refused c "(alter-var-root #'x inc)")))))))
+
+;; ---------------------------------------------------------------------------
+;; Host code is trusted provenance
+
+(deftest host-metadata-writes-set-the-flag
+  (doseq [mode [:standard :forkable]
+          [label mark!] (cond->
+                            [["sci/alter-var-meta!" #(sci/alter-var-meta! % assoc :sci/built-in true)]
+                             ["sci/reset-var-meta!" #(sci/reset-var-meta! % (assoc (meta %) :sci/built-in true))]]
+                            ;; CLJS's alter-meta! writes the object field directly
+                            #?(:clj true :cljs false)
+                            (conj ["host alter-meta!" #(alter-meta! % assoc :sci/built-in true)]))]
+    (each-route (str (name mode) " " label)
+      #(let [v (sci/new-var 'h 1 {:ns (sci/create-ns 'host.h)})
+             ctx (sci/init {:runtime-mode mode :namespaces {'host.h {'h v}}})]
+         (mark! v)
+         (is (true? (:sci/built-in (meta v))))
+         (is (true? (sci/eval-string* ctx "(:sci/built-in (meta #'host.h/h))")))
+         (is (re-find #"read-only" (str (refused ctx "(alter-var-root #'host.h/h inc)"))))
+         (is (= 1 (sci/eval-string* ctx "host.h/h")))))))
+
+(deftest metadata-reports-the-flag
+  (let [{:keys [ctx]} (token-env)]
+    (sci/eval-string* ctx "(def x 1) (alter-meta! #'x assoc :sci/built-in true)
+                           (def ^:sci/built-in y 1)")
+    (is (= [nil nil] (sci/eval-string* ctx "[(:sci/built-in (meta #'x)) (:sci/built-in (meta #'y))]")))
+    (is (true? (sci/eval-string* ctx "(:sci/built-in (meta #'clojure.core/inc))")))))
+
+;; ---------------------------------------------------------------------------
+;; Interop cannot reach SCI's internal members
+
+#?(:clj
+   (def ^:private interop-routes
+     ["(._set_built_in_BANG_ #'clojure.core/frequencies false)"
+      "(._set_built_in_BANG_ ^sci.lang.Var #'clojure.core/frequencies false)"
+      "(sci.lang.Var/._set_built_in_BANG_ #'clojure.core/frequencies false)"
+      "(._mirror_root_BANG_ #'clojure.core/frequencies (fn [_] :pwned))"
+      "(._mirror_meta_BANG_ #'clojure.core/frequencies {})"
+      "(._mark_world_tracked_BANG_ #'clojure.core/frequencies {})"
+      "(._world_home_ctx #'clojure.core/frequencies)"
+      "(.setThreadBound #'clojure.core/frequencies true)"
+      "(.bindRoot #'clojure.core/frequencies (fn [_] :pwned))"
+      "(.getRawRoot #'clojure.core/frequencies)"
+      "(.-sym #'clojure.core/frequencies)"
+      "(sci.lang.Var. (fn [_] :pwned) 'f {} false false nil *ns* {:unrestricted true} false)"
+      "(sci.lang.Var/new (fn [_] :pwned) 'f {} false false nil *ns* {:unrestricted true} false)"
+      "(sci.lang.Var/getBasis)"
+      "(._set_built_in_BANG_ *ns* false)"
+      "(._mirror_meta_BANG_ *ns* {})"
+      "(do (deftype T []) (.setVal T {}))"
+      "(do (deftype T []) (._mark_world_tracked_BANG_ T nil))"
+      "(do (deftype T []) (._mirror_root_BANG_ T {}))"
+      "(sci.lang.Type. {} (atom nil))"])
+   :cljs
+   (def ^:private interop-routes
+     ["(.sci$impl$world$IBuiltIn$_set_built_in_BANG_$arity$2 #'clojure.core/frequencies #'clojure.core/frequencies false)"
+      "(.sci$lang$IWorldMirror$_mirror_root_BANG_$arity$2 #'clojure.core/frequencies #'clojure.core/frequencies (fn [_] :pwned))"
+      "(.-built_in #'clojure.core/frequencies)"
+      "(.-world_tracked #'clojure.core/frequencies)"
+      "(set! (.-built_in #'clojure.core/frequencies) false)"
+      "(set! (.-root #'clojure.core/frequencies) (fn [_] :pwned))"
+      "(do (deftype T []) (set! (.-data T) {}))"
+      "(do (deftype T []) (.-data T))"
+      "(sci.lang.Type. {} (atom nil))"
+      "(.-prototype sci.lang.Type)"]))
+
+(deftest interop-cannot-reach-internal-members
+  (doseq [mode [:standard :forkable]
+          s interop-routes]
+    (each-route (str (name mode) " " s)
+      #(let [ctx (sci/init {:runtime-mode mode})]
+         (is (some? (refused ctx s)) "refused")
+         (is (re-find #"read-only"
+                      (str (refused ctx "(alter-var-root #'clojure.core/frequencies (constantly (fn [_] :pwned)))"))))
+         (doseq [c [ctx (sci/init {}) (sci/init {:runtime-mode :forkable})]]
+           (is (= {1 2} (sci/eval-string* c "(frequencies [1 1])"))))))))
+
+(deftest interop-on-internal-objects-keeps-object-methods
+  (let [ctx (sci/init {:runtime-mode :forkable})]
+    #?(:clj (is (= "#'clojure.core/inc" (sci/eval-string* ctx "(.toString #'clojure.core/inc)"))))
+    #?(:clj (is (true? (sci/eval-string* ctx "(instance? sci.lang.Var #'inc)"))))))
 
 ;; ---------------------------------------------------------------------------
 ;; dvergr's clojure.test adapter: host Vars whose identity must survive forks
