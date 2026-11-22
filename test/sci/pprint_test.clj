@@ -67,3 +67,19 @@
 (pprint/pprint #'inc)
 "
                              conf))))))
+
+(deftest pprint-custom-dispatch-with-write-out-test
+  ;; a user dispatch writes to the pretty writer (no staging), in both modes
+  (doseq [mode [:standard :forkable]]
+    (is (= "[11 22 33]"
+           (str/trim
+            (sci/with-out-str
+              (sci/eval-string
+               "(require '[clojure.pprint :as pprint])
+                (defrecord W [x])
+                (defmethod pprint/simple-dispatch W [o] (pprint/write-out (:x o)))
+                (pprint/pprint (->W [11 22 33]))"
+               (-> conf
+                   (assoc :runtime-mode mode)
+                   (assoc-in [:namespaces 'clojure.pprint 'write-out] pp/write-out))))))
+        (name mode))))

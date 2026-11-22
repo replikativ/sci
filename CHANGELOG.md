@@ -34,14 +34,16 @@ SCI is used in [babashka](https://github.com/babashka/babashka),
     (`#object[user.D 0x… "retired SCI world"]`, `#user.R{…}`) without
     calling user code, also when the home is retired while printing; record
     `hash`/`=` stay field-based. An instance does not retain the world that
-    constructed it. A `deftype`/`defrecord` defines exactly the type its
-    analysis created (also when delayed inside a fn, called from another
-    namespace, or when the name is redefined meanwhile), in its own
-    namespace; only that definition elects the home, atomically.
-    Registering an existing type (`init`/`merge-opts` `:namespaces`) never
-    defines it in a world nor changes its home. Printing renders the whole
-    form or, if a retired world is met while rendering (also a mutable
-    field managed in a retired world), the fallback.
+    constructed it. A `deftype` defines exactly the type its analysis
+    created (also when delayed inside a fn, called from another namespace,
+    or when the name is redefined meanwhile), in its own namespace; only
+    that definition elects the home, atomically. Registering an existing
+    type (`init`/`merge-opts` `:namespaces`) never defines it in a world
+    nor changes its home. A world's own definition counts also before a
+    home is elected. User printers write straight to their destination, as
+    upstream; the fallback form applies when the home is already retired
+    (a built-in `#object` form falls back on any retirement met while it is
+    built), and only on the engine's own retirement refusal.
   - The `:unrestricted` requirement for built-in multimethods and the
     `:deny` checks on namespace introspection (`ns-publics`, `ns-interns`,
     `ns-refers`, `ns-map`, `find-var`, `intern`, `alias`, `require :as`,
@@ -52,6 +54,24 @@ SCI is used in [babashka](https://github.com/babashka/babashka),
   - The context's `:env` holds an `Env` record on the JVM; a fork's
     namespace snapshot keeps that record.
 - The SCI version stays `0.15.59-replikativ.9` until the next release.
+
+### Known issues
+
+- A forkable primary that received another context's SCI type through
+  `:namespaces` and changes it (`defmethod print-method`, `alter-meta!`)
+  also changes it for the defining context (the type's host field is shared;
+  as in 0.15.59-replikativ.9).
+- A saved positional factory (`->R`) or a fn using `(R. x)` constructs the
+  current definition of `R` after `R` is redefined, while a saved `map->R`
+  keeps the old one; the generated `import` of a `deftype` resolves the name
+  when it runs (as upstream SCI).
+- A user printer (`print-method`, pprint dispatch, CLJS `IPrintWithWriter`)
+  that meets a retired world after it started writing propagates the
+  refusal and may leave partial output (as before); `print-dup` of SCI type
+  instances is not readable back (as upstream).
+- On ClojureScript an interpreted fn compiled by the JIT and called from the
+  host does not enter its world: it reads a world-local Var's host root and is
+  not refused after its world is retired (see `doc/fork-state-audit.md`).
 
 ## 0.15.60
 

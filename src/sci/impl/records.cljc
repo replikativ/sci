@@ -243,16 +243,14 @@
 
      SciPrintMethod
      (-sci-print-method [this w]
-       ;; rendered whole (buffered) with the home admitted, else the fields
-       (.write ^java.io.Writer w
-               ^String (world/call-with-type-admitted
-                        type
-                        #(if-let [pm (world/instance-print-method type-meta)]
-                           (let [sw (java.io.StringWriter.)]
-                             (pm this sw)
-                             (str sw))
-                           (clojure-str this))
-                        #(clojure-str this))))
+       ;; straight to the writer; a home already retired prints the fields
+       (world/print-to
+        type w
+        (fn [^java.io.Writer sw]
+          (if-let [pm (world/instance-print-method type-meta)]
+            (pm this sw)
+            (.write sw ^String (clojure-str this))))
+        #(clojure-str this)))
 
      sci.impl.types/SciTypeInstance
      (-get-type [_]
@@ -467,28 +465,23 @@
         protocol-impls (utils/split-when symbol? raw-protocol-impls)
         interfaces (mapv first protocol-impls)
         method-counts (mapv #(count (rest %)) protocol-impls)
-        methods (mapcat rest protocol-impls)
-        ;; The Type this definition carries through its whole expansion: the
-        ;; factories below and deftype* (which declares and defines it) use
-        ;; this object, never the name through the namespace mapping.
-        t (lang/new-type (cond-> {:sci.impl/type-name class-name}
-                           (world/current-world)
-                           (assoc :sci.impl/declared true)))]
+        methods (mapcat rest protocol-impls)]
+    ;; The expansion is data (no live Type): deftype* analysis allocates the
+    ;; Type; the factories refer to the record by name, as upstream.
     `(do
        (declare ~constructor-fn-sym ~factory-fn-sym ~map-factory-sym)
        (deftype* ~tagged-name ~class-name ~fields
          :implements ~(with-meta interfaces {:record true
-                                             :method-counts method-counts
-                                             :sci.impl/type t})
+                                             :method-counts method-counts})
          ~@methods)
        (defn ~constructor-fn-sym
          (~fields
           (~constructor-fn-sym ~@fields nil nil))
          ([~@fields meta# ext#]
           (sci.impl.records/->record-impl ~rec-type
-                                          ~t
+                                          ~record-name
                                           ~key-set
-                                          ~t
+                                          ~record-name
                                           (cond-> (zipmap ~keys ~fields)
                                             ext# (merge ext#)
                                             meta# (with-meta meta#)))))
@@ -500,9 +493,9 @@
                 {:doc (str "Factory function for class " class-name ", taking a map of keywords to field values.")})
          [m#]
          (sci.impl.records/->record-impl ~rec-type
-                                         ~t
+                                         ~record-name
                                          ~key-set
-                                         ~t
+                                         ~record-name
                                          (merge '~nil-map m#)))
        ~(list 'import (list (symbol (str ns-name)) record-name)))))
 

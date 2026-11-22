@@ -51,12 +51,11 @@
     true)
   world/ITypeData
   (-data-for [this]
-    ;; the hot path of type methods: a type never defined in a world (all of
-    ;; :standard mode) answers from its host field at once
+    ;; the hot path of type methods: one read of the home; a world's own
+    ;; slot counts also before a home is elected (an imported type, a
+    ;; definition between its slot write and its election)
     (let [h @home]
-      (if (nil? h)
-        data
-        (world/type-data-at this (when (vector? h) (nth h 1)) true data))))
+      (world/type-data-at this (when (vector? h) (nth h 1)) true data)))
   (-own-data [this clone]
     (world/own-type-data this data clone))
   (-own-data! [this clone]
@@ -67,7 +66,7 @@
   (-mirror-root! [_ v] (set! data v))
   (-mirror-meta! [_ m] (set! data m))
   sci.impl.types/IBox
-  (getVal [this] (let [h @home] (if (nil? h) data (world/type-data-at this (when (vector? h) (nth h 1)) false data))))
+  (getVal [this] (let [h @home] (world/type-data-at this (when (vector? h) (nth h 1)) false data)))
   (setVal [this v]
     (if (world/current-world)
       (do
@@ -81,18 +80,18 @@
     ;; The name never changes and the host field always has it, so printing
     ;; a type works without its world (also once that world is retired).
     (str (or (:sci.impl/type-name data)
-             (:sci.impl/type-name (let [h @home] (if (nil? h) data (world/type-data-at this (when (vector? h) (nth h 1)) false data)))))))
+             (:sci.impl/type-name (let [h @home] (world/type-data-at this (when (vector? h) (nth h 1)) false data))))))
 
   ;; meta is only supported to get our implementation! keys out
   #?@(:cljd
       [IMeta
-       (-meta [this] (let [h @home] (if (nil? h) data (world/type-data-at this (when (vector? h) (nth h 1)) false data))))]
+       (-meta [this] (let [h @home] (world/type-data-at this (when (vector? h) (nth h 1)) false data)))]
       :clj
       [clojure.lang.IMeta
-       (meta [this] (let [h @home] (if (nil? h) data (world/type-data-at this (when (vector? h) (nth h 1)) false data))))]
+       (meta [this] (let [h @home] (world/type-data-at this (when (vector? h) (nth h 1)) false data)))]
       :cljs
       [IMeta
-       (-meta [this] (let [h @home] (if (nil? h) data (world/type-data-at this (when (vector? h) (nth h 1)) false data))))])
+       (-meta [this] (let [h @home] (world/type-data-at this (when (vector? h) (nth h 1)) false data)))])
 
   ;; support alter-meta! for storing print-method etc.
   #?@(:cljd

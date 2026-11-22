@@ -11,17 +11,14 @@
 #?(:clj (set! *warn-on-reflection* true))
 
 (defmethod pprint/simple-dispatch sci.impl.records.SciRecord [obj]
-  ;; A user dispatch renders whole (buffered) with the home admitted; a
-  ;; retired home, or a retired world met while rendering, prints the fields.
+  ;; A user dispatch writes straight to the pretty writer (as upstream),
+  ;; with the home admitted; a home already retired prints the fields.
   (if-let [pm (world/printing-entry (.-type-meta ^sci.impl.records.SciRecord obj)
                                     :sci.impl/pprint-simple-dispatch)]
-    (let [s (world/call-with-type-admitted
-             (.-type ^sci.impl.records.SciRecord obj)
-             #(with-out-str (pm obj))
-             (constantly nil))]
-      (if s
-        (print s)
-        (pprint/simple-dispatch (into {} obj))))
+    (world/call-with-type-admitted-streaming
+     (.-type ^sci.impl.records.SciRecord obj)
+     #(pm obj)
+     (fn [_] (pprint/simple-dispatch (into {} obj))))
     (pprint/simple-dispatch (into {} obj))))
 
 (defmethod pprint/simple-dispatch sci.lang.Var [obj]

@@ -99,7 +99,7 @@
     (world/call-with-type-admitted
      n
      #(str "#object[" n " 0x" (hex-hash v) " \"" (to-string v) "\"]")
-     #(retired-str v))))
+     (fn [_] (retired-str v)))))
 
 (defprotocol SciPrintMethod
   (-sci-print-method [x w]))
@@ -158,16 +158,14 @@
                (apply types/sci-invoke this args))]
       :clj [SciPrintMethod
             (-sci-print-method [this w]
-                               ;; rendered whole (buffered), else the fallback
-                               (.write ^java.io.Writer w
-                                       ^String (world/call-with-type-admitted
-                                                type
-                                                #(if-let [pm (world/instance-print-method type-meta)]
-                                                   (let [sw (java.io.StringWriter.)]
-                                                     (pm this sw)
-                                                     (str sw))
-                                                   (clojure-str this))
-                                                #(retired-str this))))
+                               ;; straight to the writer; a home already retired prints the fallback
+                               (world/print-to
+                                type w
+                                (fn [^java.io.Writer sw]
+                                  (if-let [pm (world/instance-print-method type-meta)]
+                                    (pm this sw)
+                                    (.write sw ^String (clojure-str this))))
+                                #(retired-str this)))
             clojure.lang.IFn
             (invoke [this] (types/type-call types/sci-invoke :clojure.lang/invoke type this))
             (invoke [this a] (types/type-call types/sci-invoke :clojure.lang/invoke type this a))
@@ -346,16 +344,10 @@
      (fn [_ w opts]
        (this-as self
          (if (implements? types/SciTypeInstance self)
-           ;; rendered whole (buffered), else the fallback
-           (-write w (world/call-with-type-admitted
-                      (types/-get-type self)
-                      #(let [parts (array)]
-                         (impl self (reify IWriter
-                                      (-write [_ s] (.push parts s))
-                                      (-flush [_] nil))
-                               opts)
-                         (.join parts ""))
-                      #(retired-str self)))
+           ;; straight to the writer; a home already retired prints the fallback
+           (world/print-to (types/-get-type self) w
+                               (fn [sw] (impl self sw opts))
+                               #(retired-str self))
            (impl self w opts))))))
 
 #?(:cljs
@@ -385,29 +377,26 @@
      [t proto-map impls]
      (-install-native-protocol-on! (ensure-js-prototype t) proto-map impls)))
 
-(defn- mutable-type? [type]
-  ;; the effective definition (own, else home), never a declaration
-  (and (utils/sci-type? type)
-       (some (fn [field]
-               (let [m (meta field)]
-                 (or (:volatile-mutable m)
-                     (:unsynchronized-mutable m)
-                     ;; the CLJS spelling
-                     (:mutable m))))
-             (:sci.impl/fields (world/-data-for type)))))
+(defn- mutable-fields? [data]
+  (some (fn [field]
+          (let [m (meta field)]
+            (or (:volatile-mutable m)
+                (:unsynchronized-mutable m)
+                ;; the CLJS spelling
+                (:mutable m))))
+        (:sci.impl/fields data)))
 
 (defn ->type-impl [rec-name type type-meta m]
-  (let [desc (when (and (world/current-world)
-                        (mutable-type? type))
+  ;; One snapshot of the effective definition (own, else home; never a
+  ;; declaration) decides managed field storage and the CLJS prototype.
+  (let [data (when (instance? #?(:cljd lang/Type :default sci.lang.Type) type)
+               (world/-data-for type))
+        desc (when (and (world/current-world) (mutable-fields? data))
                (world/register-managed! :deftype-fields [m] []))
         home (:home desc)
         registry (:registry desc)
         value-slot (some-> desc :slots first)
-        obj #?(:cljs (if-let [proto (when (instance? lang/Type type)
-                                      ;; the definition (a declaration
-                                      ;; has no prototype)
-                                      (:sci.impl/js-prototype
-                                       (world/-data-for type)))]
+        obj #?(:cljs (if-let [proto (:sci.impl/js-prototype data)]
                        (let [obj (js/Object.create proto)]
                          (.call SciType obj rec-name type type-meta m
                                 home registry value-slot)
@@ -651,8 +640,8 @@
         _ (utils/check-namespace-writable! ctx @(:env ctx) (symbol (namespace tagged-name)))
         ;; The Type this analysis carries through its whole expansion
         ;; (declaration, -create-type, factories, method installs): never
-        ;; resolved by name again. defrecord allocated it at macroexpansion.
-        t (or (:sci.impl/type iface-meta) (declaration-type rec-type))
+        ;; resolved by name again (a macro expansion stays data: allocated here).
+        t (declaration-type rec-type)
         _ (do
             ;; Analysis only declares the type (slot first: the mapping
             ;; makes it reachable, also to a fork). -create-type defines it

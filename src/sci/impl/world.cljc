@@ -60,9 +60,20 @@
      retired world itself, so evaluations still running there find it after
      the owner released it."))
 
+(def ^:private retirement-refusal
+  "Marks the engine's own refusals of a retired world (`retired-error?`): an
+   application cannot construct an exception carrying this object."
+  #?(:cljd (Object.) :clj (Object.) :cljs (js/Object.)))
+
+(defn retired-refusal
+  "The engine's refusal of an access to a retired world."
+  []
+  (ex-info "SCI world has been retired."
+           {:type ::retired-world ::refusal retirement-refusal}))
+
 (defn assert-open! [^DenseWorld world]
   (when-not @(.-open? world)
-    (throw (ex-info "SCI world has been retired." {:type ::retired-world})))
+    (throw (retired-refusal)))
   world)
 (deftype ReadWorld [world primary?])
 
@@ -85,11 +96,14 @@
      `clone`) from the authoritative data when that world has none."))
 
 (defn retired-error?
-  "Whether `e` (or a cause of it) is the refusal of a retired world."
+  "Whether `e`, or an exception it wraps (SCI wraps errors raised in
+   interpreted code with their location), is the engine's own refusal of a
+   retired world: identified by a private marker, never by the public
+   `:type` an application exception may also carry."
   [e]
   (loop [e e]
     (cond (nil? e) false
-          (= ::retired-world (:type (ex-data e))) true
+          (identical? retirement-refusal (::refusal (ex-data e))) true
           :else (recur (ex-cause e)))))
 
 (defn read-world [world primary?]
@@ -824,14 +838,14 @@
                      (if (retired-error? e) false (throw e))))))))))
 
 (defn call-with-type-admitted
-  "Printing an instance of SCI type `t`: `(render)` returns the whole printed
-   form as a string (it writes nowhere). It runs with `t`'s home admitted on
-   this thread, held through rendering, so the home's retirement meanwhile
-   cannot interrupt it. If the home is already retired (and the active world
-   has no definition of its own), or rendering raises a retired-world error
-   from any world it touches (a mutable field managed in a retired world, a
-   method made in a retired world), `(fallback)` gives the form instead: the
-   printer writes either the whole rendering or the fallback."
+  "Printing an instance of SCI type `t`. `(render)` runs with `t`'s home
+   admitted on this thread, held through rendering, so the home's retirement
+   meanwhile cannot interrupt it. When the home is already retired (and the
+   active world has no definition of its own), or rendering meets the
+   engine's refusal of a retired world anywhere (a mutable field managed in
+   a retired world, a method made in one), `(fallback e)` is called with
+   that refusal (it may rethrow it, e.g. once staged output has streamed).
+   Any other exception propagates."
   [t render fallback]
   (let [home-ctx (when (and (some? t) (-world-tracked? t)) (-world-home-ctx t))
         active (when home-ctx (active-world-state))]
@@ -841,14 +855,41 @@
            (call-admitted home-ctx render))
          (catch #?(:cljd Object :clj Exception :cljs :default) e
            (if (retired-error? e)
-             (fallback)
+             (fallback e)
              (throw e))))))
+
+(defn call-with-type-admitted-streaming
+  "`call-with-type-admitted` for a printer that writes straight to its
+   destination (the pretty printer): falls back only when the home is
+   refused before rendering starts; a refusal while rendering propagates."
+  [t render fallback]
+  (let [started (volatile! false)]
+    (call-with-type-admitted
+     t
+     #(do (vreset! started true) (render))
+     (fn [e] (if @started (throw e) (fallback e))))))
+
+(defn print-to
+  "Print an instance of SCI type `t` to writer `out` with a user printer:
+   `(render out)` writes straight to `out` (no staging, as upstream), with
+   `t`'s home admitted through rendering. When the home is already retired
+   the fallback form `(fallback)` is written instead. A refusal met after
+   the printer started (another retired world it reads) propagates."
+  [t out render fallback]
+  (call-with-type-admitted-streaming
+   t
+   #(render out)
+   (fn [_]
+     (let [s (fallback)]
+       #?(:clj (.write ^java.io.Writer out ^String s)
+          :cljs (-write out s)
+          :cljd (.write out s))))))
 
 (defn assert-type-usable!
   "Refuse with the retired error unless `(type-usable? t)`."
   [t]
   (when-not (type-usable? t)
-    (throw (ex-info "SCI world has been retired." {:type ::retired-world})))
+    (throw (retired-refusal)))
   nil)
 
 (defn type-method

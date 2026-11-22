@@ -213,7 +213,7 @@
          (let [g (sci/fork o)]
            (is (some? (sci/eval-string* g "held")))
            (is (re-find #"retired SCI world" (pr-str (sci/eval-string* g "held")))))))
-     (testing "a printer extended in a retired child falls back although the home is open"
+     (testing "a printer made in a retired child: its refusal propagates (the home is open)"
        (let [p (forkable)
              _ (sci/eval-string* p "(deftype P [x])")
              c (sci/fork p)
@@ -226,4 +226,43 @@
                    (->P 1)")]
          (is (= "<P>" (pr-str d)))
          (sci/retire! c)
-         (is (re-find #"retired SCI world" (pr-str d)))))))
+         (is (= :retired (attempt #(pr-str d))))))))
+
+(deftest printing-and-expansions-behave-as-upstream
+  (testing "an application exception tagged like a retirement propagates"
+    (let [ctx (forkable)]
+      (is (= "EX app"
+             (attempt #(sci/eval-string*
+                        ctx "(deftype T [] Object (toString [_] (throw (ex-info \"app\" {:type :sci.impl.world/retired-world}))))
+                             (pr-str (T.))"))))))
+  (testing "a defrecord expansion is data: evaluated twice it defines two types"
+    (doseq [ctx [(sci/init {}) (forkable)]]
+      (let [exp (sci/eval-string* ctx "(macroexpand-1 '(defrecord Q [a]))")
+            t1 (sci/eval-form ctx exp)
+            t2 (sci/eval-form ctx exp)]
+        (is (not (identical? t1 t2)))
+        (is (= 1 (sci/eval-string* ctx "(:a (->Q 1))")))))))
+
+#?(:clj
+   (deftest a-user-printer-writes-straight-to-the-writer
+     ;; no staging: what a print-method wrote is in the destination while it
+     ;; runs (as in .9 and upstream), so output size is not bounded by memory
+     (let [sw (java.io.StringWriter.)
+           p (sci/init {:runtime-mode :forkable
+                        :namespaces {'host {'seen #(count (str sw))}}})
+           r (sci/eval-string* p "(defrecord L []) (defmethod print-method L [_ w] (.write w \"abc\") (.write w (str (host/seen)))) (->L)")]
+       (print-method r sw)
+       (is (= "abc3" (str sw))))))
+
+#?(:clj
+   (deftest a-local-definition-counts-before-any-home
+     ;; a type from a :standard context has no home in the forkable lineage;
+     ;; a child's own print-method on it is used in that child only
+     (let [s (sci/init {})
+           d (sci/eval-string* s "(deftype D [x]) (->D 1)")
+           t (sci/eval-string* s "D")
+           p (sci/init {:runtime-mode :forkable :namespaces {'user {:types {'D t}}}})
+           c (sci/fork p)]
+       (sci/eval-string* c "(defmethod print-method D [_ w] (.write w \"local\"))")
+       (is (= "local" ((sci/eval-string* c "(fn [x] (pr-str x))") d)))
+       (is (re-find #"^#object\[user.D" (pr-str d)) "the standard context is unaffected"))))
