@@ -12,6 +12,8 @@ SCI is used in [babashka](https://github.com/babashka/babashka),
 
 ## Unreleased
 
+## 0.15.60-replikativ.2
+
 - **Security / sandbox fix: copy-time fork policy no longer depends on
   mutable metadata.** A Var's copy-time fork fn runs inside a fork's copy
   section, under the source world's publish and slot write locks. It was
