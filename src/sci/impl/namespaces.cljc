@@ -1039,8 +1039,8 @@
      ;; The type's slot is written before the mapping publishes it. The env
      ;; swap is outside any section: env watches are user code. Only this
      ;; successful definition elects the home (the first definer wins).
-     (world/register-type! t data fork-fn false)
-     (when existing (types/setVal existing data))
+     (world/define-type-slot! t fork-fn)
+     (types/setVal t data)
      (world/elect-type-home! t)
      (swap! env (fn [env]
                   (-> env

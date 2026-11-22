@@ -243,13 +243,16 @@
 
      SciPrintMethod
      (-sci-print-method [this w]
-       ;; admitted through rendering; a retired home prints the fields
-       (world/call-with-type-admitted
-        type
-        #(if-let [pm (world/instance-print-method type-meta)]
-           (pm this w)
-           (.write ^java.io.Writer w ^String (clojure-str this)))
-        #(.write ^java.io.Writer w ^String (clojure-str this))))
+       ;; rendered whole (buffered) with the home admitted, else the fields
+       (.write ^java.io.Writer w
+               ^String (world/call-with-type-admitted
+                        type
+                        #(if-let [pm (world/instance-print-method type-meta)]
+                           (let [sw (java.io.StringWriter.)]
+                             (pm this sw)
+                             (str sw))
+                           (clojure-str this))
+                        #(clojure-str this))))
 
      sci.impl.types/SciTypeInstance
      (-get-type [_]
@@ -421,10 +424,10 @@
 #?(:cljs
    (defn fork-record* [^SciRecord this]
      (let [type (.-type this)
-           ;; the child's own prototype of the type; a world that only has
-           ;; the declaration has none: keep the construction prototype
+           ;; the child's own prototype of the type (its own slot only, never
+           ;; the home's); else keep the construction prototype
            proto (or (when (instance? lang/Type type)
-                       (:sci.impl/js-prototype (types/getVal type)))
+                       (:sci.impl/js-prototype (world/own-realization type)))
                      (js/Object.getPrototypeOf this))
            obj (js/Object.create proto)]
        (.call SciRecord obj
@@ -464,21 +467,28 @@
         protocol-impls (utils/split-when symbol? raw-protocol-impls)
         interfaces (mapv first protocol-impls)
         method-counts (mapv #(count (rest %)) protocol-impls)
-        methods (mapcat rest protocol-impls)]
+        methods (mapcat rest protocol-impls)
+        ;; The Type this definition carries through its whole expansion: the
+        ;; factories below and deftype* (which declares and defines it) use
+        ;; this object, never the name through the namespace mapping.
+        t (lang/new-type (cond-> {:sci.impl/type-name class-name}
+                           (world/current-world)
+                           (assoc :sci.impl/declared true)))]
     `(do
        (declare ~constructor-fn-sym ~factory-fn-sym ~map-factory-sym)
        (deftype* ~tagged-name ~class-name ~fields
          :implements ~(with-meta interfaces {:record true
-                                             :method-counts method-counts})
+                                             :method-counts method-counts
+                                             :sci.impl/type t})
          ~@methods)
        (defn ~constructor-fn-sym
          (~fields
           (~constructor-fn-sym ~@fields nil nil))
          ([~@fields meta# ext#]
           (sci.impl.records/->record-impl ~rec-type
-                                          ~record-name
+                                          ~t
                                           ~key-set
-                                          ~record-name
+                                          ~t
                                           (cond-> (zipmap ~keys ~fields)
                                             ext# (merge ext#)
                                             meta# (with-meta meta#)))))
@@ -490,9 +500,9 @@
                 {:doc (str "Factory function for class " class-name ", taking a map of keywords to field values.")})
          [m#]
          (sci.impl.records/->record-impl ~rec-type
-                                         ~record-name
+                                         ~t
                                          ~key-set
-                                         ~record-name
+                                         ~t
                                          (merge '~nil-map m#)))
        ~(list 'import (list (symbol (str ns-name)) record-name)))))
 

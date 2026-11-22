@@ -180,3 +180,47 @@
                  p "(defn mk [] (defrecord R [a]) (->R 1))
                     (extend-type R IDeref (-deref [_] :ext))
                     (let [r (mk)] [(:a r) (record? r) @r])")))))))
+
+(deftest a-mutable-instance-constructed-where-the-type-is-only-declared
+  ;; The parent only declares C (mk analysed there, run in the child) and
+  ;; constructs an instance with the child's factory: its mutable field is
+  ;; still managed per world, so a fork of the parent has its own counter.
+  (let [p (forkable)
+        _ (sci/eval-string*
+           p #?(:clj "(defn mk [] (deftype C [^:volatile-mutable n]
+                                    clojure.lang.IDeref (deref [_] (set! n (inc n)) n))
+                                  ->C)"
+                :cljs "(defn mk [] (deftype C [^:mutable n]
+                                     IDeref (-deref [_] (set! n (inc n)) n))
+                                   ->C)"))
+        c (sci/fork p)
+        factory (sci/eval-string* c "(mk)")
+        _ ((sci/eval-string* p "(fn [f] (def v [(f 0)]) nil)") factory)
+        bump "@(first v)"
+        first-parent (sci/eval-string* p bump)
+        g (sci/fork p)]
+    (is (= [1 2 2] [first-parent (sci/eval-string* g bump) (sci/eval-string* p bump)]))))
+
+#?(:cljs
+   (deftest cljs-fork-copies-and-printing-with-retired-worlds
+     (testing "a fork of a world without the type's slot keeps the construction prototype"
+       (let [p (forkable)
+             o (sci/fork p)
+             c (sci/fork p)
+             d (sci/eval-string* c (str deftype-src " (->D 42)"))]
+         ((sci/eval-string* o "(fn [x] (def held x) nil)") d)
+         (sci/retire! c)
+         (let [g (sci/fork o)]
+           (is (some? (sci/eval-string* g "held")))
+           (is (re-find #"retired SCI world" (pr-str (sci/eval-string* g "held")))))))
+     (testing "a printer extended in a retired child falls back although the home is open"
+       (let [p (forkable)
+             _ (sci/eval-string* p "(deftype P [x])")
+             c (sci/fork p)
+             d (sci/eval-string*
+                c "(def tag \"<P>\")
+                   (extend-type P IPrintWithWriter (-pr-writer [_ w _] (-write w tag)))
+                   (->P 1)")]
+         (is (= "<P>" (pr-str d)))
+         (sci/retire! c)
+         (is (re-find #"retired SCI world" (pr-str d)))))))

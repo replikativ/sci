@@ -538,6 +538,101 @@
     (is (= "#object[user.D 0x7 \"d\"]" (deref printed 5000 :timeout)))
     (is (re-find #"retired SCI world" (pr-str d)) "afterwards the default form")))
 
+;; sol review 2: Type identity, definition vs registration, printing.
+
+(deftest a-delayed-analysis-keeps-its-type-when-the-name-is-redefined-meanwhile
+  ;; The delayed D's analysis pauses right after declaring D; meanwhile a
+  ;; two-field D is defined in the same world. Each keeps its own Type.
+  (let [ctx (forkable {})
+        analyzer (promise)
+        paused (promise)
+        resume (promise)
+        armed (atom true)]
+    (add-watch (:env ctx) ::pause
+               (fn [_ _ old new]
+                 (when (and @armed
+                            (identical? (Thread/currentThread) (deref analyzer 0 nil))
+                            (not (identical? (get-in old [:namespaces 'user :types 'D])
+                                             (get-in new [:namespaces 'user :types 'D]))))
+                   (reset! armed false)
+                   (deliver paused true)
+                   (deref resume 5000 :timeout))))
+    (let [delayed (future
+                    (deliver analyzer (Thread/currentThread))
+                    (sci/eval-string*
+                     ctx "(defn mk [] (deftype D [x] Object (toString [_] \"A\")) (->D 1))"))]
+      (is (true? (deref paused 5000 :timeout)))
+      (let [b (sci/eval-string* ctx "(deftype D [x y] Object (toString [_] \"B\")) (->D 1 2)")]
+        (is (= "B" (str b)))
+        (deliver resume true)
+        (deref delayed 5000 :timeout)
+        (let [a (sci/eval-string* ctx "(mk)")]
+          (is (= ["A" "B"] [(str a) (str b)]))
+          (let [sci-type (sci/eval-string* ctx "type")]
+            (is (not (identical? (sci-type a) (sci-type b))))))))))
+
+(deftest only-a-definition-elects-the-home
+  (testing "a fork registering a copied definition before the home is elected"
+    (let [p (forkable {})
+          paused (promise)
+          resume (promise)
+          elect world/elect-type-home!
+          once (atom true)]
+      (with-redefs [world/elect-type-home!
+                    (fn [t]
+                      (when (compare-and-set! once true false)
+                        (deliver paused true)
+                        (deref resume 5000 :timeout))
+                      (elect t))]
+        (let [defining (future (sci/eval-string*
+                                p "(deftype D [] Object (toString [_] \"ready\")) (->D)"))]
+          (is (true? (deref paused 5000 :timeout)))
+          (let [c (sci/fork p)]
+            (sci/merge-opts c {}))
+          (deliver resume true)
+          (let [d (deref defining 5000 :timeout)]
+            (is (= "ready" (sci/eval-string* p "(str (->D))")))
+            (is (= "ready" (str d)) "the host uses the primary's definition"))))))
+  (testing "registering a child's type in an unrelated context"
+    (let [p (forkable {})
+          c (sci/fork p)
+          d (sci/eval-string* c "(deftype D [] Object (toString [_] \"D!\")) (->D)")
+          t (sci/eval-string* c "D")]
+      (forkable {:namespaces {'other {:types {'D t}}}})
+      (is (= "D!" (str d)) "the home is kept")
+      (sci/retire! c)
+      (is (= :retired (attempt #(str d))))))
+  (testing "importing a child's type into its own primary"
+    (let [p (forkable {})
+          c (sci/fork p)
+          d (sci/eval-string* c "(deftype D [] Object (toString [_] \"D!\")) (->D)")
+          t (sci/eval-string* c "D")
+          p2 (sci/merge-opts p {:namespaces {'user {:types {'D t}}}})]
+      (is (= "D!" ((sci/eval-string* p2 "(fn [x] (str x))") d)))
+      (is (= "D!" (str d))))))
+
+(deftest printing-falls-back-when-a-world-it-touches-is-retired
+  ;; A mutable field is managed in the world that constructed the instance:
+  ;; retiring that world while printing reads it gives the fallback form,
+  ;; although the type's home (the primary) is open.
+  (let [entered (promise)
+        release (promise)
+        p (sci/init {:runtime-mode :forkable
+                     :namespaces {'host {'entered #(deliver entered true)
+                                         'wait #(deref release 5000 :timeout)}}})
+        _ (sci/eval-string*
+           p "(deftype M [^:volatile-mutable n]
+                Object (hashCode [_] (host/entered) (host/wait) n)
+                       (toString [_] (str \"M\" n)))")
+        c (sci/fork p)
+        m (sci/eval-string* c "(->M 1)")
+        printed (future (try (pr-str m) (catch Exception e (str "EX " (ex-message e)))))]
+    (is (true? (deref entered 5000 :timeout)))
+    (sci/retire! c)
+    (deliver release true)
+    (is (re-find #"^#object\[user.M 0x[0-9a-f]+ \"retired SCI world\"\]$"
+                 (str (deref printed 5000 :timeout))))))
+
 (deftest a-host-read-racing-retirement-never-sees-a-cleared-array
   (let [p (forkable {})
         c (sci/fork p)

@@ -158,12 +158,16 @@
                (apply types/sci-invoke this args))]
       :clj [SciPrintMethod
             (-sci-print-method [this w]
-                               (world/call-with-type-admitted
-                                type
-                                #(if-let [pm (world/instance-print-method type-meta)]
-                                   (pm this w)
-                                   (.write ^java.io.Writer w ^String (clojure-str this)))
-                                #(.write ^java.io.Writer w ^String (retired-str this))))
+                               ;; rendered whole (buffered), else the fallback
+                               (.write ^java.io.Writer w
+                                       ^String (world/call-with-type-admitted
+                                                type
+                                                #(if-let [pm (world/instance-print-method type-meta)]
+                                                   (let [sw (java.io.StringWriter.)]
+                                                     (pm this sw)
+                                                     (str sw))
+                                                   (clojure-str this))
+                                                #(retired-str this))))
             clojure.lang.IFn
             (invoke [this] (types/type-call types/sci-invoke :clojure.lang/invoke type this))
             (invoke [this a] (types/type-call types/sci-invoke :clojure.lang/invoke type this a))
@@ -251,10 +255,10 @@
 #?(:cljs
    (defn fork-sci-type [^SciType this]
      (let [type (.-type this)
-           ;; the child's own prototype of the type; a world that only has
-           ;; the declaration has none: keep the construction prototype
+           ;; the child's own prototype of the type (its own slot only, never
+           ;; the home's); else keep the construction prototype
            proto (or (when (instance? lang/Type type)
-                       (:sci.impl/js-prototype (types/getVal type)))
+                       (:sci.impl/js-prototype (world/own-realization type)))
                      (js/Object.getPrototypeOf this))
            obj (js/Object.create proto)]
        (.call SciType obj
@@ -342,10 +346,16 @@
      (fn [_ w opts]
        (this-as self
          (if (implements? types/SciTypeInstance self)
-           (world/call-with-type-admitted
-            (types/-get-type self)
-            #(impl self w opts)
-            #(-write w (retired-str self)))
+           ;; rendered whole (buffered), else the fallback
+           (-write w (world/call-with-type-admitted
+                      (types/-get-type self)
+                      #(let [parts (array)]
+                         (impl self (reify IWriter
+                                      (-write [_ s] (.push parts s))
+                                      (-flush [_] nil))
+                               opts)
+                         (.join parts ""))
+                      #(retired-str self)))
            (impl self w opts))))))
 
 #?(:cljs
@@ -376,12 +386,13 @@
      (-install-native-protocol-on! (ensure-js-prototype t) proto-map impls)))
 
 (defn- mutable-type? [type]
+  ;; the effective definition (own, else home), never a declaration
   (and (utils/sci-type? type)
        (some (fn [field]
                (let [m (meta field)]
                  (or (:volatile-mutable m)
                      (:unsynchronized-mutable m))))
-             (:sci.impl/fields (types/getVal type)))))
+             (:sci.impl/fields (world/-data-for type)))))
 
 (defn ->type-impl [rec-name type type-meta m]
   (let [desc (when (and (world/current-world)
@@ -421,12 +432,21 @@
    (defmethod print-method SciType [v w]
      (-sci-print-method v w)))
 
+(defn declaration-type
+  "The Type an analysis of deftype*/defrecord allocates: its name, marked
+   declared inside a world (also in the host field, from which a primary's
+   first fork realizes its slots)."
+  [rec-type]
+  (lang/new-type (cond-> {:sci.impl/type-name rec-type}
+                   (world/current-world)
+                   (assoc :sci.impl/declared true))))
+
 (defn ^:private emit-deftype
   "Generate the common deftype boilerplate: declare, def type, defn factory, protocol-impls."
   [rec-type record-name factory-fn-sym fields factory-fn-body & [protocol-impls]]
   `(do
      (declare ~factory-fn-sym)
-     ;; the exact Type analysis created (record-name resolves to it) and
+     ;; the exact Type analysis created (record-name is that object) and
      ;; its namespace, not a lookup by name in the caller's namespace
      (sci.impl.deftype/-create-type
       ~{:sci.impl/type-name (list 'quote rec-type)
@@ -503,7 +523,7 @@
                                                                                (fn [this v]
                                                                                  (types/-mutate this field v)))
                                                                              field-set)))
-                          `(~'clojure.core/defmethod ~(fq-meth-name method-name) ~rec-type ~@bodies))))
+                          `(~'clojure.core/defmethod ~(fq-meth-name method-name) ~record-name ~@bodies))))
                      impls)))
             protocol-impls)]
        (emit-deftype rec-type record-name factory-fn-sym fields
@@ -572,7 +592,7 @@
                                       :impl `(fn ~@bodies)}])))
                            impls)]
                  [`(sci.impl.deftype/-install-native-protocol!
-                    ~rec-type ~protocol-name ~method-impls)])
+                    ~record-name ~protocol-name ~method-impls)])
                (let [protocol-var (:var protocol)
                      _ (when protocol-var
                          (vars/alter-var-root protocol-var
@@ -589,7 +609,7 @@
                  (map (fn [[method-name bodies]]
                         (let [bodies (map rest bodies)
                               bodies (transform-bodies bodies)]
-                          `(~'clojure.core/defmethod ~(fq-meth-name method-name) ~rec-type ~@bodies)))
+                          `(~'clojure.core/defmethod ~(fq-meth-name method-name) ~record-name ~@bodies)))
                       impls)))))
          protocol-impls)]
     (emit-record-type rec-type record-name constructor-fn-sym map-factory-sym
@@ -627,11 +647,11 @@
         ;; at eval time, adding the constructor var and (on CLJS) the JS
         ;; prototype.
         _ (utils/check-namespace-writable! ctx @(:env ctx) (symbol (namespace tagged-name)))
-        _ (let [t (lang/new-type (cond-> {:sci.impl/type-name rec-type}
-                                 ;; also in the host field: a primary's
-                                 ;; first fork realizes its slots from it
-                                 (world/current-world)
-                                 (assoc :sci.impl/declared true)))]
+        ;; The Type this analysis carries through its whole expansion
+        ;; (declaration, -create-type, factories, method installs): never
+        ;; resolved by name again. defrecord allocated it at macroexpansion.
+        t (or (:sci.impl/type iface-meta) (declaration-type rec-type))
+        _ (do
             ;; Analysis only declares the type (slot first: the mapping
             ;; makes it reachable, also to a fork). -create-type defines it
             ;; in the evaluating world, which becomes its home.
@@ -646,7 +666,7 @@
           ;; (factory fns are in the macro expansion)
           (let [constructor-fn-sym (symbol (str "__" factory-fn-str "__ctor__"))
                 map-factory-sym (symbol (str "map->" record-name))]
-            (analyze-defrecord* ctx form rec-type record-name
+            (analyze-defrecord* ctx form rec-type t
                                 constructor-fn-sym map-factory-sym
                                 field-set protocol-impls))
           ;; Standard deftype code generation
@@ -704,7 +724,7 @@
                        protocols-form (if (seq protocols)
                                        `#{~@(map (fn [p] (list 'deref (:var p))) protocols)}
                                        `#{})]
-                   (emit-deftype rec-type record-name factory-fn-sym fields
+                   (emit-deftype rec-type t factory-fn-sym fields
                                  `(defn ~(with-meta factory-fn-sym
                                            {:doc (str "Positional factory function for class " rec-type ".")
                                             :arglists (list fields)})
@@ -712,7 +732,7 @@
                                     (~constructor-sym {:methods (hash-map ~@method-entries)
                                                        :fields (hash-map ~@field-entries)
                                                        :protocols ~protocols-form}))))
-                 (standard-scitype-path ctx form rec-type record-name factory-fn-sym
+                 (standard-scitype-path ctx form rec-type t factory-fn-sym
                                         fields field-set protocol-impls error-hint)))
              :default
              (let [transform-bodies
@@ -771,7 +791,7 @@
                                       impls)]
                             [(@utils/analyze analyze-ctx
                               `(sci.impl.deftype/-install-native-protocol!
-                                ~rec-type ~protocol-name ~method-impls))])
+                                ~t ~protocol-name ~method-impls))])
                           (let [protocol-var (:var protocol)
                                 _ (when protocol-var
                                     (vars/alter-var-root protocol-var update :satisfies
@@ -786,14 +806,14 @@
                                    (let [bodies (map rest bodies)
                                          bodies (transform-bodies bodies)]
                                      (@utils/analyze analyze-ctx
-                                      `(~'clojure.core/defmethod ~(fq-meth-name method-name) ~rec-type ~@bodies))))
+                                      `(~'clojure.core/defmethod ~(fq-meth-name method-name) ~t ~@bodies))))
                                  impls)))))
                     protocol-impls)]
-               (emit-deftype rec-type record-name factory-fn-sym fields
+               (emit-deftype rec-type t factory-fn-sym fields
                             `(defn ~(with-meta factory-fn-sym
                                       {:doc (str "Positional factory function for class " rec-type ".")})
                                ~fields
-                               (sci.impl.deftype/->type-impl '~rec-type ~record-name ~record-name (zipmap ~(list 'quote fields) ~fields)))
+                               (sci.impl.deftype/->type-impl '~rec-type ~t ~t (zipmap ~(list 'quote fields) ~fields)))
                             protocol-impls))))]
     (if top-level?
       (types/->EvalForm result)

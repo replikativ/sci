@@ -31,12 +31,10 @@
                  :let [ns-obj (:obj ns-map)]
                  :when ns-obj]
            (world/register-namespace! ns-obj (meta ns-obj)))
-         (doseq [[_ ns-map] (:namespaces @(:env ctx))
-                 [_ t] (:types ns-map)
-                 :when (utils/sci-type? t)]
-           (world/register-type!
-            t (types/getVal t)
-            #?(:cljs deftype/fork-type-data :default nil)))
+         ;; Types are not registered: registering an existing Type handle
+         ;; neither elects, moves nor erases its home and writes no slot (a
+         ;; world without the type's definition reads its home, else its
+         ;; host field). Only -create-type defines a type.
          (doseq [[_ ns-map] (:namespaces @(:env ctx))
                  [_ v] ns-map
                  :when (and (utils/var? v)

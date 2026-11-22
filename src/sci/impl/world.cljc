@@ -814,23 +814,25 @@
                      (if (retired-error? e) false (throw e))))))))))
 
 (defn call-with-type-admitted
-  "Printing an instance of SCI type `t`: admit `t`'s home on this thread
-   before any method runs and hold the admission through `(render)`, so a
-   retirement meanwhile cannot make printing throw. When the home is already
-   retired (and the active world has no definition of its own), `(fallback)`
-   prints without user code."
+  "Printing an instance of SCI type `t`: `(render)` returns the whole printed
+   form as a string (it writes nowhere). It runs with `t`'s home admitted on
+   this thread, held through rendering, so the home's retirement meanwhile
+   cannot interrupt it. If the home is already retired (and the active world
+   has no definition of its own), or rendering raises a retired-world error
+   from any world it touches (a mutable field managed in a retired world, a
+   method made in a retired world), `(fallback)` gives the form instead: the
+   printer writes either the whole rendering or the fallback."
   [t render fallback]
   (let [home-ctx (when (and (some? t) (-world-tracked? t)) (-world-home-ctx t))
         active (when home-ctx (active-world-state))]
-    (if (or (nil? home-ctx)
-            (and active (not (identical? absent (own-definition active t true)))))
-      (render)
-      (let [started (volatile! false)]
-        (try (call-admitted home-ctx #(do (vreset! started true) (render)))
-             (catch #?(:cljd Object :clj Exception :cljs :default) e
-               (if (and (not @started) (retired-error? e))
-                 (fallback)
-                 (throw e))))))))
+    (try (if (or (nil? home-ctx)
+                 (and active (not (identical? absent (own-definition active t true)))))
+           (render)
+           (call-admitted home-ctx render))
+         (catch #?(:cljd Object :clj Exception :cljs :default) e
+           (if (retired-error? e)
+             (fallback)
+             (throw e))))))
 
 (defn assert-type-usable!
   "Refuse with the retired error unless `(type-usable? t)`."
@@ -1414,7 +1416,7 @@
   "Analysis of a deftype: the type's slot holds its declaration `data` (its
    name, marked `:sci.impl/declared`) before the namespace mapping publishes the
    type, so a fork in between keeps it undefined. Marks no home: the world
-   that evaluates the deftype defines the type (`register-type!`)."
+   that evaluates the deftype defines the type (`-create-type`)."
   [handle data value-fork-fn]
   (when-let [^DenseWorld world (current-world)]
     (let [{:keys [value-slot]}
@@ -1435,29 +1437,25 @@
     (-mark-world-tracked! handle store/*ctx*))
   handle)
 
-(defn register-type!
-  "Register type `handle` with `data` in the current world (written if the
-   world has no realization). Host-provided (defined) data elects the home;
-   a declaration (`:sci.impl/declared`) never does. `-create-type` passes
-   `elect? false` and elects after its definition is written."
-  ([handle data]
-   (register-type! handle data nil))
-  ([handle data value-fork-fn]
-   (register-type! handle data value-fork-fn true))
-  ([handle data value-fork-fn elect?]
-   (when-let [^DenseWorld world (current-world)]
-     (let [{:keys [value-slot]}
-           (allocate-descriptor! world handle :type false value-fork-fn)]
-       (ensure-capacity! world (inc value-slot))
-       (with-cells-read-lock
-         world
-         #(let [cells (current-cells world)]
-            (when (identical? absent (cells-get cells value-slot))
-              (cells-set! cells value-slot data)))))
-     ;; worlds without the type's definition (and host calls) read it there
-     (when (and elect? (not (declared? data)))
-       (elect-type-home! handle)))
-   handle))
+(defn define-type-slot!
+  "`-create-type`, before it writes the definition (`setVal`, mirrored in a
+   primary's host field) and elects the home (`elect-type-home!`): the type's
+   descriptor in the current world, with the clone fn forks use."
+  [handle value-fork-fn]
+  (when-let [^DenseWorld world (current-world)]
+    (let [{:keys [value-slot]}
+          (allocate-descriptor! world handle :type false value-fork-fn)]
+      (ensure-capacity! world (inc value-slot))))
+  handle)
+
+(defn own-realization
+  "The current world's own slot value of type `handle` (also a declaration),
+   or nil: no home or host-field lookup (a fork copying a CLJS instance)."
+  [handle]
+  ;; the selected world: during a fork's copy, the child
+  (when-let [^DenseWorld w (selected-world)]
+    (let [v (cell-value w (:value-slot (descriptor w handle)))]
+      (when-not (identical? absent v) v))))
 
 (defn- reset-slot! [^DenseWorld world slot value mirror]
   (if (nil? slot)
