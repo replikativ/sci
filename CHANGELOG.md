@@ -12,6 +12,63 @@ SCI is used in [babashka](https://github.com/babashka/babashka),
 
 ## Unreleased
 
+- **Security / sandbox fix: copy-time fork policy no longer depends on
+  mutable metadata.** A Var's copy-time fork fn runs inside a fork's copy
+  section, under the source world's publish and slot write locks. It was
+  read from the Var's `:sci.impl/fork-fn` metadata, which interpreted code
+  could set with `def`, `defonce`, `intern` (a `with-meta` / `vary-meta`
+  symbol), or `reset-meta!` / `alter-meta!` followed by a root bind, unbind
+  or watch registration, including by upgrading an existing descriptor.
+  Agent code could thereby run arbitrary code under the copy locks during
+  every fork and change what a fork's child received. Now:
+  - A Var's copier comes only from SCI's own registrations (`*loaded-libs*`,
+    CLJS type data, ClojureDart method tables) and from the host's new
+    `:fork-fns` option. The `:sci.impl/fork-fn` metadata key is ignored,
+    with no compatibility path: whoever installs a namespace does not prove
+    who wrote its Vars' metadata.
+  - `:sci/built-in` is a trusted flag of the Var or namespace object, set
+    by host constructors (`new-var`, `new-dynamic-var`, `new-macro-var`,
+    `copy-var`, `copy-var*`, `create-ns`, SCI's own tables) from their
+    construction metadata. Write protection, a Var's home and whether a
+    fork processes its value read the flag, never the current metadata, so
+    interpreted metadata can neither set nor clear it (`def`, `defonce`,
+    `intern`, `ns`, `reset-meta!`, `alter-meta!`). An `:unrestricted`
+    context's evaluation is host-trusted (it may already alter built-in
+    Vars), so its metadata writes still set or clear the flag.
+    `sci/intern` follows the evaluation rule: build host built-in Vars with
+    `new-var`.
+  - CLJS: interpreted `alter-meta!` of a type, and a direct
+    `sci.impl.deftype/-create-type` call, can no longer replace the type's
+    JS prototype, the operand of the fixed type-data copier.
+  - The copy-section participants and their rule (no user code, waits only
+    on leaf locks) are documented in `sci.impl.world`. The locks are
+    blocking and non-fair: waiting under them is acyclic but has no time
+    bound.
+- New `:fork-fns` option of `init` and `merge-opts`: a map from SCI Var to
+  a one-argument copy-time fork fn, run on the Var's value while a fork
+  copies the source (instead of `Forkable` / `:fork-fn` processing after
+  the copy). It is trusted host code: it must not block, take a lock or run
+  interpreted code. It is lineage policy (every fork and sibling of the
+  context), installed when the host calls `init` / `merge-opts`: installing
+  the same fn again is a no-op, a different one is refused, and nothing an
+  evaluation does installs or changes one.
+- Migration: an embedder that marked host Vars with
+  `(alter-meta! v assoc :sci.impl/fork-fn f)` passes them as
+  `:fork-fns {v f}` to the `init` or `merge-opts` call that installs them.
+  For example, Vars whose values must stay shared by every fork (because
+  host functions rebind those same Var handles dynamically):
+
+  ```clojure
+  (sci/merge-opts ctx {:namespaces {'clojure.test test-namespace}
+                       :fork-fns {test-out identity, report identity}})
+  ```
+
+  Without the migration those Vars' values get the default fork processing,
+  which refuses unmanaged mutable host values: the fork fails rather than
+  running the old copier. A `sci.lang.Var` / `sci.lang.Namespace` built
+  with its positional constructor takes one more argument (the trusted
+  built-in flag); use `sci/new-var` and `sci/create-ns`.
+
 ## 0.15.60-replikativ.1
 
 - Merge upstream SCI 0.15.60 and master through `be4048ec` (the `Env`
