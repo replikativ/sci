@@ -35,7 +35,7 @@
             prev
             (do (utils/check-namespace-writable! ctx @env cnn)
                 (let [m (meta prev)]
-                  (lang/->Var prev var-name m false false nil (:ns m) false))))]
+                  (lang/->Var prev var-name m false false nil (:ns m) false false))))]
     (if-let [world (:sci.impl/world ctx)]
       ;; Value and metadata are one publication, and one definition's pair is
       ;; never interleaved with another's. Var watches (user code) are

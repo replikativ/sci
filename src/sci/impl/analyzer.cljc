@@ -934,6 +934,8 @@
                                       false
                                       nil
                                       @utils/current-ns
+                                      false
+                                      ;; untrusted: see vars/sync-built-in!
                                       false)
                       (vars/unbind))]
         (swap! env

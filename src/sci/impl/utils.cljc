@@ -241,13 +241,15 @@
 
 (defn check-namespace-writable!
   "Refuse adding, removing or reloading names of namespace `ns-sym` when the
-  host marked it read-only: `:sci/built-in` in the metadata of its namespace
-  object (e.g. `(sci/create-ns 'lib {:sci/built-in true})` as the `:obj` of
-  its `:namespaces` / `add-namespace!` map). Unrestricted contexts may."
+  host marked it read-only: `:sci/built-in` in the metadata its namespace
+  object was created with (`(sci/create-ns 'lib {:sci/built-in true})` as the
+  `:obj` of its `:namespaces` / `add-namespace!` map). That trusted flag
+  (`sci.impl.world/IBuiltIn`) decides, never the current metadata.
+  Unrestricted contexts may."
   [ctx env ns-sym]
   (when-not (:unrestricted ctx)
     (when-let [ns-obj (get-in env [:namespaces ns-sym :obj])]
-      (when (:sci/built-in (meta ns-obj))
+      (when (world/-built-in? ns-obj)
         (throw (ex-info (str "Built-in namespace " ns-sym " is read-only.")
                         {:type :sci/error :namespace ns-sym})))))
   nil)
@@ -261,7 +263,8 @@
         ns-map (get-in env* [:namespaces ns-sym])
         ns-obj (or (:obj ns-map)
                    (when (or ns-map create?)
-                     (let [ns-obj (lang/->Namespace ns-sym attr-map)]
+                     (let [ns-obj (lang/->Namespace ns-sym attr-map
+                                                   (vars/evaluation-built-in attr-map))]
                        ;; Slot first: the mapping makes the namespace
                        ;; reachable (also to a fork).
                        (world/register-namespace! ns-obj attr-map)
@@ -373,12 +376,13 @@
    (dynamic-var name init-val (meta name)))
   ([name init-val meta]
    (let [meta (assoc meta :dynamic true :name (unqualify-symbol name))]
-     (lang/->Var init-val name meta false false nil (:ns meta) false))))
+     (lang/->Var init-val name meta false false nil (:ns meta) false
+                 (boolean (:sci/built-in meta))))))
 
 ;; foundational namespaces
-(def user-ns (lang/->Namespace 'user nil))
+(def user-ns (lang/->Namespace 'user nil false))
 
-(def clojure-core-ns (lang/->Namespace 'clojure.core nil))
+(def clojure-core-ns (lang/->Namespace 'clojure.core nil false))
 
 (def current-file
   (dynamic-var '*file* nil
@@ -395,13 +399,18 @@
     (if (symbol? curr-ns) curr-ns (t/getName curr-ns))))
 
 (defn new-var
-  "Returns a new sci var."
+  "Returns a new sci var. Its trusted built-in flag (`sci.impl.world/IBuiltIn`)
+  is `built-in`, by default `:sci/built-in` of `meta`: SCI's own tables. A
+  Var evaluation creates passes `vars/evaluation-built-in`."
   ([name] (doto (new-var name nil nil)
             (vars/unbind)))
   ([name init-val] (new-var name init-val (meta name)))
   ([name init-val meta]
+   (new-var name init-val meta (boolean (:sci/built-in meta))))
+  ([name init-val meta built-in]
    (let [meta (assoc meta :name (unqualify-symbol name))]
-     (lang/->Var init-val name meta false nil nil (:ns meta) false))))
+     (lang/->Var init-val name meta false nil nil (:ns meta) false
+                 (boolean built-in)))))
 
 (defn var? [x]
   (instance? #?(:cljd lang/Var :clj sci.lang.Var :cljs sci.lang.Var) x))
@@ -415,7 +424,7 @@
         allow (:allow ctx)
         deny (:deny ctx)]
     (and (or (not allow)
-             (and (var? v) (not (:sci/built-in (meta v))))
+             (and (var? v) (not (world/-built-in? v)))
              (contains? allow check-sym))
          (or (not deny)
              (and (not (contains? deny check-sym))

@@ -520,7 +520,7 @@
     (zipmap (keys aliases)
             (map (fn [sym]
                    (or (sci.impl.utils/namespace-object (:env ctx) sym false nil)
-                       (sci.lang/->Namespace sym nil)))
+                       (sci.lang/->Namespace sym nil false)))
                  (vals aliases)))))
 
 (defn sci-ns-aliases [sci-ns]
@@ -695,7 +695,10 @@
             (check-intern-permission ctx ns-name var-sym v)
             v)
           (let [_ (sci.impl.utils/check-namespace-writable! ctx @env ns-name)
-                new-var (sci.impl.utils/new-var var-sym nil (assoc (meta var-sym) :ns ns))]
+                m (assoc (meta var-sym) :ns ns)
+                ;; the name symbol's metadata is evaluation's: untrusted
+                new-var (sci.impl.utils/new-var var-sym nil m
+                                                (sci.impl.vars/evaluation-built-in m))]
             (sci.impl.vars/unbind new-var)
             (swap! env assoc-in [:namespaces ns-name var-sym] new-var)
             new-var)))))
@@ -715,8 +718,9 @@
                 ;; lineage registry keeps this Var (and its raw root) for the
                 ;; lineage's lifetime, which must not retain the child's value.
                 child? (and (:sci.impl/world ctx) (not (world/primary-world?)))
-                new-var (sci.impl.utils/new-var var-sym (when-not child? val)
-                                                (assoc (meta var-sym) :ns ns))]
+                m (assoc (meta var-sym) :ns ns)
+                new-var (sci.impl.utils/new-var var-sym (when-not child? val) m
+                                                (sci.impl.vars/evaluation-built-in m))]
             ;; Slots first: the mapping makes the Var reachable.
             (if child?
               (world/register-var! new-var val (meta new-var))
@@ -960,7 +964,7 @@
 #?(:clj
    (def clojure-lang
      {:private true
-      :obj (sci.lang/->Namespace 'clojure.lang nil)
+      :obj (sci.lang/->Namespace 'clojure.lang nil false)
       ;; IDeref as protocol instead of class
       'IDeref core-protocols/deref-protocol
       'deref core-protocols/deref
@@ -987,6 +991,10 @@
   ([data] (-create-type data nil nil))
   ([data t ns-sym]
    (let [ctx (store/get-ctx)
+         ;; SCI's expansion never passes a prototype, and `-create-type` is
+         ;; reachable from interpreted code: the JS prototype (the operand of
+         ;; the fixed copier `fork-type-data`) only comes from SCI below
+         data (dissoc data :sci.impl/js-prototype)
          env (:env ctx)
          cnn (or ns-sym (sci.impl.utils/current-ns-name))
          type-name (symbol (let [s (clojure.core/str (:sci.impl/type-name data))
@@ -1050,14 +1058,14 @@
      t)))
 
 (def sci-impl-records
-  {:obj (sci.lang/->Namespace 'sci.impl.records nil)
+  {:obj (sci.lang/->Namespace 'sci.impl.records nil false)
    :private true
    'toString sci.impl.records/to-string
    '-create-record-type -create-type
    '->record-impl sci.impl.records/->record-impl})
 
 (def sci-impl-deftype
-  {:obj (sci.lang/->Namespace 'sci.impl.deftype nil)
+  {:obj (sci.lang/->Namespace 'sci.impl.deftype nil false)
    :private true
    'toString sci.impl.deftype/to-string
    #?@(:clj ['equals sci.impl.deftype/equals
@@ -1086,7 +1094,7 @@
      sci.impl.records/to-string :sci.impl.records/toString}))
 
 (def sci-impl-protocols
-  {:obj (sci.lang/->Namespace 'sci.impl.protocols nil)
+  {:obj (sci.lang/->Namespace 'sci.impl.protocols nil false)
    :private true
    #?@(:cljs ['-extend-native! sci.impl.protocols/-extend-native!])
    'type->str sci.impl.protocols/type->str
@@ -1244,26 +1252,31 @@
          (utils/namespace? iref)
          (let [current-meta (meta iref)]
            (vars/with-writeable-namespace iref current-meta
-             (if (world/current-world)
-               (world/alter-namespace-meta!
-                iref current-meta f args
-                (when (world/primary-world?) #(sci.lang/-mirror-meta! iref %)))
-               (apply cljs.core/alter-meta! iref f args))))
+             (vars/sync-built-in!
+              iref
+              (if (world/current-world)
+                (world/alter-namespace-meta!
+                 iref current-meta f args
+                 (when (world/primary-world?) #(sci.lang/-mirror-meta! iref %)))
+                (apply cljs.core/alter-meta! iref f args)))))
 
          (utils/var? iref)
          (let [current-meta (meta iref)]
            (vars/with-writeable-var iref current-meta
-             (if (world/current-world)
-               (world/alter-var-meta!
-                iref current-meta f args
-                (when (world/primary-world?) #(sci.lang/-mirror-meta! iref %)))
-               (apply cljs.core/alter-meta! iref f args))))
+             (vars/sync-built-in!
+              iref
+              (if (world/current-world)
+                (world/alter-var-meta!
+                 iref current-meta f args
+                 (when (world/primary-world?) #(sci.lang/-mirror-meta! iref %)))
+                (apply cljs.core/alter-meta! iref f args)))))
 
          (utils/sci-type? iref)
          ;; this world's own data, copied first (with its own JS prototype)
          ;; when it has none: never another world's
-         (types/setVal iref (apply f (world/-own-data! iref sci.impl.deftype/fork-type-data)
-                                   args))
+         (types/setVal iref (sci.impl.deftype/altered-type-data
+                             (world/-own-data! iref sci.impl.deftype/fork-type-data)
+                             f args))
 
          :else
          (let [m (meta iref)]
@@ -1280,20 +1293,24 @@
          (utils/namespace? iref)
          (let [current-meta (meta iref)]
            (vars/with-writeable-namespace iref current-meta
-             (if (world/current-world)
-               (do (world/reset-namespace-meta!
-                    iref m (when (world/primary-world?) #(sci.lang/-mirror-meta! iref %)))
-                   m)
-               (cljs.core/reset-meta! iref m))))
+             (vars/sync-built-in!
+              iref
+              (if (world/current-world)
+                (do (world/reset-namespace-meta!
+                     iref m (when (world/primary-world?) #(sci.lang/-mirror-meta! iref %)))
+                    m)
+                (cljs.core/reset-meta! iref m)))))
 
          (utils/var? iref)
          (let [current-meta (meta iref)]
            (vars/with-writeable-var iref current-meta
-             (if (world/current-world)
-               (do (world/reset-var-meta!
-                    iref m (when (world/primary-world?) #(sci.lang/-mirror-meta! iref %)))
-                   m)
-               (cljs.core/reset-meta! iref m))))
+             (vars/sync-built-in!
+              iref
+              (if (world/current-world)
+                (do (world/reset-var-meta!
+                     iref m (when (world/primary-world?) #(sci.lang/-mirror-meta! iref %)))
+                    m)
+                (cljs.core/reset-meta! iref m)))))
 
          :else
          (cljs.core/reset-meta! iref m)))))
@@ -1376,7 +1393,13 @@
                  imap))]
     `(let* [~ge ~e] (case* ~ge 0 0 ~default ~imap :sparse :hash-equiv nil))))
 
-(defn- fork-loaded-libs [libs]
+(defn fork-loaded-libs
+  "SCI's own copier of the `*loaded-libs*` Var (installed by `init` /
+   `merge-opts`, `sci.impl.world/install-var-fork-fns!`). Its operand is the
+   Var's root: a built-in Var only SCI writes, holding a ref (an atom off the
+   JVM) that only SCI's `add-loaded-lib` updates with `conj`. The deref runs
+   no user code; on the JVM it may wait for that short commit's ref lock."
+  [libs]
   (#?(:clj ref :cljs atom :cljd atom) @libs))
 
 (defn loaded-libs** [syms]
@@ -1388,8 +1411,7 @@
    {:doc "A ref to a sorted set of symbols representing loaded libs"
     :ns clojure-core-ns
     :private true
-    :sci/built-in true
-    :sci.impl/fork-fn fork-loaded-libs}))
+    :sci/built-in true}))
 
 (defn loaded-libs* []
   (-> (store/get-ctx) :env deref :namespaces
@@ -1565,7 +1587,7 @@
        [p f]
        (.finally p (vars/binding-continuation-fn f)))
 
-     (def async-await-namespace (sci.lang/->Namespace 'sci.impl.async-await nil))))
+     (def async-await-namespace (sci.lang/->Namespace 'sci.impl.async-await nil false))))
 
 (defn eval* [form]
   (let [ctx (store/get-ctx)]
@@ -2561,7 +2583,7 @@
                                    (+ 2 (- (count (.getStackTrace cause))
                                            (count st)))))))))))))
 
- (def clojure-repl-namespace (sci.lang/->Namespace 'clojure.repl nil))
+ (def clojure-repl-namespace (sci.lang/->Namespace 'clojure.repl nil false))
 
  (def clojure-repl
    {:obj clojure-repl-namespace
@@ -2589,17 +2611,17 @@
      `(do ~@(map (fn [a] (apply-template argv expr a))
                  (partition c values)))))
 
- (def clojure-template-namespace (sci.lang/->Namespace 'clojure.template nil))
+ (def clojure-template-namespace (sci.lang/->Namespace 'clojure.template nil false))
 
  (def clojure-template
    {:obj clojure-template-namespace
     'apply-template (copy-var apply-template clojure-template-namespace)
     'do-template (macrofy 'do-template do-template clojure-template-namespace)})
 
- (def clojure-string-namespace (sci.lang/->Namespace 'clojure.string nil))
- (def clojure-set-namespace (sci.lang/->Namespace 'clojure.set nil))
- (def clojure-walk-namespace (sci.lang/->Namespace 'clojure.walk nil))
- (def clojure-edn-namespace (sci.lang/->Namespace 'clojure.edn nil))
+ (def clojure-string-namespace (sci.lang/->Namespace 'clojure.string nil false))
+ (def clojure-set-namespace (sci.lang/->Namespace 'clojure.set nil false))
+ (def clojure-walk-namespace (sci.lang/->Namespace 'clojure.walk nil false))
+ (def clojure-edn-namespace (sci.lang/->Namespace 'clojure.edn nil false))
 
  (def macroexpand-all
    (sci.lang/->Var (fn [form]
@@ -2617,6 +2639,7 @@
                   nil
                   nil
                   clojure-walk-namespace
+                  false
                   false))
 
  (def clojure-walk-ns

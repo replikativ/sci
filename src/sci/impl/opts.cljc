@@ -13,15 +13,34 @@
   #?@(:cljd [] :clj [(:import
                        [sci.impl.types ICustomType])]))
 
-(defn- register-vars! [ctx]
+(defn- install-fork-fns!
+  "Host install time: the copy-time fork fns of `fork-fns` (SCI Var ->
+   copier) for `ctx`'s lineage (`sci.impl.world/install-var-fork-fns!`).
+   Before the Vars are registered, so their descriptors are created with the
+   copier. A standard context has no forks: nothing to install."
+  [ctx fork-fns]
+  (when-let [world (:sci.impl/world ctx)]
+    (when (seq fork-fns)
+      (doseq [[v f] fork-fns]
+        (when-not (and (utils/var? v) (ifn? f))
+          (throw (ex-info ":fork-fns maps SCI Vars to fork functions."
+                          {:var v :fork-fn f}))))
+      (world/install-var-fork-fns! world fork-fns))))
+
+(defn- register-vars!
+  "Register the environment's Vars and namespaces in `ctx`'s world.
+   `loaded-libs` is the `*loaded-libs*` Var `init-env!` just created: SCI's
+   own copier is installed for it first (never through Var metadata)."
+  [ctx loaded-libs]
   (when (:sci.impl/world ctx)
+    (install-fork-fns! ctx {loaded-libs namespaces/fork-loaded-libs})
     (store/with-ctx ctx
       (world/with-active-world
         ctx
         #(do
          ;; Mark the exact shipped native handles before visiting environment
          ;; Vars: an embedding may alias one under another namespace/key. Some
-         ;; lack :sci/built-in metadata, which must remain unchanged because it
+         ;; are not :sci/built-in, which must remain unchanged because it
          ;; also governs mutation permissions and fork classification.
          (doseq [v (concat (mapcat vals (vals namespaces/namespaces))
                           (vals namespaces/forkable-core-overrides))
@@ -58,7 +77,8 @@
 
 (defn init-env! [env aliases namespaces classes raw-classes imports
                  load-fn #?(:cljs async-load-fn) #?(:cljs js-libs) ns-aliases]
-  (swap! env (fn [env]
+  ;; returns the `*loaded-libs*` Var this call installed
+  (-> (swap! env (fn [env]
                (let [env #?(:clj (if (instance? Env env) env (map->Env env))
                             :default (or env {}))
                      env-nss (:namespaces env)
@@ -97,7 +117,8 @@
                         :class->opts (:class->opts classes)
                         #?@(:cljd [:type->opts (:type->opts classes)])
                         :raw-classes raw-classes
-                        :ns-aliases ns-aliases)))))
+                        :ns-aliases ns-aliases))))
+      (get-in [:namespaces 'clojure.core '*loaded-libs*])))
 
 (defn process-permissions [prev-perms & permissions]
   (not-empty (into prev-perms (comp cat (map strip-core-ns)) permissions)))
@@ -288,6 +309,7 @@
            unrestricted
            runtime-mode
            fork-fn
+           fork-fns
            #?(:cljs async-load-fn)
            #?(:cljs js-libs)
            ns-aliases]}]
@@ -303,7 +325,7 @@
                                       {'clojure.core
                                        namespaces/forkable-core-overrides}))
                      bindings (merge {'user (assoc bindings :obj utils/user-ns)}))
-        _ (init-env! env aliases namespaces classes raw-classes imports
+        loaded-libs (init-env! env aliases namespaces classes raw-classes imports
                      load-fn #?(:cljs async-load-fn) #?(:cljs js-libs) ns-aliases)
         world-root (when (= :forkable runtime-mode) (world/new-world))
         ctx (assoc (->ctx {} env features readers (or allow deny)
@@ -322,7 +344,8 @@
                    :sci.impl/lineage (when world-root (atom nil))
                    :sci.impl/primary? (when world-root true)
                    #?@(:clj [:main-thread-id (.getId (Thread/currentThread))]))]
-    (register-vars! ctx)
+    (install-fork-fns! ctx fork-fns)
+    (register-vars! ctx loaded-libs)
     ctx))
 
 (defn merge-opts [ctx opts]
@@ -341,6 +364,7 @@
                 deftype-fn
                 runtime-mode
                 fork-fn
+                fork-fns
                 #?(:cljs async-load-fn)
                 #?(:cljs js-libs)
                 ns-aliases]
@@ -359,7 +383,9 @@
         classes (normalize-classes raw-classes)
         namespaces (cond-> namespaces
                      bindings (merge {'user (assoc bindings :obj utils/user-ns)}))
-        _ (init-env! !env aliases namespaces classes raw-classes imports load-fn #?(:cljs async-load-fn) #?(:cljs js-libs) ns-aliases)
+        ;; the copiers before the mappings make the Vars reachable
+        _ (install-fork-fns! ctx fork-fns)
+        loaded-libs (init-env! !env aliases namespaces classes raw-classes imports load-fn #?(:cljs async-load-fn) #?(:cljs js-libs) ns-aliases)
         interrupt-fn (if (contains? opts :interrupt-fn) (:interrupt-fn opts) (:interrupt-fn ctx))
         unrestricted (if (contains? opts :unrestricted) (:unrestricted opts) (:unrestricted ctx))
         fork-fn (if (contains? opts :fork-fn) fork-fn (:fork-fn ctx))
@@ -377,5 +403,5 @@
                    :sci.impl/lineage (:sci.impl/lineage ctx)
                    :sci.impl/primary? (:sci.impl/primary? ctx)
                    :main-thread-id (:main-thread-id ctx))]
-    (register-vars! ctx)
+    (register-vars! ctx loaded-libs)
     ctx))

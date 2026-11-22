@@ -49,7 +49,8 @@
   ([name init-val] (new-var name init-val (meta name)))
   ([name init-val meta]
    (let [meta (assoc meta :name (utils/unqualify-symbol name))]
-     (sci.lang/->Var init-val name meta false false nil (:ns meta) false))))
+     (sci.lang/->Var init-val name meta false false nil (:ns meta) false
+                     (boolean (:sci/built-in meta))))))
 
 (defn new-dynamic-var
   "Same as new-var but adds :dynamic true to meta."
@@ -58,7 +59,8 @@
   ([name init-val] (new-dynamic-var name init-val (meta name)))
   ([name init-val meta]
    (let [meta (assoc meta :dynamic true :name (utils/unqualify-symbol name))]
-     (sci.lang/->Var init-val name meta false false nil (:ns meta) false))))
+     (sci.lang/->Var init-val name meta false false nil (:ns meta) false
+                     (boolean (:sci/built-in meta))))))
 
 (defn with-detached-context
   "Invoke zero-argument `f` outside the currently executing SCI context.
@@ -116,7 +118,8 @@
      (sci.lang/->Var
       (vary-meta init-val
                  assoc :sci/macro true)
-      name meta false false nil (:ns meta) false))))
+      name meta false false nil (:ns meta) false
+      (boolean (:sci/built-in meta))))))
 
 (macros/deftime
   (defmacro copy-var
@@ -321,12 +324,14 @@
    (fn []
      (let [current (meta v)]
        (vars/with-writeable-var v current
-         (if (world/current-world)
-           (world/alter-var-meta! v current f args
-                                  (when (world/primary-world?)
-                                    #(sci.lang/-mirror-meta! v %)))
-           (apply #?(:cljd utils/alter-meta!* :default c/alter-meta!)
-                  v f args)))))))
+         (vars/sync-built-in!
+          v
+          (if (world/current-world)
+            (world/alter-var-meta! v current f args
+                                   (when (world/primary-world?)
+                                     #(sci.lang/-mirror-meta! v %)))
+            (apply #?(:cljd utils/alter-meta!* :default c/alter-meta!)
+                   v f args))))))))
 
 (defn reset-var-meta!
   "Reset metadata for SCI Var `v` in its home or explicitly selected world."
@@ -336,19 +341,23 @@
    (fn []
      (let [current (meta v)]
        (vars/with-writeable-var v current
-         (if (world/current-world)
-           (do (world/reset-var-meta! v m
-                                      (when (world/primary-world?)
-                                        #(sci.lang/-mirror-meta! v %)))
-               m)
-           (utils/reset-meta!* v m)))))))
+         (vars/sync-built-in!
+          v
+          (if (world/current-world)
+            (do (world/reset-var-meta! v m
+                                       (when (world/primary-world?)
+                                         #(sci.lang/-mirror-meta! v %)))
+                m)
+            (utils/reset-meta!* v m))))))))
 
 (defn intern
   "Finds or creates a sci var named by the symbol name in the namespace
   ns (which can be a symbol or a sci namespace), setting its root
   binding to val if supplied. The namespace must exist in the ctx. The
   sci var will adopt any metadata from the name symbol.  Returns the
-  sci var."
+  sci var. Interning is the operation interpreted code performs too, so
+  `:sci/built-in` on the name makes a new Var read-only only in an
+  `:unrestricted` ctx; build host built-in Vars with `new-var`."
   ([ctx sci-ns name]
    (store/with-ctx ctx
      (world/with-active-world ctx #(namespaces/sci-intern sci-ns name))))
@@ -387,6 +396,19 @@
   values held in SCI world cells that do not implement `sci.fork/Forkable` and
   need application-specific isolation. SCI-owned mutable primitives are
   already world-relative and retain identity.
+
+  - `:fork-fns`: optional map from SCI Var to a one-argument copy-time fork
+  fn (also accepted by `merge-opts`; ignored by a `:standard` context). A
+  fork calls it on the Var's value while it copies the source world, under
+  the source's write locks, instead of `Forkable`/`:fork-fn` processing
+  after the copy: it is trusted host code that must not block, take a lock
+  or run interpreted code. `identity` keeps a host Var's value (e.g. an
+  implementation table whose Vars are rebound dynamically) shared by every
+  fork. It is policy for the whole lineage (all forks and siblings of the
+  context), installed when the host calls `init` / `merge-opts` and never
+  changed afterwards: the same fn again is a no-op, a different one is
+  refused. This option is the only way a Var gets a copier; Var metadata
+  (formerly `:sci.impl/fork-fn`) is ignored.
 
   - `:runtime-mode`: `:standard` (the default) retains SCI's direct hot paths.
   `:forkable` enables isolated runtime worlds for Vars, dynamic bindings and
@@ -505,10 +527,13 @@
            :val #(fns/contextualize ctx %))))
 
 (defn create-ns
-  "Creates namespace object. Can be used in var metadata."
+  "Creates namespace object. Can be used in var metadata. `:sci/built-in` in
+  `meta` makes it read-only to interpreted code: as a host constructor, this
+  is where that trusted flag comes from (interpreted metadata cannot set or
+  clear it)."
   ([sym] (create-ns sym nil))
   ([sym meta]
-   (sci.lang/->Namespace sym meta)))
+   (sci.lang/->Namespace sym meta (boolean (:sci/built-in meta)))))
 
 (defn parse-string
   "Parses string `s` in the context of `ctx` (as produced with

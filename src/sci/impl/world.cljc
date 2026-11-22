@@ -20,7 +20,43 @@
   - A resize takes `slot-gate` exclusively for the array copy.
   A fork is therefore a cut between individual publications. Every
   publication makes its result reachable last: slots are written before an
-  environment mapping or slot value refers to the handle."
+  environment mapping or slot value refers to the handle.
+
+  Copy-section audit (JVM). Everything that runs while a fork holds the
+  source's `publish-gate` and `slot-gate` write locks follows one rule: no
+  user (interpreted) code, and it waits only on leaf locks, which are never
+  held while waiting for another lock or for user code. The participants:
+  - Primary snapshot (`realize-primary!`): reads Var roots and metadata,
+    namespace metadata, Type data and SCI volatile/ref roots through `fork`'s
+    snapshot fns; plain field reads.
+  - Stock cache hooks (`IForkableWorldCache` of SCI's lazy caches): copy an
+    existing realization in short map sections; they never realize a lazy
+    value or take its realization monitor. The owner index is a WeakHashMap
+    under its own monitor (leaf); owners hash by identity.
+  - Trusted-Future check (`sci.fork/trusted-future?`): `isDone` only on exact
+    FutureTask / CompletableFuture or a `clojure.core/future` wrapper around
+    one (a volatile read); the wrapper's delegate is read reflectively, its
+    Field cached in a ConcurrentHashMap (leaf bin locks, class reflection).
+  - SCI's own copiers (`copy-cells!`), installed only by SCI and the host
+    (`install-var-fork-fns!`), never from Var metadata or any evaluation:
+    `fork-loaded-libs` (operand: the built-in `*loaded-libs*` root, a ref /
+    atom only SCI's `add-loaded-lib` updates with `conj`; the JVM deref may
+    wait for that commit's ref lock), the CLJS `fork-type-data` (operand: the
+    type's JS prototype, which only SCI sets: interpreted `alter-meta!` and
+    `-create-type` cannot replace it) and the ClojureDart method table
+    (`identity`). Var copiers installed through `:fork-fns` are host code
+    with the same rule.
+  - The namespace environment snapshot: a deref of the env atom.
+  - Retirement (`retire-world!`) is not inside a copy: it takes the slot
+    read lock, so it waits for a copy in progress (and a copy for it); its
+    cache hooks (`IWorldCache`) only drop private entries.
+  - Failed-copy cleanup retires the unpublished target after the source's
+    locks are released.
+  - Host `IForkableWorldCache` / `IWorldCache` implementations are trusted
+    host code under the same rule.
+  The locks are blocking and non-fair: waiting under them is acyclic, but
+  has no time bound. A fork's copy waits for in-flight slot writes and
+  publications (which run no user code), and they wait for the copy."
   (:require [sci.ctx-store :as store]
             [sci.fork :as fork]
             [sci.impl.execution :as execution])
@@ -81,6 +117,19 @@
   (-world-tracked? [handle])
   (-world-home-ctx [handle])
   (-mark-world-tracked! [handle home-ctx]))
+
+(defprotocol IBuiltIn
+  "Trusted provenance of `:sci/built-in` on a SCI Var or namespace. The flag,
+   not the object's current metadata, decides write protection, a Var's
+   home and whether forks process its value (`host-fork?`). Host
+   constructors (`sci.core/new-var`, `copy-var`, `create-ns`, SCI's own
+   tables) take it from their construction metadata. Evaluation sets it only
+   in an `:unrestricted` context (host-trusted code, which may already alter
+   built-in Vars): any other evaluation can neither set nor clear it, through
+   `def`, `intern`, `ns`, `alter-meta!` or `reset-meta!`. The flag belongs to
+   the object, so it is shared by every world and lineage holding it."
+  (-built-in? [x])
+  (-set-built-in! [x built-in?]))
 
 (defprotocol ITypeData
   "A SCI Type's data under forks (`type-data-of`); implemented by
@@ -959,6 +1008,13 @@
     fallback))
 
 (defn- allocate-descriptor!
+  "The descriptor of `handle` in `world`'s lineage registry, allocated with
+   `value-fork-fn` (the copier `copy-cells!` runs under the copy locks) when
+   new. Only SCI passes a copier here, and only a fixed one of its own: the
+   CLJS type-data clone (`:type`), the ClojureDart method table (`:ref`). A
+   Var's copier comes only from `install-var-fork-fns!`: no evaluation path
+   gives or upgrades one. An existing `:type` descriptor without its copier
+   (allocated by a data write before the definition) gets SCI's fixed one."
   [^DenseWorld world handle kind host-fork? value-fork-fn]
   (assert-accessible! world)
   (let [registry (.-registry world)]
@@ -966,7 +1022,8 @@
       registry
       (fn []
         (if-let [desc (get-in @registry [:descriptors handle])]
-          (if (and value-fork-fn (nil? (:value-fork-fn desc)))
+          (if (and value-fork-fn (= :type kind) (= :type (:kind desc))
+                   (nil? (:value-fork-fn desc)))
             (let [desc (assoc desc :value-fork-fn value-fork-fn)]
               (swap! registry assoc-in [:descriptors handle] desc)
               desc)
@@ -984,6 +1041,41 @@
                          (assoc :next-slot (+ start width))
                          (assoc-in [:descriptors handle] desc))))
             desc))))))
+
+(defn install-var-fork-fns!
+  "Host install time only (`init` / `merge-opts` `:fork-fns`, and SCI's own
+   `*loaded-libs*` from `init-env!`): give each Var in `fork-fns` (Var ->
+   copier) that copy-time fork fn in `world`'s lineage registry. The copier
+   then runs on the Var's value inside every later fork's copy section, under
+   the source's locks, so it is trusted host code that never blocks, takes a
+   lock or runs interpreted code.
+
+   The registry is shared by every context of the lineage (forks and
+   siblings): this is lineage policy, applying to all their later forks. A
+   descriptor's copier is set once and never changes: installing the same fn
+   again is a no-op, a different one is refused. A Var registered earlier
+   without a copier receives it here (still a host call, never an
+   evaluation). Nothing in evaluation, including Var metadata, installs or
+   upgrades a copier."
+  [^DenseWorld world fork-fns]
+  (assert-accessible! world)
+  (let [registry (.-registry world)]
+    (with-registry-lock
+      registry
+      (fn []
+        (doseq [[v f] fork-fns]
+          (let [{:keys [kind value-fork-fn]}
+                (allocate-descriptor! world v :var (not (-built-in? v)) nil)]
+            (cond
+              (not= :var kind)
+              (throw (ex-info "A fork fn can only be installed for a SCI Var."
+                              {:var v}))
+              (nil? value-fork-fn)
+              (swap! registry assoc-in [:descriptors v :value-fork-fn] f)
+              (not (identical? f value-fork-fn))
+              (throw (ex-info "A different fork fn is already installed for this Var in this lineage."
+                              {:var v})))))))
+    nil))
 
 (defn register-managed!
   "Allocate dense slots whose owner carries the returned descriptor directly.
@@ -1433,12 +1525,13 @@
   ([handle value m watches]
    (register-var! handle value m watches nil))
   ([handle value m watches mirror-root]
+   ;; Built-in-ness is the Var's trusted flag, never `m`; `m` never gives a
+   ;; copier (`install-var-fork-fns!`).
    (when-let [^DenseWorld world (current-world)]
-     (-mark-world-tracked! handle
-                           (when-not (:sci/built-in m) store/*ctx*))
-     (let [{:keys [value-slot meta-slot]}
-           (allocate-descriptor! world handle :var (not (:sci/built-in m))
-                                 (:sci.impl/fork-fn m))
+     (let [built-in? (-built-in? handle)
+           _ (-mark-world-tracked! handle (when-not built-in? store/*ctx*))
+           {:keys [value-slot meta-slot]}
+           (allocate-descriptor! world handle :var (not built-in?) nil)
            watch-slot (when (seq watches)
                         (:watch-slot (allocate-var-watch-slot! world handle watches)))]
        (ensure-capacity! world (inc (max meta-slot (or watch-slot 0))))
@@ -1575,8 +1668,8 @@
    (if-let [^DenseWorld world (current-world)]
      (let [{:keys [meta-slot]} (or (descriptor world handle)
                                    (allocate-descriptor! world handle :var
-                                                         (not (:sci/built-in m))
-                                                         (:sci.impl/fork-fn m)))]
+                                                         (not (-built-in? handle))
+                                                         nil))]
        (reset-slot! world meta-slot m mirror))
      ::no-world)))
 
@@ -1623,8 +1716,8 @@
    (if-let [^DenseWorld world (current-world)]
      (let [{:keys [meta-slot]} (or (descriptor world handle)
                                    (allocate-descriptor! world handle :var
-                                                         (not (:sci/built-in fallback))
-                                                         (:sci.impl/fork-fn fallback)))]
+                                                         (not (-built-in? handle))
+                                                         nil))]
        (alter-slot! world meta-slot fallback f args mirror))
      ::no-world)))
 
@@ -1765,11 +1858,13 @@
       (cells-set! target i (if (< i (cells-length source))
                             (cells-get source i)
                             absent)))
-    ;; SCI's own descriptor fork fns (loaded-libs ref, CLJS type data,
-    ;; ClojureDart method tables) snapshot SCI-owned mutable state, so they
-    ;; run here, cut with the cells and the environment. They are internal
-    ;; and never block or run user code. They establish target-local
-    ;; realizations before host Forkable values see the child world.
+    ;; Descriptor fork fns snapshot SCI-owned mutable state (loaded-libs ref,
+    ;; CLJS type data, ClojureDart method tables) or apply host `:fork-fns`
+    ;; policy, so they run here, cut with the cells and the environment.
+    ;; Only SCI and the host install them (`install-var-fork-fns!`), never
+    ;; evaluation or Var metadata: they never block or run user code. They
+    ;; establish target-local realizations before host Forkable values see
+    ;; the child world.
     (doseq [[_ {:keys [value-slot value-fork-fn]}] (:descriptors registry-state)
             :when value-fork-fn
             :when (< value-slot logical-n)

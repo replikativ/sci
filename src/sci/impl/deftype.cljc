@@ -285,6 +285,19 @@
        data)))
 
 #?(:cljs
+   (defn altered-type-data
+     "Interpreted `alter-meta!` of a type: `(apply f own args)`, keeping the
+  type's JS prototype (`:sci.impl/js-prototype` of `own`, this world's own
+  data). That prototype is the operand `fork-type-data` consumes inside a
+  fork's copy section, so interpreted metadata can neither replace nor
+  remove it."
+     [own f args]
+     (let [data (apply f own args)]
+       (if-some [proto (:sci.impl/js-prototype own)]
+         (assoc data :sci.impl/js-prototype proto)
+         (dissoc data :sci.impl/js-prototype)))))
+
+#?(:cljs
    (defn -install-field-accessors!
      "Installs a JS accessor on the type's prototype for each field, so
   host-style interop on instances resolves fields like compiled CLJS:

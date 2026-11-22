@@ -25,12 +25,14 @@
 
 (macros/deftime
   (defmacro with-writeable-namespace
-    [the-ns-object ns-meta & body]
-    `(let [m# ~ns-meta]
-       (if (or (:unrestricted sci.ctx-store/*ctx*) (not (:sci/built-in m#)))
+    [the-ns-object _ns-meta & body]
+    ;; the namespace's trusted flag (`sci.impl.world/IBuiltIn`), never its
+    ;; metadata
+    `(let [ns-obj# ~the-ns-object]
+       (if (or (:unrestricted sci.ctx-store/*ctx*)
+               (not (sci.impl.world/-built-in? ns-obj#)))
          (do ~@body)
-         (let [ns-obj# ~the-ns-object
-               name# (t/getName ns-obj#)]
+         (let [name# (t/getName ns-obj#)]
            (throw (ex-info (str "Built-in namespace " name# " is read-only.")
                            {:ns ns-obj#})))))))
 
@@ -493,13 +495,31 @@
 (defn built-in-var? [var-meta]
   (:sci/built-in var-meta))
 
+(defn evaluation-built-in
+  "The trusted built-in flag (`sci.impl.world/IBuiltIn`) of a Var or
+   namespace that evaluation creates with metadata `m`: only an
+   `:unrestricted` context's evaluation (host-trusted code) can set it."
+  [m]
+  (boolean (and (:unrestricted store/*ctx*) (:sci/built-in m))))
+
+(defn sync-built-in!
+  "After evaluation wrote `m` as the metadata of Var or namespace `x`: in an
+   `:unrestricted` context the written metadata decides the trusted flag;
+   any other evaluation leaves it unchanged. Returns `m`."
+  [x m]
+  (when (:unrestricted store/*ctx*)
+    (world/-set-built-in! x (:sci/built-in m)))
+  m)
+
 (macros/deftime
   (defmacro with-writeable-var
     [the-var var-meta & body]
-    `(let [vm# ~var-meta]
-       (if (or (:unrestricted sci.ctx-store/*ctx*) (not (:sci/built-in vm#)))
+    ;; the Var's trusted flag (`sci.impl.world/IBuiltIn`), never its metadata
+    `(let [the-var# ~the-var]
+       (if (or (:unrestricted sci.ctx-store/*ctx*)
+               (not (sci.impl.world/-built-in? the-var#)))
          (do ~@body)
-         (let [the-var# ~the-var
+         (let [vm# ~var-meta
                ns# (:ns vm#)
                ns-name# (t/getName ns#)
                name# (t/getName the-var#)]

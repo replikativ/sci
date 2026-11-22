@@ -169,9 +169,19 @@
          ns
          #?(:cljd ^:mutable world-tracked
             :clj ^:volatile-mutable world-tracked
-            :cljs ^:mutable world-tracked)]
+            :cljs ^:mutable world-tracked)
+         ;; trusted `:sci/built-in` (`sci.impl.world/IBuiltIn`), never read
+         ;; from the metadata
+         #?(:cljd ^:mutable built-in
+            :clj ^:volatile-mutable built-in
+            :cljs ^:mutable built-in)]
   ;; marker interface, clj only for now
   #?@(:cljd [] :clj [sci.lang.IVar])
+  world/IBuiltIn
+  (-built-in? [_] (boolean built-in))
+  (-set-built-in! [this b]
+    #?(:cljd (set! built-in (boolean b))
+       :default (set! (.-built-in this) (boolean b))))
   IWorldMirror
   (-mirror-root! [_ v] (vars/bumping-set! root v))
   (-mirror-meta! [_ m] (set! meta m))
@@ -333,10 +343,12 @@
                                        ;; world lock; the monitor only orders
                                        ;; alterMeta callers.
                                        (locking this
-                                         (if (world/current-world)
-                                           (world/alter-var-meta! this current-meta f args
-                                                                  (primary-mirror-meta this))
-                                           (set! (.-meta this) (apply f meta args)))))))))
+                                         (vars/sync-built-in!
+                                          this
+                                          (if (world/current-world)
+                                            (world/alter-var-meta! this current-meta f args
+                                                                   (primary-mirror-meta this))
+                                            (set! (.-meta this) (apply f meta args))))))))))
                      (resetMeta [this m]
                                 (world/call-with-var-context
                                  this
@@ -347,8 +359,9 @@
                                        ;; inside a publication (def).
                                        (if (world/current-world)
                                          (do (world/reset-var-meta! this m (primary-mirror-meta this))
-                                             m)
-                                         (locking this (set! (.-meta this) m))))))))])
+                                             (vars/sync-built-in! this m))
+                                         (locking this
+                                           (vars/sync-built-in! this (set! (.-meta this) m)))))))))])
   #?@(:cljd [types/IResetMeta
              (-reset-meta! [this m]
                (world/call-with-var-context
@@ -356,10 +369,12 @@
                 (fn []
                   (let [current-meta (world/var-meta this meta)]
                     (vars/with-writeable-var this current-meta
-                      (if (world/current-world)
-                        (do (world/reset-var-meta! this m (primary-mirror-meta this))
-                            m)
-                        (set! (.-meta this) m)))))))
+                      (vars/sync-built-in!
+                       this
+                       (if (world/current-world)
+                         (do (world/reset-var-meta! this m (primary-mirror-meta this))
+                             m)
+                         (set! (.-meta this) m))))))))
              IWatchable
              (-add-watch [this key watch-fn]
                          (world/call-with-var-context
@@ -547,7 +562,16 @@
       directly."}
     Namespace [name #?(:cljd ^:mutable meta
                        :clj ^:volatile-mutable meta
-                       :cljs ^:mutable meta)]
+                       :cljs ^:mutable meta)
+               ;; trusted `:sci/built-in` (`sci.impl.world/IBuiltIn`)
+               #?(:cljd ^:mutable built-in
+                  :clj ^:volatile-mutable built-in
+                  :cljs ^:mutable built-in)]
+  world/IBuiltIn
+  (-built-in? [_] (boolean built-in))
+  (-set-built-in! [this b]
+    #?(:cljd (set! built-in (boolean b))
+       :default (set! (.-built-in this) (boolean b))))
   Object
   (toString [_]
     (str name))
@@ -564,26 +588,30 @@
              (-reset-meta! [this m]
                (let [current-meta (world/namespace-meta this meta)]
                  (vars/with-writeable-namespace this current-meta
-                   (if (world/current-world)
-                     (do (world/reset-namespace-meta! this m (primary-mirror-meta this))
-                         m)
-                     (set! meta m)))))]
+                   (vars/sync-built-in!
+                    this
+                    (if (world/current-world)
+                      (do (world/reset-namespace-meta! this m (primary-mirror-meta this))
+                          m)
+                      (set! meta m))))))]
       :clj [clojure.lang.IReference
             (alterMeta [this f args]
                        (let [current-meta (world/namespace-meta this meta)]
                          (vars/with-writeable-namespace this current-meta
                            (locking this
-                             (if (world/current-world)
-                               (world/alter-namespace-meta!
-                                this current-meta f args (primary-mirror-meta this))
-                               (set! meta (apply f meta args)))))))
+                             (vars/sync-built-in!
+                              this
+                              (if (world/current-world)
+                                (world/alter-namespace-meta!
+                                 this current-meta f args (primary-mirror-meta this))
+                                (set! meta (apply f meta args))))))))
             (resetMeta [this m]
                        (let [current-meta (world/namespace-meta this meta)]
                          (vars/with-writeable-namespace this current-meta
                            (if (world/current-world)
                              (do (world/reset-namespace-meta! this m (primary-mirror-meta this))
-                                 m)
-                             (locking this (set! meta m))))))]))
+                                 (vars/sync-built-in! this m))
+                             (locking this (vars/sync-built-in! this (set! meta m)))))))]))
 
 (defn new-type
   "A SCI type with type data `data` and no home yet."

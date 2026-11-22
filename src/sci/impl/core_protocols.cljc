@@ -206,11 +206,11 @@
                                     #(notify-ref! ref %1 %2))))
 
 #?(:cljd
-   (def cljd-core-ns (lang/->Namespace 'cljd.core nil)))
+   (def cljd-core-ns (lang/->Namespace 'cljd.core nil false)))
 #?(:clj
-   (def clj-lang-ns (lang/->Namespace 'clojure.lang nil)))
+   (def clj-lang-ns (lang/->Namespace 'clojure.lang nil false)))
 #?(:cljs
-   (def cljs-core-ns (lang/->Namespace 'cljs.core nil)))
+   (def cljs-core-ns (lang/->Namespace 'cljs.core nil false)))
 
 (def deref-protocol
   #?(:cljd
